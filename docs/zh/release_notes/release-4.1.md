@@ -54,7 +54,6 @@ displayed_sidebar: docs
 - 支持 MemTable 刷写和合并的管道执行，提高存算分离集群中云原生表的摄取吞吐量。[#67878](https://github.com/StarRocks/starrocks/pull/67878)
 - 支持 `dry_run` 模式修复云原生表，允许用户在执行前预览修复操作。[#68494](https://github.com/StarRocks/starrocks/pull/68494)
 - 在存算一体集群中为发布事务添加了线程池，提高了发布吞吐量。[#67797](https://github.com/StarRocks/starrocks/pull/67797)
-- 支持动态修改云原生表的 `datacache.enable` 属性。[#69011](https://github.com/StarRocks/starrocks/pull/69011)
 
 ### 数据湖分析
 
