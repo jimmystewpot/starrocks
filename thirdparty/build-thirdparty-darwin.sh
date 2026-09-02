@@ -1667,12 +1667,19 @@ build_snappy() {
     mkdir -p "${BUILD_DIR}"
     cd "${BUILD_DIR}"
     rm -rf CMakeCache.txt CMakeFiles/
+    local machine_type
+    machine_type="$(uname -m)"
+    local snappy_cxx_flags="${CXXFLAGS:-}"
+    if [[ "${machine_type}" == "arm64" ]]; then
+        snappy_cxx_flags="${snappy_cxx_flags} -march=armv8-a+crc"
+    fi
     "${CMAKE_CMD}" .. \
         -G "${CMAKE_GENERATOR}" \
         -DCMAKE_INSTALL_PREFIX="${TP_INSTALL_DIR}" \
         -DCMAKE_INSTALL_LIBDIR=lib \
         -DCMAKE_INSTALL_INCLUDEDIR=include/snappy \
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+        -DCMAKE_CXX_FLAGS="${snappy_cxx_flags}" \
         -DSNAPPY_BUILD_TESTS=OFF \
         -DSNAPPY_BUILD_BENCHMARKS=OFF \
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5
