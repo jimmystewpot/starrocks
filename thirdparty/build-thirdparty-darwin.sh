@@ -348,10 +348,21 @@ setup_build_environment() {
         export BUILD_SYSTEM="${BUILD_SYSTEM:-make}"
     fi
 
+    export TP_TARGET_ARCH_FLAGS=""
+    if [[ "${MACHINE_TYPE}" == "aarch64" ]]; then
+        export TP_TARGET_ARCH_FLAGS="-march=armv8-a+crc"
+    fi
+
     export FILE_PREFIX_MAP_OPTION="-ffile-prefix-map=${TP_SOURCE_DIR}=. -ffile-prefix-map=${TP_INSTALL_DIR}=."
     export GLOBAL_CPPFLAGS="-I${TP_INCLUDE_DIR}"
     export GLOBAL_CFLAGS="-O3 -fno-omit-frame-pointer -std=gnu17 -fPIC -g ${FILE_PREFIX_MAP_OPTION}"
     export GLOBAL_CXXFLAGS="-O3 -fno-omit-frame-pointer -fPIC -g -stdlib=libc++ ${FILE_PREFIX_MAP_OPTION}"
+
+    if [[ -n "${TP_TARGET_ARCH_FLAGS}" ]]; then
+        export GLOBAL_CFLAGS="$(append_flags "${GLOBAL_CFLAGS}" "${TP_TARGET_ARCH_FLAGS}")"
+        export GLOBAL_CXXFLAGS="$(append_flags "${GLOBAL_CXXFLAGS}" "${TP_TARGET_ARCH_FLAGS}")"
+    fi
+
     export CPPFLAGS="${GLOBAL_CPPFLAGS}"
     export CFLAGS="${GLOBAL_CFLAGS}"
     export CXXFLAGS="${GLOBAL_CXXFLAGS}"
@@ -1673,6 +1684,7 @@ build_snappy() {
         -DCMAKE_INSTALL_LIBDIR=lib \
         -DCMAKE_INSTALL_INCLUDEDIR=include/snappy \
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+        -DCMAKE_CXX_FLAGS="${CXXFLAGS}" \
         -DSNAPPY_BUILD_TESTS=OFF \
         -DSNAPPY_BUILD_BENCHMARKS=OFF \
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5
@@ -2006,7 +2018,10 @@ build_arrow() {
 
     local arrow_simd_level="DEFAULT"
     local arrow_runtime_simd_level="SSE4_2"
-    if [[ "${THIRD_PARTY_BUILD_WITH_AVX2}" != "OFF" ]]; then
+    if [[ "${MACHINE_TYPE}" == "aarch64" ]]; then
+        arrow_simd_level="NEON"
+        arrow_runtime_simd_level="NEON"
+    elif [[ "${THIRD_PARTY_BUILD_WITH_AVX2}" != "OFF" ]]; then
         arrow_simd_level="AVX2"
         arrow_runtime_simd_level="AVX2"
     fi
