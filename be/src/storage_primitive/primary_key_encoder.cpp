@@ -35,6 +35,14 @@
 
 #include "storage_primitive/primary_key_encoder.h"
 
+#if defined(__x86_64__)
+#include <emmintrin.h>
+#include <immintrin.h>
+#include <nmmintrin.h>
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -52,14 +60,6 @@
 #include "storage_primitive/type_utils.h"
 #include "types/date_value.h"
 #include "types/logical_type_infra.h"
-
-#if defined(__x86_64__)
-#include <emmintrin.h>
-#include <immintrin.h>
-#include <nmmintrin.h>
-#elif defined(__ARM_NEON) && defined(__aarch64__)
-#include <arm_neon.h>
-#endif
 
 namespace starrocks {
 
@@ -220,7 +220,6 @@ Status encoding_utils::decode_slice(Slice* src, std::string* dest, Slice* dest_f
     } else {
         if (!fast_decode) {
             auto* separator = static_cast<uint8_t*>(memmem(src->data, src->size, "\0\0", 2));
-            DCHECK(separator) << "bad encoded primary key, separator not found";
             if (PREDICT_FALSE(separator == nullptr)) {
                 LOG(WARNING) << "bad encoded primary key, separator not found";
                 return Status::InvalidArgument("bad encoded primary key, separator not found");
@@ -249,16 +248,24 @@ Status encoding_utils::decode_slice(Slice* src, std::string* dest, Slice* dest_f
             }
             src->remove_prefix(len + 2);
         } else {
-            void* separator = std::memchr(src->data, '\0', src->size);
-            DCHECK(separator) << "bad encoded primary key, separator not found";
+            auto* data = reinterpret_cast<const uint8_t*>(src->data);
+            const void* separator = std::memchr(data, '\0', src->size);
             if (PREDICT_FALSE(separator == nullptr)) {
+                LOG(WARNING) << "bad encoded primary key, separator not found";
+                return Status::InvalidArgument("bad encoded primary key, separator not found");
+            }
+            size_t len = static_cast<const uint8_t*>(separator) - data;
+            // The encoding contract specifies a two-byte 0x00 0x00 delimiter for middle slice fields.
+            // If the buffer is truncated after the first null byte, or if the following byte is not null,
+            // the delimiter is missing. Reject immediately to prevent Slice::remove_prefix underflow.
+            if (PREDICT_FALSE(len + 1 >= src->size || data[len + 1] != '\0')) {
                 LOG(WARNING) << "bad encoded primary key, separator not found";
                 return Status::InvalidArgument("bad encoded primary key, separator not found");
             }
 
             dest_fast->data = src->data;
-            dest_fast->size = (uint8_t*)separator - (uint8_t*)src->data;
-            src->remove_prefix(dest_fast->size + 2);
+            dest_fast->size = len;
+            src->remove_prefix(len + 2);
         }
     }
     return Status::OK();

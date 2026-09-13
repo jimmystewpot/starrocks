@@ -851,6 +851,82 @@ TEST(PrimaryKeyEncoderTest, testSimdSliceEncodingNullEscapes) {
     }
 }
 
+TEST(PrimaryKeyEncoderTest, testDecodeSliceMissingSeparatorReturnsError) {
+    // Regression: DCHECK(separator) was fatal in ASAN before the fix.
+    // Verify decode_slice returns Status::InvalidArgument for corrupt/truncated
+    // inputs instead of aborting, so callers like tablet_splitter can fall back.
+
+    // fast_decode=false path uses memmem searching for "\0\0".
+    // Fails (returns InvalidArgument) when no "\0\0" exists in the input.
+
+    // Case A: clean ASCII, no null bytes at all — no "\0\0", no "\0"
+    {
+        std::string corrupt = "hello_no_terminator";
+        Slice s(corrupt);
+        std::string dest;
+        Status st = encoding_utils::decode_slice(&s, &dest, nullptr, /*is_last=*/false, /*fast_decode=*/false);
+        EXPECT_FALSE(st.ok()) << "Expected error for missing \\0\\0 separator (fast_decode=false, no nulls)";
+        EXPECT_TRUE(st.is_invalid_argument()) << st.to_string();
+    }
+
+    // Case B: single \0 but no \0\0 — memmem still finds no "\0\0"
+    {
+        const std::string corrupt = {'h', 'e', 'l', '\0', 'l', 'o'};
+        Slice s(corrupt);
+        std::string dest;
+        Status st = encoding_utils::decode_slice(&s, &dest, nullptr, /*is_last=*/false, /*fast_decode=*/false);
+        EXPECT_FALSE(st.ok()) << "Expected error for missing \\0\\0 separator (fast_decode=false, single null)";
+        EXPECT_TRUE(st.is_invalid_argument()) << st.to_string();
+    }
+
+    // fast_decode=true path uses memchr searching for a single '\0'.
+    // Fails (returns InvalidArgument) only when there is no '\0' at all.
+
+    // Case C: no null bytes — memchr finds nothing
+    {
+        std::string corrupt = "hello_no_terminator";
+        Slice s(corrupt);
+        Slice dest_fast;
+        Status st = encoding_utils::decode_slice(&s, nullptr, &dest_fast, /*is_last=*/false, /*fast_decode=*/true);
+        EXPECT_FALSE(st.ok()) << "Expected error for missing \\0 separator (fast_decode=true, no nulls)";
+        EXPECT_TRUE(st.is_invalid_argument()) << st.to_string();
+    }
+
+    // Case D: single '\0' followed by non-null character — fast_decode=true must fail
+    // because the required '\0\0' delimiter is missing.
+    {
+        const std::string invalid_for_fast = {'h', 'e', 'l', '\0', 'l', 'o'};
+        Slice s(invalid_for_fast);
+        Slice dest_fast;
+        Status st = encoding_utils::decode_slice(&s, nullptr, &dest_fast, /*is_last=*/false, /*fast_decode=*/true);
+        EXPECT_FALSE(st.ok()) << "fast_decode=true must fail when second \\0 is missing";
+        EXPECT_TRUE(st.is_invalid_argument()) << st.to_string();
+    }
+
+    // Case E: truncated slice ending with a single '\0' — fast_decode=true must return
+    // InvalidArgument without calling remove_prefix(len + 2) which would assert/underflow.
+    {
+        const std::string truncated = {'h', 'e', 'l', '\0'};
+        Slice s(truncated);
+        Slice dest_fast;
+        Status st = encoding_utils::decode_slice(&s, nullptr, &dest_fast, /*is_last=*/false, /*fast_decode=*/true);
+        EXPECT_FALSE(st.ok()) << "fast_decode=true must fail on truncated single \\0";
+        EXPECT_TRUE(st.is_invalid_argument()) << st.to_string();
+    }
+
+    // Case F: valid '\0\0' delimiter with trailing bytes — fast_decode=true succeeds,
+    // points dest_fast to payload, and advances src past the delimiter.
+    {
+        const std::string valid = {'h', 'e', 'l', '\0', '\0', 'm', 'o', 'r', 'e'};
+        Slice s(valid);
+        Slice dest_fast;
+        Status st = encoding_utils::decode_slice(&s, nullptr, &dest_fast, /*is_last=*/false, /*fast_decode=*/true);
+        EXPECT_TRUE(st.ok()) << "fast_decode=true should succeed with \\0\\0: " << st.to_string();
+        EXPECT_EQ(dest_fast.to_string(), "hel");
+        EXPECT_EQ(s.to_string(), "more");
+    }
+}
+
 TEST(PrimaryKeyEncoderTest, testCompositeWithMiddleVarcharBatch) {
     auto sc = create_key_schema({TYPE_INT, TYPE_VARCHAR, TYPE_BIGINT});
     MutableColumnPtr dest_v1;

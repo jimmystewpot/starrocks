@@ -33,11 +33,13 @@ namespace {
 // that sort-key decoding inherits the memchr fast-path and SIMD libc routines
 // added in the ARM64 acceleration work.
 //
-// Note: error messages on corrupt input now read "bad encoded primary key,
-// separator not found" rather than the previous "full sort key: separator not
-// found in encoded string column".
+// Preserves the full sort key error context on corrupt input.
 inline Status unescape_slice_column(Slice* src, bool is_last, std::string* dest) {
-    return encoding_utils::decode_slice(src, dest, nullptr, is_last, false);
+    Status st = encoding_utils::decode_slice(src, dest, nullptr, is_last, false);
+    if (PREDICT_FALSE(!st.ok())) {
+        return Status::InvalidArgument("full sort key: separator not found in encoded string column");
+    }
+    return Status::OK();
 }
 
 // Decode a fixed-size, non-string key column: KeyCoder::decode_ascending fills a local |CppType| buffer
