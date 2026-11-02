@@ -379,8 +379,10 @@ protected:
             // max case size in use SIMD CASE WHEN implements
             constexpr int max_simd_case_when_size = 8;
 
-            // optimisation for non-nullable Arithmetic Type (and DATETIME on ARM64)
-#if defined(__aarch64__)
+            // optimization for non-nullable Arithmetic Type (and Date/DateTime on AVX2 / DateTime on ARM64)
+#if defined(__AVX2__)
+            constexpr bool enable_simd_mulselector = isArithmeticLT<ResultType> || lt_is_date_or_datetime<ResultType>;
+#elif defined(__aarch64__)
             constexpr bool enable_simd_mulselector = isArithmeticLT<ResultType> || lt_is_datetime<ResultType>;
 #else
             constexpr bool enable_simd_mulselector = isArithmeticLT<ResultType>;

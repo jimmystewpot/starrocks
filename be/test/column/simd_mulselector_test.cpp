@@ -51,7 +51,7 @@ template <LogicalType TYPE>
 void inject_special_values(typename SIMD_muti_selector<TYPE>::Container& container, int branch_idx) {
     if constexpr (TYPE == TYPE_DOUBLE) {
         const double custom_nan = []() {
-            uint64_t bits = 0x7ff8000000000001ULL;
+            uint64_t bits = 0x7ff8000012345678ULL;
             double v = 0.0;
             std::memcpy(&v, &bits, sizeof(double));
             return v;
@@ -66,6 +66,41 @@ void inject_special_values(typename SIMD_muti_selector<TYPE>::Container& contain
                 container[0] = neg_zero;
             } else if (branch_idx % 4 == 2) {
                 container[0] = pos_inf;
+            } else {
+                container[0] = neg_inf;
+            }
+            return;
+        }
+        for (size_t i = 0; i < container.size(); ++i) {
+            if (i % 17 == 0) {
+                container[i] = custom_nan;
+            } else if (i % 19 == 0) {
+                container[i] = neg_zero;
+            } else if (i % 23 == 0) {
+                container[i] = pos_inf;
+            } else if (i % 29 == 0) {
+                container[i] = neg_inf;
+            }
+        }
+    } else if constexpr (TYPE == TYPE_FLOAT) {
+        const float custom_nan = []() {
+            uint32_t bits = 0x7fc01234U;
+            float v = 0.0f;
+            std::memcpy(&v, &bits, sizeof(float));
+            return v;
+        }();
+        const float neg_zero = -0.0f;
+        const float pos_inf = std::numeric_limits<float>::infinity();
+        const float neg_inf = -std::numeric_limits<float>::infinity();
+        if (container.size() == 1) {
+            if (branch_idx % 4 == 0) {
+                container[0] = custom_nan;
+            } else if (branch_idx % 4 == 1) {
+                container[0] = neg_zero;
+            } else if (branch_idx % 4 == 2) {
+                container[0] = pos_inf;
+            } else {
+                container[0] = neg_inf;
             }
             return;
         }
@@ -84,7 +119,7 @@ void inject_special_values(typename SIMD_muti_selector<TYPE>::Container& contain
 }
 
 template <LogicalType TYPE, int CASE_SIZE>
-void run_simd_multi_select_case(int test_size, SelectorPattern pattern, ConstMode const_mode) {
+void run_simd_multi_select_case(int row_size, SelectorPattern pattern, ConstMode const_mode) {
     static_assert(isArithmeticLT<TYPE> || lt_is_date_or_datetime<TYPE>,
                   "Now Select IF only support Arithmetic, DATE, or DATETIME TYPE");
 
@@ -96,7 +131,7 @@ void run_simd_multi_select_case(int test_size, SelectorPattern pattern, ConstMod
     SelectorContainer selectors[CASE_SIZE];
     Container data_valus[CASE_SIZE + 1];
     Container dst;
-    Container expected;
+    Container dst2;
 
     SelectVec select_vecs[CASE_SIZE];
     const Container* select_lists[CASE_SIZE + 1];
@@ -118,8 +153,8 @@ void run_simd_multi_select_case(int test_size, SelectorPattern pattern, ConstMod
 
     // Initialise selectors with a single resize from empty.
     for (int b = 0; b < CASE_SIZE; ++b) {
-        selectors[b].resize(test_size);
-        for (int r = 0; r < test_size; ++r) {
+        selectors[b].resize(row_size);
+        for (int r = 0; r < row_size; ++r) {
             uint8_t val = 0;
             switch (pattern) {
             case SelectorPattern::kRandom01:
@@ -179,8 +214,8 @@ void run_simd_multi_select_case(int test_size, SelectorPattern pattern, ConstMod
             data_valus[i].resize(1);
             data_valus[i][0] = RandomGenerator<RuntimeCppType, 128>::next_value();
         } else {
-            data_valus[i].resize(test_size);
-            for (int r = 0; r < test_size; ++r) {
+            data_valus[i].resize(row_size);
+            for (int r = 0; r < row_size; ++r) {
                 data_valus[i][r] = RandomGenerator<RuntimeCppType, 128>::next_value();
             }
         }
@@ -188,30 +223,31 @@ void run_simd_multi_select_case(int test_size, SelectorPattern pattern, ConstMod
         select_lists[i] = &data_valus[i];
     }
 
-    // Size dst and expected with a single resize from empty, and poison dst with 0xCD.
-    dst.resize(test_size);
-    expected.resize(test_size);
-    if (test_size > 0) {
-        std::memset(dst.data(), 0xCD, test_size * sizeof(RuntimeCppType));
+    // Size dst and dst2 with a single resize from empty, and poison both with 0xCD.
+    dst.resize(row_size);
+    dst2.resize(row_size);
+    if (row_size > 0) {
+        std::memset(dst.data(), 0xCD, row_size * sizeof(RuntimeCppType));
+        std::memset(dst2.data(), 0xCD, row_size * sizeof(RuntimeCppType));
     }
 
-    for (int r = 0; r < test_size; ++r) {
+    for (int r = 0; r < row_size; ++r) {
         int index = 0;
         while (index < CASE_SIZE && !select_vecs[index][r]) {
             index++;
         }
-        expected[r] = is_const[index] ? (*select_lists[index])[0] : (*select_lists[index])[r];
+        dst2[r] = is_const[index] ? (*select_lists[index])[0] : (*select_lists[index])[r];
     }
 
     SIMD_muti_selector<TYPE>::multi_select_if(select_vecs, CASE_SIZE, dst, select_lists, CASE_SIZE + 1, is_const,
-                                              test_size);
+                                              row_size);
 
     std::string ctx = "type=" + std::to_string(static_cast<int>(TYPE)) + " arity=" + std::to_string(CASE_SIZE) +
-                      " n=" + std::to_string(test_size) + " pat=" + std::to_string(static_cast<int>(pattern)) +
+                      " n=" + std::to_string(row_size) + " pat=" + std::to_string(static_cast<int>(pattern)) +
                       " const_mask=" + const_mask_str;
-    ASSERT_EQ(static_cast<size_t>(test_size), dst.size()) << ctx;
-    if (test_size > 0) {
-        ASSERT_EQ(0, std::memcmp(expected.data(), dst.data(), test_size * sizeof(RuntimeCppType))) << ctx;
+    ASSERT_EQ(static_cast<size_t>(row_size), dst.size()) << ctx;
+    if (row_size > 0) {
+        ASSERT_EQ(0, std::memcmp(dst.data(), dst2.data(), row_size * sizeof(RuntimeCppType))) << ctx;
     }
 }
 
@@ -230,7 +266,7 @@ bool test_function_wrapper() {
 
 template <LogicalType TYPE, int CASE_SIZE>
 void test_arity_matrix() {
-    const int row_counts[] = {0, 1, 15, 16, 17, 31, 32, 33, 64, 4095, 4096};
+    const int row_counts[] = {0, 1, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 1024, 4095, 4096};
     const SelectorPattern patterns[] = {
             SelectorPattern::kRandom01,
             SelectorPattern::kAllFalse,
@@ -247,12 +283,12 @@ void test_arity_matrix() {
 
     for (int n : row_counts) {
         for (SelectorPattern pat : patterns) {
-            if (n < 4095) {
+            if (n < 1024) {
                 for (ConstMode cm : const_modes) {
                     run_simd_multi_select_case<TYPE, CASE_SIZE>(n, pat, cm);
                 }
             } else {
-                // Full 4095/4096 runs across representative const modes to keep test runtime fast.
+                // Full 1024/4095/4096 runs across representative const modes to keep test runtime fast.
                 run_simd_multi_select_case<TYPE, CASE_SIZE>(n, pat, ConstMode::kAllVar);
                 run_simd_multi_select_case<TYPE, CASE_SIZE>(n, pat, ConstMode::kAllConst);
                 run_simd_multi_select_case<TYPE, CASE_SIZE>(n, pat, ConstMode::kAlternatingConstVar);
@@ -277,20 +313,345 @@ bool test_all() {
     return (... && test_type_matrix<TYPE>());
 }
 
+template <LogicalType TYPE, int CASE_SIZE>
+void run_non_canonical_selector_bytes_case() {
+    using SelectVec = typename SIMD_muti_selector<TYPE>::SelectVec;
+    using Container = typename SIMD_muti_selector<TYPE>::Container;
+    using SelectorContainer = typename BooleanColumn::Container;
+    using RuntimeCppType = typename SIMD_muti_selector<TYPE>::CppType;
+
+    constexpr int row_size = 97;
+    const uint8_t non_zero_bytes[5] = {0x01, 0x02, 0x7f, 0x80, 0xff};
+
+    for (bool alternating_const : {false, true}) {
+        SelectorContainer selectors[CASE_SIZE];
+        Container data_values[CASE_SIZE + 1];
+        Container dst;
+        Container dst2;
+        SelectVec select_vecs[CASE_SIZE];
+        const Container* select_lists[CASE_SIZE + 1];
+        std::vector<bool> is_const(CASE_SIZE + 1, false);
+
+        for (int b = 0; b < CASE_SIZE; ++b) {
+            selectors[b].resize(row_size, 0);
+            for (int r = 0; r < row_size; ++r) {
+                if (r >= 32 && r < 64 && b == 0) {
+                    // Batch 1 (rows 32..63): all-true branch 0 with non-canonical truthy bytes including 0x80 and 0xff.
+                    selectors[b][r] = non_zero_bytes[r % 5];
+                } else {
+                    int winner = r % (CASE_SIZE + 1);
+                    if (b == winner) {
+                        selectors[b][r] = non_zero_bytes[(r + b) % 5];
+                    } else if (b > winner && ((r + b) % 2 == 0)) {
+                        // Later overshadowed branch also uses 0x80 / 0xff to test priority masking.
+                        selectors[b][r] = (r & 1) ? 0x80 : 0xff;
+                    } else {
+                        selectors[b][r] = 0x00;
+                    }
+                }
+            }
+            select_vecs[b] = selectors[b].data();
+        }
+
+        for (int i = 0; i < CASE_SIZE + 1; ++i) {
+            is_const[i] = alternating_const && (i % 2 == 1);
+            if (is_const[i]) {
+                data_values[i].resize(1);
+                data_values[i][0] = RandomGenerator<RuntimeCppType, 128>::next_value();
+            } else {
+                data_values[i].resize(row_size);
+                for (int r = 0; r < row_size; ++r) {
+                    data_values[i][r] = RandomGenerator<RuntimeCppType, 128>::next_value();
+                }
+            }
+            select_lists[i] = &data_values[i];
+        }
+
+        dst.resize(row_size);
+        dst2.resize(row_size);
+        std::memset(dst.data(), 0xCD, row_size * sizeof(RuntimeCppType));
+        std::memset(dst2.data(), 0xCD, row_size * sizeof(RuntimeCppType));
+
+        for (int r = 0; r < row_size; ++r) {
+            int idx = 0;
+            while (idx < CASE_SIZE && !select_vecs[idx][r]) {
+                idx++;
+            }
+            dst2[r] = is_const[idx] ? (*select_lists[idx])[0] : (*select_lists[idx])[r];
+        }
+
+        SIMD_muti_selector<TYPE>::multi_select_if(select_vecs, CASE_SIZE, dst, select_lists, CASE_SIZE + 1, is_const,
+                                                  row_size);
+        ASSERT_EQ(0, std::memcmp(dst.data(), dst2.data(), row_size * sizeof(RuntimeCppType)))
+                << "type=" << static_cast<int>(TYPE) << " arity=" << CASE_SIZE
+                << " alternating_const=" << alternating_const;
+    }
+}
+
+template <LogicalType TYPE>
+void run_non_canonical_for_type() {
+    run_non_canonical_selector_bytes_case<TYPE, 1>();
+    run_non_canonical_selector_bytes_case<TYPE, 2>();
+    run_non_canonical_selector_bytes_case<TYPE, 4>();
+    run_non_canonical_selector_bytes_case<TYPE, 8>();
+}
+
+template <LogicalType TYPE, int CASE_SIZE>
+void run_bit31_and_subchunk_divergence_case() {
+    using SelectVec = typename SIMD_muti_selector<TYPE>::SelectVec;
+    using Container = typename SIMD_muti_selector<TYPE>::Container;
+    using SelectorContainer = typename BooleanColumn::Container;
+    using RuntimeCppType = typename SIMD_muti_selector<TYPE>::CppType;
+
+    constexpr int row_size = 65;
+    for (bool alternating_const : {false, true}) {
+        SelectorContainer selectors[CASE_SIZE];
+        Container data_values[CASE_SIZE + 1];
+        Container dst;
+        Container dst2;
+        SelectVec select_vecs[CASE_SIZE];
+        const Container* select_lists[CASE_SIZE + 1];
+        std::vector<bool> is_const(CASE_SIZE + 1, false);
+
+        for (int b = 0; b < CASE_SIZE; ++b) {
+            selectors[b].resize(row_size, 0);
+            for (int r = 0; r < row_size; ++r) {
+                int lane = r % 32;
+                if (b == 0) {
+                    if (lane == 31) {
+                        selectors[b][r] = 1;
+                    } else if (lane >= 16 && lane <= 30) {
+                        selectors[b][r] = 1;
+                    } else if (lane >= 8 && lane <= 15) {
+                        selectors[b][r] = static_cast<uint8_t>(lane & 1);
+                    } else {
+                        selectors[b][r] = 0;
+                    }
+                } else {
+                    // In rows 0..7 and even lanes of 8..15, later branches or ELSE win;
+                    // also set 1s in lanes 16..31 to verify earlier branch 0 priority over later branches.
+                    if (lane < 8) {
+                        selectors[b][r] = static_cast<uint8_t>((lane % CASE_SIZE) == b ? 1 : 0);
+                    } else if (lane < 16) {
+                        selectors[b][r] = static_cast<uint8_t>(((lane + b) % 3 == 0) ? 1 : 0);
+                    } else {
+                        selectors[b][r] = 1;
+                    }
+                }
+            }
+            select_vecs[b] = selectors[b].data();
+        }
+
+        for (int i = 0; i < CASE_SIZE + 1; ++i) {
+            is_const[i] = alternating_const && (i % 2 == 1);
+            if (is_const[i]) {
+                data_values[i].resize(1);
+                data_values[i][0] = RandomGenerator<RuntimeCppType, 128>::next_value();
+            } else {
+                data_values[i].resize(row_size);
+                for (int r = 0; r < row_size; ++r) {
+                    data_values[i][r] = RandomGenerator<RuntimeCppType, 128>::next_value();
+                }
+            }
+            select_lists[i] = &data_values[i];
+        }
+
+        dst.resize(row_size);
+        dst2.resize(row_size);
+        std::memset(dst.data(), 0xCD, row_size * sizeof(RuntimeCppType));
+        std::memset(dst2.data(), 0xCD, row_size * sizeof(RuntimeCppType));
+
+        for (int r = 0; r < row_size; ++r) {
+            int idx = 0;
+            while (idx < CASE_SIZE && !select_vecs[idx][r]) {
+                idx++;
+            }
+            dst2[r] = is_const[idx] ? (*select_lists[idx])[0] : (*select_lists[idx])[r];
+        }
+
+        SIMD_muti_selector<TYPE>::multi_select_if(select_vecs, CASE_SIZE, dst, select_lists, CASE_SIZE + 1, is_const,
+                                                  row_size);
+        ASSERT_EQ(0, std::memcmp(dst.data(), dst2.data(), row_size * sizeof(RuntimeCppType)))
+                << "type=" << static_cast<int>(TYPE) << " arity=" << CASE_SIZE
+                << " alternating_const=" << alternating_const;
+    }
+}
+
+template <LogicalType TYPE>
+void run_bit31_for_type() {
+    run_bit31_and_subchunk_divergence_case<TYPE, 2>();
+    run_bit31_and_subchunk_divergence_case<TYPE, 4>();
+    run_bit31_and_subchunk_divergence_case<TYPE, 8>();
+}
+
+template <LogicalType TYPE>
+void run_first_when_all_true_and_exceed_max_when_for_type() {
+    using SelectVec = typename SIMD_muti_selector<TYPE>::SelectVec;
+    using Container = typename SIMD_muti_selector<TYPE>::Container;
+    using SelectorContainer = typename BooleanColumn::Container;
+    using RuntimeCppType = typename SIMD_muti_selector<TYPE>::CppType;
+
+    constexpr int row_size = 97;
+
+    // 1. win_bits[0] == 0xffffffffu across 3 consecutive 32-row batches (row_size = 97) with non-const ELSE,
+    // plus a mixed batch pattern (batch 0 all WHEN 0, batch 1 all ELSE, batch 2 all WHEN 0) to verify
+    // non-const ELSE pointer advancement across all-true WHEN batches.
+    for (bool all_three_batches_when0 : {true, false}) {
+        constexpr int kArity = 4;
+        SelectorContainer selectors[kArity];
+        Container data_values[kArity + 1];
+        Container dst;
+        Container dst2;
+        SelectVec select_vecs[kArity];
+        const Container* select_lists[kArity + 1];
+        std::vector<bool> is_const(kArity + 1, false);
+
+        for (int b = 0; b < kArity; ++b) {
+            selectors[b].resize(row_size, 0);
+            for (int r = 0; r < row_size; ++r) {
+                if (all_three_batches_when0) {
+                    selectors[b][r] = (b == 0) ? 1 : static_cast<uint8_t>(r & 1);
+                } else {
+                    int batch = r / 32;
+                    if (batch == 1) {
+                        selectors[b][r] = 0; // All ELSE in batch 1
+                    } else {
+                        selectors[b][r] = (b == 0) ? 1 : 0;
+                    }
+                }
+            }
+            select_vecs[b] = selectors[b].data();
+        }
+
+        for (int i = 0; i < kArity + 1; ++i) {
+            data_values[i].resize(row_size);
+            for (int r = 0; r < row_size; ++r) {
+                data_values[i][r] = RandomGenerator<RuntimeCppType, 128>::next_value();
+            }
+            select_lists[i] = &data_values[i];
+        }
+
+        dst.resize(row_size);
+        dst2.resize(row_size);
+        std::memset(dst.data(), 0xCD, row_size * sizeof(RuntimeCppType));
+        std::memset(dst2.data(), 0xCD, row_size * sizeof(RuntimeCppType));
+
+        for (int r = 0; r < row_size; ++r) {
+            int idx = 0;
+            while (idx < kArity && !select_vecs[idx][r]) {
+                idx++;
+            }
+            dst2[r] = (*select_lists[idx])[r];
+        }
+
+        SIMD_muti_selector<TYPE>::multi_select_if(select_vecs, kArity, dst, select_lists, kArity + 1, is_const,
+                                                  row_size);
+        ASSERT_EQ(0, std::memcmp(dst.data(), dst2.data(), row_size * sizeof(RuntimeCppType)))
+                << "type=" << static_cast<int>(TYPE) << " all_three_batches_when0=" << all_three_batches_when0;
+    }
+
+    // 2. select_vec_size = 9 (> kMaxSimdWhenSize) with both canonical {0, 1} and non-canonical {0, 0x80, 0xff} bytes.
+    for (bool use_non_canonical : {false, true}) {
+        constexpr int kArity = 9;
+        SelectorContainer selectors[kArity];
+        Container data_values[kArity + 1];
+        Container dst;
+        Container dst2;
+        SelectVec select_vecs[kArity];
+        const Container* select_lists[kArity + 1];
+        std::vector<bool> is_const(kArity + 1, false);
+
+        for (int b = 0; b < kArity; ++b) {
+            selectors[b].resize(row_size, 0);
+            for (int r = 0; r < row_size; ++r) {
+                uint8_t truthy = use_non_canonical ? ((r & 1) ? 0x80 : 0xff) : 0x01;
+                if (r < 32 && b == 0) {
+                    // Batch 0: all-true branch 0 to exercise early break in fallback load loop.
+                    selectors[b][r] = truthy;
+                } else {
+                    int winner = r % (kArity + 1);
+                    selectors[b][r] = (b == winner) ? truthy : 0x00;
+                }
+            }
+            select_vecs[b] = selectors[b].data();
+        }
+
+        for (int i = 0; i < kArity + 1; ++i) {
+            is_const[i] = (i == 3 || i == 7);
+            if (is_const[i]) {
+                data_values[i].resize(1);
+                data_values[i][0] = RandomGenerator<RuntimeCppType, 128>::next_value();
+            } else {
+                data_values[i].resize(row_size);
+                for (int r = 0; r < row_size; ++r) {
+                    data_values[i][r] = RandomGenerator<RuntimeCppType, 128>::next_value();
+                }
+            }
+            select_lists[i] = &data_values[i];
+        }
+
+        dst.resize(row_size);
+        dst2.resize(row_size);
+        std::memset(dst.data(), 0xCD, row_size * sizeof(RuntimeCppType));
+        std::memset(dst2.data(), 0xCD, row_size * sizeof(RuntimeCppType));
+
+        for (int r = 0; r < row_size; ++r) {
+            int idx = 0;
+            while (idx < kArity && !select_vecs[idx][r]) {
+                idx++;
+            }
+            dst2[r] = is_const[idx] ? (*select_lists[idx])[0] : (*select_lists[idx])[r];
+        }
+
+        SIMD_muti_selector<TYPE>::multi_select_if(select_vecs, kArity, dst, select_lists, kArity + 1, is_const,
+                                                  row_size);
+        ASSERT_EQ(0, std::memcmp(dst.data(), dst2.data(), row_size * sizeof(RuntimeCppType)))
+                << "type=" << static_cast<int>(TYPE) << " arity=9 use_non_canonical=" << use_non_canonical;
+    }
+}
+
 PARALLEL_TEST(SIMDMultiSelectorTest, TestVarVar) {
     // clang-format off
-    test_all<TYPE_TINYINT, 
-            TYPE_SMALLINT, 
-            TYPE_INT, 
-            TYPE_BIGINT, 
-            TYPE_LARGEINT, 
+    test_all<TYPE_BOOLEAN,
+            TYPE_TINYINT,
+            TYPE_SMALLINT,
+            TYPE_INT,
+            TYPE_BIGINT,
+            TYPE_LARGEINT,
             TYPE_DECIMAL32,
-            TYPE_DECIMAL64, 
-            TYPE_DECIMAL128, 
-            TYPE_FLOAT, 
+            TYPE_DECIMAL64,
+            TYPE_DECIMAL128,
+            TYPE_FLOAT,
             TYPE_DOUBLE,
             TYPE_DATE,
             TYPE_DATETIME>();
     // clang-format on
 }
+
+PARALLEL_TEST(SIMDMultiSelectorTest, TestNonCanonicalSelectorBytes) {
+    run_non_canonical_for_type<TYPE_BOOLEAN>();
+    run_non_canonical_for_type<TYPE_SMALLINT>();
+    run_non_canonical_for_type<TYPE_INT>();
+    run_non_canonical_for_type<TYPE_BIGINT>();
+    run_non_canonical_for_type<TYPE_DATE>();
+    run_non_canonical_for_type<TYPE_DATETIME>();
+}
+
+PARALLEL_TEST(SIMDMultiSelectorTest, TestBit31SignExtensionAndSubChunkDivergence) {
+    run_bit31_for_type<TYPE_SMALLINT>();
+    run_bit31_for_type<TYPE_INT>();
+    run_bit31_for_type<TYPE_BIGINT>();
+    run_bit31_for_type<TYPE_DATE>();
+    run_bit31_for_type<TYPE_DATETIME>();
+}
+
+PARALLEL_TEST(SIMDMultiSelectorTest, TestFirstWhenAllTrueAndExceedMaxWhenFallback) {
+    run_first_when_all_true_and_exceed_max_when_for_type<TYPE_BOOLEAN>();
+    run_first_when_all_true_and_exceed_max_when_for_type<TYPE_SMALLINT>();
+    run_first_when_all_true_and_exceed_max_when_for_type<TYPE_INT>();
+    run_first_when_all_true_and_exceed_max_when_for_type<TYPE_BIGINT>();
+    run_first_when_all_true_and_exceed_max_when_for_type<TYPE_DATE>();
+    run_first_when_all_true_and_exceed_max_when_for_type<TYPE_DATETIME>();
+}
+
 } // namespace starrocks
