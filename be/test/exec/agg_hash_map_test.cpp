@@ -863,6 +863,271 @@ TEST_F(AggHashMapTest, SliceKey32LayoutEqualityAndHash) {
     }
 }
 
+TEST_F(AggHashMapTest, FixedSize32NonNullExact32ByteBoundaryPreservesByte31) {
+    constexpr int kNumRows = 64;
+    RuntimeState state;
+    state.set_chunk_size(kNumRows);
+    RuntimeProfile profile("FixedSize32NonNullExact32ByteBoundaryPreservesByte31");
+    AggStatistics statis(&profile);
+    MemPool pool;
+    Buffer<AggDataPtr> agg_states(kNumRows);
+
+    auto c0 = Int64Column::create();
+    auto c1 = Int64Column::create();
+    auto c2 = Int64Column::create();
+    auto c3 = Int64Column::create();
+
+    using RowTuple = std::tuple<int64_t, int64_t, int64_t, int64_t>;
+    std::set<RowTuple> expected;
+    for (int i = 0; i < kNumRows; ++i) {
+        // Pair up rows that share identical bytes 0..30 and differ only in byte 31 (the MSB of c3,
+        // which overlaps SliceKey32::u.size).
+        const int group = i / 4;
+        const uint64_t msb_Choices[4] = {0x00ULL, 0x20ULL, 0x80ULL, 0xffULL};
+        const int64_t v0 = static_cast<int64_t>(0x0102030405060700ULL + group);
+        const int64_t v1 = static_cast<int64_t>(0x1112131415161700ULL + group * 3);
+        const int64_t v2 = static_cast<int64_t>(0x2122232425262700ULL + group * 7);
+        const uint64_t low56 = 0x0031323334353600ULL + static_cast<uint64_t>(group);
+        const int64_t v3 = static_cast<int64_t>(low56 | (msb_Choices[i % 4] << 56));
+        c0->append(v0);
+        c1->append(v1);
+        c2->append(v2);
+        c3->append(v3);
+        expected.emplace(v0, v1, v2, v3);
+    }
+    ASSERT_EQ(static_cast<size_t>(kNumRows), expected.size());
+    Columns key_columns{c0, c1, c2, c3};
+
+    AggHashMapVariant map_variant;
+    map_variant.init(&state, AggHashMapVariant::Type::phase1_slice_fx32, &statis);
+    map_variant.visit([&](auto& m) {
+        using MapType = std::remove_reference_t<decltype(*m)>;
+        if constexpr (std::is_same_v<MapType, SerializedKeyFixedSize32AggHashMap<PhmapSeed1>>) {
+            m->has_null_column = false;
+            m->fixed_byte_size = 32;
+            m->build_hash_map(
+                    kNumRows, key_columns, &pool, [&](const auto&) { return pool.allocate(sizeof(int64_t)); },
+                    &agg_states);
+            EXPECT_EQ(static_cast<size_t>(kNumRows), m->hash_map.size());
+        } else {
+            FAIL() << "unexpected initial map type";
+        }
+    });
+
+    map_variant.convert_to_two_level(&state);
+    ASSERT_EQ(AggHashMapVariant::Type::phase1_slice_fx32_two_level, map_variant.type());
+    map_variant.convert_to_two_level(&state);
+    ASSERT_EQ(AggHashMapVariant::Type::phase1_slice_fx32_two_level, map_variant.type());
+
+    map_variant.visit([&](auto& m) {
+        using MapType = std::remove_reference_t<decltype(*m)>;
+        if constexpr (std::is_same_v<MapType, SerializedKeyFixedSize32TwoLevelAggHashMap<PhmapSeed1>>) {
+            EXPECT_FALSE(m->has_null_column);
+            EXPECT_EQ(32, m->fixed_byte_size);
+            m->results.clear();
+            for (const auto& kv : m->hash_map) {
+                m->results.push_back(kv.first);
+            }
+            ASSERT_EQ(static_cast<size_t>(kNumRows), m->results.size());
+            MutableColumns out_cols;
+            for (int c = 0; c < 4; ++c) {
+                out_cols.push_back(Int64Column::create());
+            }
+            m->insert_keys_to_columns(m->results, out_cols, kNumRows);
+            std::set<RowTuple> actual;
+            const auto* out0 = down_cast<const Int64Column*>(out_cols[0].get());
+            const auto* out1 = down_cast<const Int64Column*>(out_cols[1].get());
+            const auto* out2 = down_cast<const Int64Column*>(out_cols[2].get());
+            const auto* out3 = down_cast<const Int64Column*>(out_cols[3].get());
+            for (int i = 0; i < kNumRows; ++i) {
+                actual.emplace(out0->get_data()[i], out1->get_data()[i], out2->get_data()[i], out3->get_data()[i]);
+            }
+            EXPECT_EQ(expected, actual);
+        } else {
+            FAIL() << "expected SerializedKeyFixedSize32TwoLevelAggHashMap";
+        }
+    });
+
+    AggHashSetVariant set_variant;
+    set_variant.init(&state, AggHashSetVariant::Type::phase1_slice_fx32, &statis);
+    set_variant.visit([&](auto& s) {
+        using SetType = std::remove_reference_t<decltype(*s)>;
+        if constexpr (std::is_same_v<SetType, SerializedKeyAggHashSetFixedSize32<PhmapSeed1>>) {
+            s->has_null_column = false;
+            s->fixed_byte_size = 32;
+            s->template build_set<true>(kNumRows, key_columns, &pool, nullptr);
+            EXPECT_EQ(static_cast<size_t>(kNumRows), s->hash_set.size());
+        } else {
+            FAIL() << "unexpected initial set type";
+        }
+    });
+    set_variant.convert_to_two_level(&state);
+    ASSERT_EQ(AggHashSetVariant::Type::phase1_slice_fx32_two_level, set_variant.type());
+    set_variant.visit([&](auto& s) {
+        using SetType = std::remove_reference_t<decltype(*s)>;
+        if constexpr (std::is_same_v<SetType, SerializedKeyAggHashSetFixedSize32TwoLevel<PhmapSeed1>>) {
+            EXPECT_FALSE(s->has_null_column);
+            EXPECT_EQ(32, s->fixed_byte_size);
+            s->results.assign(s->hash_set.begin(), s->hash_set.end());
+            ASSERT_EQ(static_cast<size_t>(kNumRows), s->results.size());
+            MutableColumns out_cols;
+            for (int c = 0; c < 4; ++c) {
+                out_cols.push_back(Int64Column::create());
+            }
+            s->insert_keys_to_columns(s->results, out_cols, kNumRows);
+            std::set<RowTuple> actual;
+            const auto* out0 = down_cast<const Int64Column*>(out_cols[0].get());
+            const auto* out1 = down_cast<const Int64Column*>(out_cols[1].get());
+            const auto* out2 = down_cast<const Int64Column*>(out_cols[2].get());
+            const auto* out3 = down_cast<const Int64Column*>(out_cols[3].get());
+            for (int i = 0; i < kNumRows; ++i) {
+                actual.emplace(out0->get_data()[i], out1->get_data()[i], out2->get_data()[i], out3->get_data()[i]);
+            }
+            EXPECT_EQ(expected, actual);
+        } else {
+            FAIL() << "expected SerializedKeyAggHashSetFixedSize32TwoLevel";
+        }
+    });
+}
+
+TEST_F(AggHashMapTest, FixedSize32NullableZeroPayloadDistinctNullBitmapsDoNotCollide) {
+    using NullableQuad =
+            std::tuple<std::optional<int32_t>, std::optional<int32_t>, std::optional<int32_t>, std::optional<int32_t>>;
+    const std::vector<NullableQuad> distinct_rows = {
+            {std::nullopt, 0, 0, 0},
+            {0, std::nullopt, 0, 0},
+            {0, 0, std::nullopt, 0},
+            {0, 0, 0, std::nullopt},
+            {0, 0, 0, 0},
+    };
+    const std::set<NullableQuad> expected(distinct_rows.begin(), distinct_rows.end());
+    ASSERT_EQ(5u, expected.size());
+
+    // Repeat each tuple twice (10 input rows) to verify both non-collision across distinct null positions
+    // and deduplication of identical nullable tuples.
+    constexpr int kNumRows = 10;
+    RuntimeState state;
+    state.set_chunk_size(kNumRows);
+    RuntimeProfile profile("FixedSize32NullableZeroPayloadDistinctNullBitmapsDoNotCollide");
+    AggStatistics statis(&profile);
+    MemPool pool;
+    Buffer<AggDataPtr> agg_states(kNumRows);
+
+    auto c0 = NullableColumn::create(Int32Column::create(), NullColumn::create());
+    auto c1 = NullableColumn::create(Int32Column::create(), NullColumn::create());
+    auto c2 = NullableColumn::create(Int32Column::create(), NullColumn::create());
+    auto c3 = NullableColumn::create(Int32Column::create(), NullColumn::create());
+
+    auto append_opt = [](const NullableColumn::MutablePtr& col, const std::optional<int32_t>& val) {
+        if (val.has_value()) {
+            col->append_datum(*val);
+        } else {
+            col->append_nulls(1);
+        }
+    };
+    for (int i = 0; i < kNumRows; ++i) {
+        const auto& [v0, v1, v2, v3] = distinct_rows[i % distinct_rows.size()];
+        append_opt(c0, v0);
+        append_opt(c1, v1);
+        append_opt(c2, v2);
+        append_opt(c3, v3);
+    }
+    Columns key_columns{c0, c1, c2, c3};
+
+    AggHashMapVariant map_variant;
+    map_variant.init(&state, AggHashMapVariant::Type::phase1_slice_fx32, &statis);
+    map_variant.visit([&](auto& m) {
+        using MapType = std::remove_reference_t<decltype(*m)>;
+        if constexpr (std::is_same_v<MapType, SerializedKeyFixedSize32AggHashMap<PhmapSeed1>>) {
+            m->has_null_column = true;
+            m->fixed_byte_size = 0;
+            m->build_hash_map(
+                    kNumRows, key_columns, &pool, [&](const auto&) { return pool.allocate(sizeof(int64_t)); },
+                    &agg_states);
+            EXPECT_EQ(5u, m->hash_map.size());
+        } else {
+            FAIL() << "unexpected initial map type";
+        }
+    });
+
+    map_variant.convert_to_two_level(&state);
+    ASSERT_EQ(AggHashMapVariant::Type::phase1_slice_fx32_two_level, map_variant.type());
+
+    auto read_nullable_quad = [](const MutableColumns& cols, int row) -> NullableQuad {
+        auto read_cell = [&](int col_idx) -> std::optional<int32_t> {
+            const auto* nul_col = down_cast<const NullableColumn*>(cols[col_idx].get());
+            if (nul_col->is_null(row)) {
+                return std::nullopt;
+            }
+            const auto* data_col = down_cast<const Int32Column*>(nul_col->data_column().get());
+            return data_col->get_data()[row];
+        };
+        return {read_cell(0), read_cell(1), read_cell(2), read_cell(3)};
+    };
+
+    map_variant.visit([&](auto& m) {
+        using MapType = std::remove_reference_t<decltype(*m)>;
+        if constexpr (std::is_same_v<MapType, SerializedKeyFixedSize32TwoLevelAggHashMap<PhmapSeed1>>) {
+            EXPECT_TRUE(m->has_null_column);
+            EXPECT_EQ(0, m->fixed_byte_size);
+            m->results.clear();
+            for (const auto& kv : m->hash_map) {
+                m->results.push_back(kv.first);
+            }
+            ASSERT_EQ(5u, m->results.size());
+            MutableColumns out_cols;
+            for (int c = 0; c < 4; ++c) {
+                out_cols.push_back(NullableColumn::create(Int32Column::create(), NullColumn::create()));
+            }
+            m->insert_keys_to_columns(m->results, out_cols, 5);
+            std::set<NullableQuad> actual;
+            for (int i = 0; i < 5; ++i) {
+                actual.insert(read_nullable_quad(out_cols, i));
+            }
+            EXPECT_EQ(expected, actual);
+        } else {
+            FAIL() << "expected SerializedKeyFixedSize32TwoLevelAggHashMap";
+        }
+    });
+
+    AggHashSetVariant set_variant;
+    set_variant.init(&state, AggHashSetVariant::Type::phase1_slice_fx32, &statis);
+    set_variant.visit([&](auto& s) {
+        using SetType = std::remove_reference_t<decltype(*s)>;
+        if constexpr (std::is_same_v<SetType, SerializedKeyAggHashSetFixedSize32<PhmapSeed1>>) {
+            s->has_null_column = true;
+            s->fixed_byte_size = 0;
+            s->template build_set<true>(kNumRows, key_columns, &pool, nullptr);
+            EXPECT_EQ(5u, s->hash_set.size());
+        } else {
+            FAIL() << "unexpected initial set type";
+        }
+    });
+    set_variant.convert_to_two_level(&state);
+    ASSERT_EQ(AggHashSetVariant::Type::phase1_slice_fx32_two_level, set_variant.type());
+    set_variant.visit([&](auto& s) {
+        using SetType = std::remove_reference_t<decltype(*s)>;
+        if constexpr (std::is_same_v<SetType, SerializedKeyAggHashSetFixedSize32TwoLevel<PhmapSeed1>>) {
+            EXPECT_TRUE(s->has_null_column);
+            EXPECT_EQ(0, s->fixed_byte_size);
+            s->results.assign(s->hash_set.begin(), s->hash_set.end());
+            ASSERT_EQ(5u, s->results.size());
+            MutableColumns out_cols;
+            for (int c = 0; c < 4; ++c) {
+                out_cols.push_back(NullableColumn::create(Int32Column::create(), NullColumn::create()));
+            }
+            s->insert_keys_to_columns(s->results, out_cols, 5);
+            std::set<NullableQuad> actual;
+            for (int i = 0; i < 5; ++i) {
+                actual.insert(read_nullable_quad(out_cols, i));
+            }
+            EXPECT_EQ(expected, actual);
+        } else {
+            FAIL() << "expected SerializedKeyAggHashSetFixedSize32TwoLevel";
+        }
+    });
+}
+
 // Guards the latent trap: a combined fixed-size key whose has_null_column is dropped stops
 // writing the null byte into the key and silently merges distinct groups.
 TEST(HashMapTest, CopyAggKeyStateCarriesCombinedFixedSizeFields) {
