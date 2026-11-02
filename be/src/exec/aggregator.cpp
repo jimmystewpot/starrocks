@@ -1614,6 +1614,9 @@ typename HashVariantType::Type Aggregator::_try_to_apply_fixed_size_opt(typename
             } else if (max_size < 16 || (!has_null_column && max_size == 16)) {
                 type = _aggr_phase == AggrPhase1 ? HashVariantType::Type::phase1_slice_fx16
                                                  : HashVariantType::Type::phase2_slice_fx16;
+            } else if (max_size < 32 || (!has_null_column && max_size == 32)) {
+                type = _aggr_phase == AggrPhase1 ? HashVariantType::Type::phase1_slice_fx32
+                                                 : HashVariantType::Type::phase2_slice_fx32;
             }
             if (!has_null_column) {
                 fixed_byte_size = max_size;
