@@ -106,6 +106,10 @@ TEST_F(AggregatorHashVariantTest, VariantNamesMatchTheEnum) {
             {AggHashMapVariant::Type::phase2_slice_fx8_two_level, "phase2_slice_fx8_two_level"},
             {AggHashMapVariant::Type::phase1_slice_fx16_two_level, "phase1_slice_fx16_two_level"},
             {AggHashMapVariant::Type::phase2_slice_fx16_two_level, "phase2_slice_fx16_two_level"},
+            {AggHashMapVariant::Type::phase1_slice_fx32, "phase1_slice_fx32"},
+            {AggHashMapVariant::Type::phase2_slice_fx32, "phase2_slice_fx32"},
+            {AggHashMapVariant::Type::phase1_slice_fx32_two_level, "phase1_slice_fx32_two_level"},
+            {AggHashMapVariant::Type::phase2_slice_fx32_two_level, "phase2_slice_fx32_two_level"},
     };
     for (const auto& [type, name] : map_cases) {
         map_variant.init(&_state, type, &_agg_stat);
@@ -124,6 +128,10 @@ TEST_F(AggregatorHashVariantTest, VariantNamesMatchTheEnum) {
             {AggHashSetVariant::Type::phase2_slice_fx8_two_level, "phase2_slice_fx8_two_level"},
             {AggHashSetVariant::Type::phase1_slice_fx16_two_level, "phase1_slice_fx16_two_level"},
             {AggHashSetVariant::Type::phase2_slice_fx16_two_level, "phase2_slice_fx16_two_level"},
+            {AggHashSetVariant::Type::phase1_slice_fx32, "phase1_slice_fx32"},
+            {AggHashSetVariant::Type::phase2_slice_fx32, "phase2_slice_fx32"},
+            {AggHashSetVariant::Type::phase1_slice_fx32_two_level, "phase1_slice_fx32_two_level"},
+            {AggHashSetVariant::Type::phase2_slice_fx32_two_level, "phase2_slice_fx32_two_level"},
     };
     for (const auto& [type, name] : set_cases) {
         set_variant.init(&_state, type, &_agg_stat);
@@ -344,6 +352,89 @@ TEST_F(AggregatorHashVariantTest, TwoLevelFixedSize16SetConversionRefreshesRepor
     aggregator->try_convert_to_two_level_set();
     EXPECT_STREQ("phase1_slice_fx16_two_level", aggregator->_hash_set_variant.type_name());
     EXPECT_EQ("phase1_slice_fx16_two_level", reported_variant());
+}
+
+// ClickBench Q35 shape: 4 nullable INT32 columns (max_size = 4 * (4 + 1) = 20B < 32B) select
+// phase1_slice_fx32 and convert to phase1_slice_fx32_two_level when over the two-level threshold.
+TEST_F(AggregatorHashVariantTest, TwoLevelFixedSize32Nullable20ByteConversionRefreshesReportedVariant) {
+    auto aggregator = make_aggregator({column_type(TYPE_INT, true), column_type(TYPE_INT, true),
+                                       column_type(TYPE_INT, true), column_type(TYPE_INT, true)});
+    aggregator->_init_agg_hash_variant(aggregator->_hash_map_variant);
+    EXPECT_STREQ("phase1_slice_fx32", aggregator->_hash_map_variant.type_name());
+    ASSERT_EQ("phase1_slice_fx32", reported_variant());
+
+    aggregator->_mem_pool = std::make_unique<MemPool>();
+
+    const int64_t saved_threshold = config::two_level_memory_threshold;
+    DeferOp restore([&]() { config::two_level_memory_threshold = saved_threshold; });
+    config::two_level_memory_threshold = 0;
+
+    aggregator->try_convert_to_two_level_map();
+    EXPECT_STREQ("phase1_slice_fx32_two_level", aggregator->_hash_map_variant.type_name());
+    EXPECT_EQ("phase1_slice_fx32_two_level", reported_variant());
+
+    aggregator->try_convert_to_two_level_map();
+    EXPECT_EQ("phase1_slice_fx32_two_level", reported_variant());
+}
+
+TEST_F(AggregatorHashVariantTest, TwoLevelFixedSize32Nullable20ByteSetConversionRefreshesReportedVariant) {
+    auto aggregator = make_aggregator({column_type(TYPE_INT, true), column_type(TYPE_INT, true),
+                                       column_type(TYPE_INT, true), column_type(TYPE_INT, true)});
+    aggregator->_is_only_group_by_columns = true;
+    aggregator->_init_agg_hash_variant(aggregator->_hash_set_variant);
+    EXPECT_STREQ("phase1_slice_fx32", aggregator->_hash_set_variant.type_name());
+    ASSERT_EQ("phase1_slice_fx32", reported_variant());
+
+    aggregator->_mem_pool = std::make_unique<MemPool>();
+
+    const int64_t saved_threshold = config::two_level_memory_threshold;
+    DeferOp restore([&]() { config::two_level_memory_threshold = saved_threshold; });
+    config::two_level_memory_threshold = 0;
+
+    aggregator->try_convert_to_two_level_set();
+    EXPECT_STREQ("phase1_slice_fx32_two_level", aggregator->_hash_set_variant.type_name());
+    EXPECT_EQ("phase1_slice_fx32_two_level", reported_variant());
+}
+
+// 4 non-nullable INT64 columns (max_size = 32B, has_null_column = false) fit at the exact 32-byte
+// boundary because byte 31 is not needed for u.size.
+TEST_F(AggregatorHashVariantTest, FixedSize32NonNullable32ByteBoundarySelectsFixedSize32) {
+    auto aggregator = make_aggregator({column_type(TYPE_BIGINT, false), column_type(TYPE_BIGINT, false),
+                                       column_type(TYPE_BIGINT, false), column_type(TYPE_BIGINT, false)});
+    aggregator->_init_agg_hash_variant(aggregator->_hash_map_variant);
+    EXPECT_STREQ("phase1_slice_fx32", aggregator->_hash_map_variant.type_name());
+    ASSERT_EQ("phase1_slice_fx32", reported_variant());
+
+    aggregator->_mem_pool = std::make_unique<MemPool>();
+
+    const int64_t saved_threshold = config::two_level_memory_threshold;
+    DeferOp restore([&]() { config::two_level_memory_threshold = saved_threshold; });
+    config::two_level_memory_threshold = 0;
+
+    aggregator->try_convert_to_two_level_map();
+    EXPECT_STREQ("phase1_slice_fx32_two_level", aggregator->_hash_map_variant.type_name());
+    EXPECT_EQ("phase1_slice_fx32_two_level", reported_variant());
+}
+
+// 4 nullable INT64 columns (max_size = 36B, has_null_column = true) and a 32B nullable layout
+// (where byte 31 would collide with u.size) both fall back to phase1_slice.
+TEST_F(AggregatorHashVariantTest, FourNullableInt64And32ByteNullableFallBackToSerializedSlice) {
+    {
+        auto aggregator = make_aggregator({column_type(TYPE_BIGINT, true), column_type(TYPE_BIGINT, true),
+                                           column_type(TYPE_BIGINT, true), column_type(TYPE_BIGINT, true)});
+        aggregator->_init_agg_hash_variant(aggregator->_hash_map_variant);
+        EXPECT_STREQ("phase1_slice", aggregator->_hash_map_variant.type_name());
+        EXPECT_EQ("phase1_slice", reported_variant());
+    }
+    {
+        // 3 non-null BIGINT (24B) + 1 non-null INT (4B) + 2 nullable TINYINT (4B) = 32B with has_null_column = true
+        auto aggregator = make_aggregator({column_type(TYPE_BIGINT, false), column_type(TYPE_BIGINT, false),
+                                           column_type(TYPE_BIGINT, false), column_type(TYPE_INT, false),
+                                           column_type(TYPE_TINYINT, true), column_type(TYPE_TINYINT, true)});
+        aggregator->_init_agg_hash_variant(aggregator->_hash_map_variant);
+        EXPECT_STREQ("phase1_slice", aggregator->_hash_map_variant.type_name());
+        EXPECT_EQ("phase1_slice", reported_variant());
+    }
 }
 
 // An aggregate with no grouping keys accumulates into a single state and never touches the hash
