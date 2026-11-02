@@ -359,6 +359,15 @@ void AggHashMapVariant::convert_to_two_level(RuntimeState* state) {
 
     CONVERT_TO_TWO_LEVEL_MAP(phase1_int32_two_level, phase1_int32);
     CONVERT_TO_TWO_LEVEL_MAP(phase2_int32_two_level, phase2_int32);
+
+    CONVERT_TO_TWO_LEVEL_MAP(phase1_int64_two_level, phase1_int64);
+    CONVERT_TO_TWO_LEVEL_MAP(phase2_int64_two_level, phase2_int64);
+
+    CONVERT_TO_TWO_LEVEL_MAP(phase1_slice_fx8_two_level, phase1_slice_fx8);
+    CONVERT_TO_TWO_LEVEL_MAP(phase2_slice_fx8_two_level, phase2_slice_fx8);
+
+    CONVERT_TO_TWO_LEVEL_MAP(phase1_slice_fx16_two_level, phase1_slice_fx16);
+    CONVERT_TO_TWO_LEVEL_MAP(phase2_slice_fx16_two_level, phase2_slice_fx16);
 }
 
 #define AGG_VARIANT_TYPE_NAME_CASE(NAME) \
@@ -488,6 +497,15 @@ void AggHashSetVariant::convert_to_two_level(RuntimeState* state) {
 
     CONVERT_TO_TWO_LEVEL_SET(phase1_int32_two_level, phase1_int32);
     CONVERT_TO_TWO_LEVEL_SET(phase2_int32_two_level, phase2_int32);
+
+    CONVERT_TO_TWO_LEVEL_SET(phase1_int64_two_level, phase1_int64);
+    CONVERT_TO_TWO_LEVEL_SET(phase2_int64_two_level, phase2_int64);
+
+    CONVERT_TO_TWO_LEVEL_SET(phase1_slice_fx8_two_level, phase1_slice_fx8);
+    CONVERT_TO_TWO_LEVEL_SET(phase2_slice_fx8_two_level, phase2_slice_fx8);
+
+    CONVERT_TO_TWO_LEVEL_SET(phase1_slice_fx16_two_level, phase1_slice_fx16);
+    CONVERT_TO_TWO_LEVEL_SET(phase2_slice_fx16_two_level, phase2_slice_fx16);
 }
 
 void AggHashSetVariant::reset() {
