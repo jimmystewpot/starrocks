@@ -48,7 +48,6 @@
 #define HWCAP_CRC32 (1 << 7)
 #endif
 #endif
-
 #include "base/coding.h"
 
 namespace starrocks::crc32c {
@@ -315,7 +314,6 @@ static inline bool has_arm_crc32() {
     return has_feature;
 }
 #endif // defined(__aarch64__)
-
 #if defined(__ARM_NEON) && defined(__aarch64__)
 namespace {
 #if defined(USE_ARM_PMULL)

@@ -111,7 +111,6 @@ TEST(CRC, SmallAndUnalignedBuffers) {
         }
     }
 }
-
 TEST(CRC, LargeBuffersAndChunking) {
     std::vector<char> buffer(65536 + 64);
     for (size_t i = 0; i < buffer.size(); ++i) {
@@ -324,7 +323,6 @@ TEST(CRC, FallbackEquivalenceAcrossBoundaries) {
     }
 #endif
 }
-
 #if defined(__ARM_NEON) && defined(__aarch64__) && defined(USE_ARM_PMULL)
 // Computes CRC32C using ARMv8 PMULL parallel 64-byte folding.
 // Precondition: len >= 64 && (len % 16 == 0).
@@ -456,4 +454,5 @@ TEST(Crc32cTest, DirectPmullContractEnforcement) {
 #endif
 
 #endif // BE_TEST
+
 } // namespace starrocks::crc32c
