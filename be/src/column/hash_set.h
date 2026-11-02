@@ -154,6 +154,8 @@ struct SliceKey32 {
     } u;
     static_assert(sizeof(u) == 32);
 
+    // Bitwise `&` over four `bool` comparisons avoids short-circuit branch mispredictions
+    // and allows the compiler to emit a single branchless 256-bit SIMD equality check.
     ALWAYS_INLINE bool operator==(const SliceKey32& k) const {
         return (u.ui64[0] == k.u.ui64[0]) & (u.ui64[1] == k.u.ui64[1]) & (u.ui64[2] == k.u.ui64[2]) &
                (u.ui64[3] == k.u.ui64[3]);

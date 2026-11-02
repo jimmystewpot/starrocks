@@ -65,7 +65,7 @@ inline size_t agg_hash_map_default_prefetch_dist() {
 }
 
 #define AGG_HASH_SET_PRECOMPUTE_HASH_VALS()                  \
-    hashes.reserve(chunk_size);                              \
+    hashes.resize(chunk_size);                               \
     for (size_t i = 0; i < chunk_size; i++) {                \
         hashes[i] = this->hash_set.hash_function()(keys[i]); \
     }                                                        \
@@ -831,6 +831,11 @@ struct AggHashSetOfSerializedKeyFixedSize : public AggHashSet<HashSet, AggHashSe
             not_founds->assign(chunk_size, 0);
         }
 
+        if (UNLIKELY(chunk_size > static_cast<size_t>(_chunk_size))) {
+            buffer = _mem_pool->allocate(max_fixed_size * chunk_size + SLICE_MEMEQUAL_OVERFLOW_PADDING);
+            memset(buffer, 0x0, max_fixed_size * chunk_size);
+            _chunk_size = chunk_size;
+        }
         if (has_null_column) {
             memset(buffer, 0x0, max_fixed_size * chunk_size);
         }
@@ -883,7 +888,7 @@ struct AggHashSetOfSerializedKeyFixedSize : public AggHashSet<HashSet, AggHashSe
 
     void insert_keys_to_columns(ResultVector& keys, MutableColumns& key_columns, int32_t chunk_size) {
         DCHECK(has_null_column || fixed_byte_size != -1);
-        tmp_slices.reserve(chunk_size);
+        tmp_slices.resize(chunk_size);
 
         if (!has_null_column) {
             for (int i = 0; i < chunk_size; i++) {

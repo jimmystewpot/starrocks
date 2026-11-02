@@ -997,13 +997,14 @@ TEST_F(AggHashMapTest, FixedSize32NullableZeroPayloadDistinctNullBitmapsDoNotCol
             {0, 0, std::nullopt, 0},
             {0, 0, 0, std::nullopt},
             {0, 0, 0, 0},
+            {std::nullopt, std::nullopt, std::nullopt, std::nullopt},
     };
     const std::set<NullableQuad> expected(distinct_rows.begin(), distinct_rows.end());
-    ASSERT_EQ(5u, expected.size());
+    ASSERT_EQ(6u, expected.size());
 
-    // Repeat each tuple twice (10 input rows) to verify both non-collision across distinct null positions
-    // and deduplication of identical nullable tuples.
-    constexpr int kNumRows = 10;
+    // Repeat each tuple twice (12 input rows) to verify both non-collision across distinct null positions
+    // (including the 100%-NULL row) and deduplication of identical nullable tuples.
+    constexpr int kNumRows = 12;
     RuntimeState state;
     state.set_chunk_size(kNumRows);
     RuntimeProfile profile("FixedSize32NullableZeroPayloadDistinctNullBitmapsDoNotCollide");
@@ -1042,7 +1043,7 @@ TEST_F(AggHashMapTest, FixedSize32NullableZeroPayloadDistinctNullBitmapsDoNotCol
             m->build_hash_map(
                     kNumRows, key_columns, &pool, [&](const auto&) { return pool.allocate(sizeof(int64_t)); },
                     &agg_states);
-            EXPECT_EQ(5u, m->hash_map.size());
+            EXPECT_EQ(6u, m->hash_map.size());
         } else {
             FAIL() << "unexpected initial map type";
         }
@@ -1072,14 +1073,14 @@ TEST_F(AggHashMapTest, FixedSize32NullableZeroPayloadDistinctNullBitmapsDoNotCol
             for (const auto& kv : m->hash_map) {
                 m->results.push_back(kv.first);
             }
-            ASSERT_EQ(5u, m->results.size());
+            ASSERT_EQ(6u, m->results.size());
             MutableColumns out_cols;
             for (int c = 0; c < 4; ++c) {
                 out_cols.push_back(NullableColumn::create(Int32Column::create(), NullColumn::create()));
             }
-            m->insert_keys_to_columns(m->results, out_cols, 5);
+            m->insert_keys_to_columns(m->results, out_cols, 6);
             std::set<NullableQuad> actual;
-            for (int i = 0; i < 5; ++i) {
+            for (int i = 0; i < 6; ++i) {
                 actual.insert(read_nullable_quad(out_cols, i));
             }
             EXPECT_EQ(expected, actual);
@@ -1096,7 +1097,7 @@ TEST_F(AggHashMapTest, FixedSize32NullableZeroPayloadDistinctNullBitmapsDoNotCol
             s->has_null_column = true;
             s->fixed_byte_size = 0;
             s->template build_set<true>(kNumRows, key_columns, &pool, nullptr);
-            EXPECT_EQ(5u, s->hash_set.size());
+            EXPECT_EQ(6u, s->hash_set.size());
         } else {
             FAIL() << "unexpected initial set type";
         }
@@ -1109,14 +1110,14 @@ TEST_F(AggHashMapTest, FixedSize32NullableZeroPayloadDistinctNullBitmapsDoNotCol
             EXPECT_TRUE(s->has_null_column);
             EXPECT_EQ(0, s->fixed_byte_size);
             s->results.assign(s->hash_set.begin(), s->hash_set.end());
-            ASSERT_EQ(5u, s->results.size());
+            ASSERT_EQ(6u, s->results.size());
             MutableColumns out_cols;
             for (int c = 0; c < 4; ++c) {
                 out_cols.push_back(NullableColumn::create(Int32Column::create(), NullColumn::create()));
             }
-            s->insert_keys_to_columns(s->results, out_cols, 5);
+            s->insert_keys_to_columns(s->results, out_cols, 6);
             std::set<NullableQuad> actual;
-            for (int i = 0; i < 5; ++i) {
+            for (int i = 0; i < 6; ++i) {
                 actual.insert(read_nullable_quad(out_cols, i));
             }
             EXPECT_EQ(expected, actual);
@@ -1164,6 +1165,14 @@ TEST_F(AggHashMapTest, FixedSize32NonNullSub32ByteNoprefetchToPrefetchTransition
         if constexpr (std::is_same_v<MapType, SerializedKeyFixedSize32AggHashMap<PhmapSeed1>>) {
             m->has_null_column = false;
             m->fixed_byte_size = 24;
+            // Empty chunk (chunk_size == 0) and single-element chunk (chunk_size == 1) must be safe no-op / 1-row build.
+            m->build_hash_map(
+                    0, key_columns, &pool, [&](const auto&) { return pool.allocate(sizeof(int64_t)); }, &agg_states);
+            EXPECT_EQ(0u, m->hash_map.size());
+            m->build_hash_map(
+                    1, key_columns, &pool, [&](const auto&) { return pool.allocate(sizeof(int64_t)); }, &agg_states);
+            EXPECT_EQ(1u, m->hash_map.size());
+
             // Chunk 1: force compute_agg_noprefetch (high L2 ratio threshold).
             config::agg_prefetch_l2_ratio = 1e9;
             m->build_hash_map(
@@ -1179,6 +1188,14 @@ TEST_F(AggHashMapTest, FixedSize32NonNullSub32ByteNoprefetchToPrefetchTransition
                     kChunkRows, key_columns, &pool, [&](const auto&) { return pool.allocate(sizeof(int64_t)); },
                     &agg_states);
             EXPECT_EQ(static_cast<size_t>(kChunkRows), m->hash_map.size());
+
+            Filter not_founds;
+            m->build_hash_map_with_selection(
+                    kChunkRows, key_columns, &pool, [&](const auto&) { return pool.allocate(sizeof(int64_t)); },
+                    &agg_states, &not_founds);
+            for (int i = 0; i < kChunkRows; ++i) {
+                EXPECT_EQ(0, not_founds[i]);
+            }
         } else {
             FAIL() << "unexpected initial map type";
         }

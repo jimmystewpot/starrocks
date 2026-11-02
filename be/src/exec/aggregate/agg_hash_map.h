@@ -1037,6 +1037,10 @@ struct AggHashMapWithSerializedKeyFixedSize
         }
     }
 
+    // NOTE: Both noprefetch and prefetch paths must serialize at stride `max_fixed_size = sizeof(CacheEntry)`
+    // and index `caches[i].key`. When `has_null_column == false`, trailing unused bytes in each `CacheEntry`
+    // are zeroed once in the constructor; serializing at a tighter stride would overwrite those zeroed bytes
+    // and corrupt keys when transitioning from noprefetch to prefetch.
     template <AllocFunc<Self> Func, typename HTBuildOp>
     ALWAYS_NOINLINE void compute_agg_noprefetch(size_t chunk_size, const Columns& key_columns,
                                                 Buffer<AggDataPtr>* agg_states, Func&& allocate_func,
@@ -1126,7 +1130,7 @@ struct AggHashMapWithSerializedKeyFixedSize
 
     void insert_keys_to_columns(ResultVector& keys, MutableColumns& key_columns, int32_t chunk_size) {
         DCHECK(has_null_column || fixed_byte_size != -1);
-        tmp_slices.reserve(chunk_size);
+        tmp_slices.resize(chunk_size);
 
         if (!has_null_column) {
             for (int i = 0; i < chunk_size; i++) {
