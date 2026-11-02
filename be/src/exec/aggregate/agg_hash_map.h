@@ -92,6 +92,14 @@ using FixedSize16SliceAggHashMap =
 // two level agg hash map
 template <PhmapSeed seed>
 using Int32AggTwoLevelHashMap = phmap::parallel_flat_hash_map<int32_t, AggDataPtr, StdHashWithSeed<int32_t, seed>>;
+template <PhmapSeed seed>
+using Int64AggTwoLevelHashMap = phmap::parallel_flat_hash_map<int64_t, AggDataPtr, StdHashWithSeed<int64_t, seed>>;
+template <PhmapSeed seed>
+using FixedSize8SliceAggTwoLevelHashMap =
+        phmap::parallel_flat_hash_map<SliceKey8, AggDataPtr, FixedSizeSliceKeyHash<SliceKey8, seed>>;
+template <PhmapSeed seed>
+using FixedSize16SliceAggTwoLevelHashMap =
+        phmap::parallel_flat_hash_map<SliceKey16, AggDataPtr, FixedSizeSliceKeyHash<SliceKey16, seed>>;
 
 // The SliceAggTwoLevelHashMap will have 2 ^ 4 = 16 sub map,
 // The 16 is same as PartitionedAggregationNode::PARTITION_FANOUT
@@ -1059,7 +1067,7 @@ struct AggHashMapWithSerializedKeyFixedSize
     template <AllocFunc<Self> Func, typename HTBuildOp>
     void compute_agg_states(size_t chunk_size, const Columns& key_columns, MemPool* pool, Func&& allocate_func,
                             Buffer<AggDataPtr>* agg_states, ExtraAggParam* extra) {
-        DCHECK(fixed_byte_size != -1);
+        DCHECK(has_null_column || fixed_byte_size != -1);
         slice_sizes.assign(chunk_size, 0);
 
         auto* buffer = reinterpret_cast<uint8_t*>(caches.data());
@@ -1108,7 +1116,7 @@ struct AggHashMapWithSerializedKeyFixedSize
     }
 
     void insert_keys_to_columns(ResultVector& keys, MutableColumns& key_columns, int32_t chunk_size) {
-        DCHECK(fixed_byte_size != -1);
+        DCHECK(has_null_column || fixed_byte_size != -1);
         tmp_slices.reserve(chunk_size);
 
         if (!has_null_column) {

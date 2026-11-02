@@ -237,6 +237,14 @@ using FixedSize16SliceAggHashSet = phmap::flat_hash_set<SliceKey16, FixedSizeSli
 // two level agg hash set
 template <PhmapSeed seed>
 using Int32AggTwoLevelHashSet = phmap::parallel_flat_hash_set<int32_t, StdHashWithSeed<int32_t, seed>>;
+template <PhmapSeed seed>
+using Int64AggTwoLevelHashSet = phmap::parallel_flat_hash_set<int64_t, StdHashWithSeed<int64_t, seed>>;
+template <PhmapSeed seed>
+using FixedSize8SliceAggTwoLevelHashSet =
+        phmap::parallel_flat_hash_set<SliceKey8, FixedSizeSliceKeyHash<SliceKey8, seed>>;
+template <PhmapSeed seed>
+using FixedSize16SliceAggTwoLevelHashSet =
+        phmap::parallel_flat_hash_set<SliceKey16, FixedSizeSliceKeyHash<SliceKey16, seed>>;
 
 template <PhmapSeed seed>
 using SliceAggTwoLevelHashSet =
@@ -811,7 +819,7 @@ struct AggHashSetOfSerializedKeyFixedSize : public AggHashSet<HashSet, AggHashSe
     // and are mainly used in the first stage of two-stage aggregation when aggr reduction is low
     template <bool compute_and_allocate>
     void build_set(size_t chunk_size, const Columns& key_columns, MemPool* pool, Filter* not_founds) {
-        DCHECK(fixed_byte_size != -1);
+        DCHECK(has_null_column || fixed_byte_size != -1);
         slice_sizes.assign(chunk_size, 0);
         if constexpr (!compute_and_allocate) {
             DCHECK(not_founds);
@@ -869,7 +877,7 @@ struct AggHashSetOfSerializedKeyFixedSize : public AggHashSet<HashSet, AggHashSe
     }
 
     void insert_keys_to_columns(ResultVector& keys, MutableColumns& key_columns, int32_t chunk_size) {
-        DCHECK(fixed_byte_size != -1);
+        DCHECK(has_null_column || fixed_byte_size != -1);
         tmp_slices.reserve(chunk_size);
 
         if (!has_null_column) {

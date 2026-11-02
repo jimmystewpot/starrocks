@@ -237,6 +237,30 @@ static_assert(agg_key_state_is_convertible<Int32AggHashSetOfOneNumberKey<PhmapSe
                                            Int32TwoLevelAggHashSetOfOneNumberKey<PhmapSeed1>>);
 static_assert(agg_key_state_is_convertible<Int32AggHashSetOfOneNumberKey<PhmapSeed2>,
                                            Int32TwoLevelAggHashSetOfOneNumberKey<PhmapSeed2>>);
+static_assert(agg_key_state_is_convertible<Int64AggHashMapWithOneNumberKey<PhmapSeed1>,
+                                           Int64TwoLevelAggHashMapWithOneNumberKey<PhmapSeed1>>);
+static_assert(agg_key_state_is_convertible<Int64AggHashMapWithOneNumberKey<PhmapSeed2>,
+                                           Int64TwoLevelAggHashMapWithOneNumberKey<PhmapSeed2>>);
+static_assert(agg_key_state_is_convertible<Int64AggHashSetOfOneNumberKey<PhmapSeed1>,
+                                           Int64TwoLevelAggHashSetOfOneNumberKey<PhmapSeed1>>);
+static_assert(agg_key_state_is_convertible<Int64AggHashSetOfOneNumberKey<PhmapSeed2>,
+                                           Int64TwoLevelAggHashSetOfOneNumberKey<PhmapSeed2>>);
+static_assert(agg_key_state_is_convertible<SerializedKeyFixedSize8AggHashMap<PhmapSeed1>,
+                                           SerializedKeyFixedSize8TwoLevelAggHashMap<PhmapSeed1>>);
+static_assert(agg_key_state_is_convertible<SerializedKeyFixedSize8AggHashMap<PhmapSeed2>,
+                                           SerializedKeyFixedSize8TwoLevelAggHashMap<PhmapSeed2>>);
+static_assert(agg_key_state_is_convertible<SerializedKeyAggHashSetFixedSize8<PhmapSeed1>,
+                                           SerializedKeyAggHashSetFixedSize8TwoLevel<PhmapSeed1>>);
+static_assert(agg_key_state_is_convertible<SerializedKeyAggHashSetFixedSize8<PhmapSeed2>,
+                                           SerializedKeyAggHashSetFixedSize8TwoLevel<PhmapSeed2>>);
+static_assert(agg_key_state_is_convertible<SerializedKeyFixedSize16AggHashMap<PhmapSeed1>,
+                                           SerializedKeyFixedSize16TwoLevelAggHashMap<PhmapSeed1>>);
+static_assert(agg_key_state_is_convertible<SerializedKeyFixedSize16AggHashMap<PhmapSeed2>,
+                                           SerializedKeyFixedSize16TwoLevelAggHashMap<PhmapSeed2>>);
+static_assert(agg_key_state_is_convertible<SerializedKeyAggHashSetFixedSize16<PhmapSeed1>,
+                                           SerializedKeyAggHashSetFixedSize16TwoLevel<PhmapSeed1>>);
+static_assert(agg_key_state_is_convertible<SerializedKeyAggHashSetFixedSize16<PhmapSeed2>,
+                                           SerializedKeyAggHashSetFixedSize16TwoLevel<PhmapSeed2>>);
 
 // ...and every way of silently dropping out-of-table state has to be rejected. Without these the
 // guard could be vacuously true and nobody would notice.
@@ -255,8 +279,14 @@ template <typename KeyType>
 KeyType make_two_level_test_key(int i, const std::vector<std::string>& key_storage) {
     if constexpr (std::is_integral_v<KeyType>) {
         return static_cast<KeyType>(i);
-    } else {
+    } else if constexpr (is_slice_with_hash32<KeyType> || std::is_same_v<KeyType, Slice>) {
         return KeyType(Slice(key_storage[i]));
+    } else {
+        KeyType key{};
+        const int64_t val = static_cast<int64_t>(i);
+        memcpy(key.u.data, &val, std::min(sizeof(val), sizeof(key.u.data)));
+        key.u.size = static_cast<uint8_t>(std::min(sizeof(val), sizeof(key.u.data)));
+        return key;
     }
 }
 
@@ -290,6 +320,10 @@ void check_map_converts_to_two_level(const char* what, AggHashMapVariant::Type s
             if constexpr (MapType::has_single_null_key) {
                 hash_map_with_key->set_null_key_data((AggDataPtr)(&null_key_value));
             }
+            if constexpr (is_combined_fixed_size_key<MapType>) {
+                hash_map_with_key->has_null_column = true;
+                hash_map_with_key->fixed_byte_size = static_cast<int>(sizeof(typename MapType::KeyType)) - 1;
+            }
         } else {
             FAIL() << "unexpected active alternative before the conversion";
         }
@@ -312,6 +346,10 @@ void check_map_converts_to_two_level(const char* what, AggHashMapVariant::Type s
             if constexpr (MapType::has_single_null_key) {
                 ASSERT_NE(nullptr, hash_map_with_key->get_null_key_data());
                 EXPECT_EQ(null_key_value, *(int64_t*)hash_map_with_key->get_null_key_data());
+            }
+            if constexpr (is_combined_fixed_size_key<MapType>) {
+                EXPECT_TRUE(hash_map_with_key->has_null_column);
+                EXPECT_EQ(static_cast<int>(sizeof(typename MapType::KeyType)) - 1, hash_map_with_key->fixed_byte_size);
             }
         } else {
             FAIL() << "convert_to_two_level() did not switch to the two-level map";
@@ -343,6 +381,10 @@ void check_set_converts_to_two_level(const char* what, AggHashSetVariant::Type s
             if constexpr (SetType::has_single_null_key) {
                 hash_set_with_key->has_null_key = true;
             }
+            if constexpr (is_combined_fixed_size_key<SetType>) {
+                hash_set_with_key->has_null_column = true;
+                hash_set_with_key->fixed_byte_size = static_cast<int>(sizeof(typename SetType::KeyType)) - 1;
+            }
         } else {
             FAIL() << "unexpected active alternative before the conversion";
         }
@@ -362,6 +404,10 @@ void check_set_converts_to_two_level(const char* what, AggHashSetVariant::Type s
             }
             if constexpr (SetType::has_single_null_key) {
                 EXPECT_TRUE(hash_set_with_key->has_null_key);
+            }
+            if constexpr (is_combined_fixed_size_key<SetType>) {
+                EXPECT_TRUE(hash_set_with_key->has_null_column);
+                EXPECT_EQ(static_cast<int>(sizeof(typename SetType::KeyType)) - 1, hash_set_with_key->fixed_byte_size);
             }
         } else {
             FAIL() << "convert_to_two_level() did not switch to the two-level set";
@@ -389,6 +435,24 @@ TEST(HashMapTest, ConvertToTwoLevelPreservesEveryDeclaredMapPair) {
     check_map_converts_to_two_level<Int32AggHashMapWithOneNumberKey<PhmapSeed2>,
                                     Int32TwoLevelAggHashMapWithOneNumberKey<PhmapSeed2>>("phase2_int32",
                                                                                          Type::phase2_int32);
+    check_map_converts_to_two_level<Int64AggHashMapWithOneNumberKey<PhmapSeed1>,
+                                    Int64TwoLevelAggHashMapWithOneNumberKey<PhmapSeed1>>("phase1_int64",
+                                                                                         Type::phase1_int64);
+    check_map_converts_to_two_level<Int64AggHashMapWithOneNumberKey<PhmapSeed2>,
+                                    Int64TwoLevelAggHashMapWithOneNumberKey<PhmapSeed2>>("phase2_int64",
+                                                                                         Type::phase2_int64);
+    check_map_converts_to_two_level<SerializedKeyFixedSize8AggHashMap<PhmapSeed1>,
+                                    SerializedKeyFixedSize8TwoLevelAggHashMap<PhmapSeed1>>("phase1_slice_fx8",
+                                                                                           Type::phase1_slice_fx8);
+    check_map_converts_to_two_level<SerializedKeyFixedSize8AggHashMap<PhmapSeed2>,
+                                    SerializedKeyFixedSize8TwoLevelAggHashMap<PhmapSeed2>>("phase2_slice_fx8",
+                                                                                           Type::phase2_slice_fx8);
+    check_map_converts_to_two_level<SerializedKeyFixedSize16AggHashMap<PhmapSeed1>,
+                                    SerializedKeyFixedSize16TwoLevelAggHashMap<PhmapSeed1>>("phase1_slice_fx16",
+                                                                                            Type::phase1_slice_fx16);
+    check_map_converts_to_two_level<SerializedKeyFixedSize16AggHashMap<PhmapSeed2>,
+                                    SerializedKeyFixedSize16TwoLevelAggHashMap<PhmapSeed2>>("phase2_slice_fx16",
+                                                                                            Type::phase2_slice_fx16);
 }
 
 TEST(HashMapTest, ConvertToTwoLevelPreservesEveryDeclaredSetPair) {
@@ -411,6 +475,24 @@ TEST(HashMapTest, ConvertToTwoLevelPreservesEveryDeclaredSetPair) {
     check_set_converts_to_two_level<Int32AggHashSetOfOneNumberKey<PhmapSeed2>,
                                     Int32TwoLevelAggHashSetOfOneNumberKey<PhmapSeed2>>("phase2_int32",
                                                                                        Type::phase2_int32);
+    check_set_converts_to_two_level<Int64AggHashSetOfOneNumberKey<PhmapSeed1>,
+                                    Int64TwoLevelAggHashSetOfOneNumberKey<PhmapSeed1>>("phase1_int64",
+                                                                                       Type::phase1_int64);
+    check_set_converts_to_two_level<Int64AggHashSetOfOneNumberKey<PhmapSeed2>,
+                                    Int64TwoLevelAggHashSetOfOneNumberKey<PhmapSeed2>>("phase2_int64",
+                                                                                       Type::phase2_int64);
+    check_set_converts_to_two_level<SerializedKeyAggHashSetFixedSize8<PhmapSeed1>,
+                                    SerializedKeyAggHashSetFixedSize8TwoLevel<PhmapSeed1>>("phase1_slice_fx8",
+                                                                                           Type::phase1_slice_fx8);
+    check_set_converts_to_two_level<SerializedKeyAggHashSetFixedSize8<PhmapSeed2>,
+                                    SerializedKeyAggHashSetFixedSize8TwoLevel<PhmapSeed2>>("phase2_slice_fx8",
+                                                                                           Type::phase2_slice_fx8);
+    check_set_converts_to_two_level<SerializedKeyAggHashSetFixedSize16<PhmapSeed1>,
+                                    SerializedKeyAggHashSetFixedSize16TwoLevel<PhmapSeed1>>("phase1_slice_fx16",
+                                                                                            Type::phase1_slice_fx16);
+    check_set_converts_to_two_level<SerializedKeyAggHashSetFixedSize16<PhmapSeed2>,
+                                    SerializedKeyAggHashSetFixedSize16TwoLevel<PhmapSeed2>>("phase2_slice_fx16",
+                                                                                            Type::phase2_slice_fx16);
 }
 
 TEST(HashMapTest, ConvertToTwoLevelInt32IdempotentAndPreservesNullKeyData) {
