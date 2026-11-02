@@ -825,11 +825,9 @@ TEST_F(AggHashMapTest, SliceKey32LayoutEqualityAndHash) {
     EXPECT_EQ(base_h1, hash1(copy));
     EXPECT_EQ(base_h2, hash2(copy));
     EXPECT_NE(base_h1, base_h2);
-    EXPECT_EQ((phmap_mix_with_seed<sizeof(size_t), PhmapSeed1>()(
-                      crc_hash_64(base.u.data, sizeof(SliceKey32), PhmapSeed1))),
+    EXPECT_EQ((phmap_mix_with_seed<sizeof(size_t), PhmapSeed1>()(crc_hash_64(&base.u, sizeof(SliceKey32), PhmapSeed1))),
               base_h1);
-    EXPECT_EQ((phmap_mix_with_seed<sizeof(size_t), PhmapSeed2>()(
-                      crc_hash_64(base.u.data, sizeof(SliceKey32), PhmapSeed2))),
+    EXPECT_EQ((phmap_mix_with_seed<sizeof(size_t), PhmapSeed2>()(crc_hash_64(&base.u, sizeof(SliceKey32), PhmapSeed2))),
               base_h2);
 
     for (int word = 0; word < 4; ++word) {
@@ -1124,6 +1122,99 @@ TEST_F(AggHashMapTest, FixedSize32NullableZeroPayloadDistinctNullBitmapsDoNotCol
             EXPECT_EQ(expected, actual);
         } else {
             FAIL() << "expected SerializedKeyAggHashSetFixedSize32TwoLevel";
+        }
+    });
+}
+
+// Regression test for BLOCKER-1: non-nullable FixedSize32 keys shorter than 32 bytes (e.g. 3 x BIGINT = 24B)
+// must not leave dirty bytes in bytes 24..31 of caches[i].key when transitioning from compute_agg_noprefetch
+// to compute_agg_prefetch and then converting to two-level.
+TEST_F(AggHashMapTest, FixedSize32NonNullSub32ByteNoprefetchToPrefetchTransition) {
+    constexpr int kChunkRows = 64;
+    const double saved_ratio = config::agg_prefetch_l2_ratio;
+    DeferOp restore_ratio([&]() { config::agg_prefetch_l2_ratio = saved_ratio; });
+
+    RuntimeState state;
+    state.set_chunk_size(kChunkRows);
+    RuntimeProfile profile("FixedSize32NonNullSub32ByteNoprefetchToPrefetchTransition");
+    AggStatistics statis(&profile);
+    MemPool pool;
+    Buffer<AggDataPtr> agg_states(kChunkRows);
+
+    auto c0 = Int64Column::create();
+    auto c1 = Int64Column::create();
+    auto c2 = Int64Column::create();
+    using RowTriple = std::tuple<int64_t, int64_t, int64_t>;
+    std::set<RowTriple> expected;
+    for (int i = 0; i < kChunkRows; ++i) {
+        const int64_t v0 = static_cast<int64_t>(0x1122334455667700ULL + i);
+        const int64_t v1 = static_cast<int64_t>(0x8899aabbccddee00ULL + i * 5);
+        const int64_t v2 = static_cast<int64_t>(0xfedcba9876543200ULL + i * 9);
+        c0->append(v0);
+        c1->append(v1);
+        c2->append(v2);
+        expected.emplace(v0, v1, v2);
+    }
+    Columns key_columns{c0, c1, c2};
+
+    AggHashMapVariant map_variant;
+    map_variant.init(&state, AggHashMapVariant::Type::phase1_slice_fx32, &statis);
+    map_variant.visit([&](auto& m) {
+        using MapType = std::remove_reference_t<decltype(*m)>;
+        if constexpr (std::is_same_v<MapType, SerializedKeyFixedSize32AggHashMap<PhmapSeed1>>) {
+            m->has_null_column = false;
+            m->fixed_byte_size = 24;
+            // Chunk 1: force compute_agg_noprefetch (high L2 ratio threshold).
+            config::agg_prefetch_l2_ratio = 1e9;
+            m->build_hash_map(
+                    kChunkRows, key_columns, &pool, [&](const auto&) { return pool.allocate(sizeof(int64_t)); },
+                    &agg_states);
+            EXPECT_EQ(static_cast<size_t>(kChunkRows), m->hash_map.size());
+
+            // Chunk 2: force compute_agg_prefetch on the exact same 24-byte keys.
+            // Without consistent CacheEntry stride, bytes 24..31 of caches[i].key contain stale non-zero bytes
+            // written by compute_agg_noprefetch, causing duplicate groups!
+            config::agg_prefetch_l2_ratio = 0.0;
+            m->build_hash_map(
+                    kChunkRows, key_columns, &pool, [&](const auto&) { return pool.allocate(sizeof(int64_t)); },
+                    &agg_states);
+            EXPECT_EQ(static_cast<size_t>(kChunkRows), m->hash_map.size());
+        } else {
+            FAIL() << "unexpected initial map type";
+        }
+    });
+
+    map_variant.convert_to_two_level(&state);
+    ASSERT_EQ(AggHashMapVariant::Type::phase1_slice_fx32_two_level, map_variant.type());
+    map_variant.visit([&](auto& m) {
+        using MapType = std::remove_reference_t<decltype(*m)>;
+        if constexpr (std::is_same_v<MapType, SerializedKeyFixedSize32TwoLevelAggHashMap<PhmapSeed1>>) {
+            config::agg_prefetch_l2_ratio = 0.0;
+            m->build_hash_map(
+                    kChunkRows, key_columns, &pool, [&](const auto&) { return pool.allocate(sizeof(int64_t)); },
+                    &agg_states);
+            EXPECT_EQ(static_cast<size_t>(kChunkRows), m->hash_map.size());
+
+            m->results.clear();
+            for (const auto& kv : m->hash_map) {
+                m->results.push_back(kv.first);
+            }
+            ASSERT_EQ(static_cast<size_t>(kChunkRows), m->results.size());
+            MutableColumns out_cols;
+            for (int c = 0; c < 3; ++c) {
+                out_cols.push_back(Int64Column::create());
+            }
+            m->insert_keys_to_columns(m->results, out_cols, kChunkRows);
+            std::set<RowTriple> actual;
+            const auto* out0 = down_cast<const Int64Column*>(out_cols[0].get());
+            const auto* out1 = down_cast<const Int64Column*>(out_cols[1].get());
+            const auto* out2 = down_cast<const Int64Column*>(out_cols[2].get());
+            for (int i = 0; i < kChunkRows; ++i) {
+                actual.emplace(out0->get_data()[i], out1->get_data()[i], out2->get_data()[i]);
+            }
+            EXPECT_EQ(expected, actual);
+        } else {
+            FAIL() << "expected SerializedKeyFixedSize32TwoLevelAggHashMap";
         }
     });
 }
