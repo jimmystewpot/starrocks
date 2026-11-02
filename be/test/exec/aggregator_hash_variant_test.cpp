@@ -100,6 +100,12 @@ TEST_F(AggregatorHashVariantTest, VariantNamesMatchTheEnum) {
             {AggHashMapVariant::Type::phase2_slice_fx8, "phase2_slice_fx8"},
             {AggHashMapVariant::Type::phase1_slice_cx4, "phase1_slice_cx4"},
             {AggHashMapVariant::Type::phase1_slice_two_level, "phase1_slice_two_level"},
+            {AggHashMapVariant::Type::phase1_int64_two_level, "phase1_int64_two_level"},
+            {AggHashMapVariant::Type::phase2_int64_two_level, "phase2_int64_two_level"},
+            {AggHashMapVariant::Type::phase1_slice_fx8_two_level, "phase1_slice_fx8_two_level"},
+            {AggHashMapVariant::Type::phase2_slice_fx8_two_level, "phase2_slice_fx8_two_level"},
+            {AggHashMapVariant::Type::phase1_slice_fx16_two_level, "phase1_slice_fx16_two_level"},
+            {AggHashMapVariant::Type::phase2_slice_fx16_two_level, "phase2_slice_fx16_two_level"},
     };
     for (const auto& [type, name] : map_cases) {
         map_variant.init(&_state, type, &_agg_stat);
@@ -112,6 +118,12 @@ TEST_F(AggregatorHashVariantTest, VariantNamesMatchTheEnum) {
             {AggHashSetVariant::Type::phase1_slice, "phase1_slice"},
             {AggHashSetVariant::Type::phase1_slice_fx16, "phase1_slice_fx16"},
             {AggHashSetVariant::Type::phase1_slice_two_level, "phase1_slice_two_level"},
+            {AggHashSetVariant::Type::phase1_int64_two_level, "phase1_int64_two_level"},
+            {AggHashSetVariant::Type::phase2_int64_two_level, "phase2_int64_two_level"},
+            {AggHashSetVariant::Type::phase1_slice_fx8_two_level, "phase1_slice_fx8_two_level"},
+            {AggHashSetVariant::Type::phase2_slice_fx8_two_level, "phase2_slice_fx8_two_level"},
+            {AggHashSetVariant::Type::phase1_slice_fx16_two_level, "phase1_slice_fx16_two_level"},
+            {AggHashSetVariant::Type::phase2_slice_fx16_two_level, "phase2_slice_fx16_two_level"},
     };
     for (const auto& [type, name] : set_cases) {
         set_variant.init(&_state, type, &_agg_stat);
@@ -222,6 +234,116 @@ TEST_F(AggregatorHashVariantTest, TwoLevelInt32SetConversionRefreshesReportedVar
     aggregator->try_convert_to_two_level_set();
     EXPECT_STREQ("phase1_int32_two_level", aggregator->_hash_set_variant.type_name());
     EXPECT_EQ("phase1_int32_two_level", reported_variant());
+}
+
+TEST_F(AggregatorHashVariantTest, TwoLevelInt64ConversionRefreshesReportedVariant) {
+    auto aggregator = make_aggregator({column_type(TYPE_BIGINT, false)});
+    aggregator->_init_agg_hash_variant(aggregator->_hash_map_variant);
+    ASSERT_EQ("phase1_int64", reported_variant());
+
+    aggregator->_mem_pool = std::make_unique<MemPool>();
+
+    const int64_t saved_threshold = config::two_level_memory_threshold;
+    DeferOp restore([&]() { config::two_level_memory_threshold = saved_threshold; });
+    config::two_level_memory_threshold = 0;
+
+    aggregator->try_convert_to_two_level_map();
+    EXPECT_STREQ("phase1_int64_two_level", aggregator->_hash_map_variant.type_name());
+    EXPECT_EQ("phase1_int64_two_level", reported_variant());
+
+    aggregator->try_convert_to_two_level_map();
+    EXPECT_EQ("phase1_int64_two_level", reported_variant());
+}
+
+TEST_F(AggregatorHashVariantTest, TwoLevelInt64SetConversionRefreshesReportedVariant) {
+    auto aggregator = make_aggregator({column_type(TYPE_BIGINT, false)});
+    aggregator->_is_only_group_by_columns = true;
+    aggregator->_init_agg_hash_variant(aggregator->_hash_set_variant);
+    ASSERT_EQ("phase1_int64", reported_variant());
+
+    aggregator->_mem_pool = std::make_unique<MemPool>();
+
+    const int64_t saved_threshold = config::two_level_memory_threshold;
+    DeferOp restore([&]() { config::two_level_memory_threshold = saved_threshold; });
+    config::two_level_memory_threshold = 0;
+
+    aggregator->try_convert_to_two_level_set();
+    EXPECT_STREQ("phase1_int64_two_level", aggregator->_hash_set_variant.type_name());
+    EXPECT_EQ("phase1_int64_two_level", reported_variant());
+}
+
+TEST_F(AggregatorHashVariantTest, TwoLevelFixedSize8ConversionRefreshesReportedVariant) {
+    auto aggregator = make_aggregator({column_type(TYPE_INT, false), column_type(TYPE_INT, false)});
+    aggregator->_init_agg_hash_variant(aggregator->_hash_map_variant);
+    ASSERT_EQ("phase1_slice_fx8", reported_variant());
+
+    aggregator->_mem_pool = std::make_unique<MemPool>();
+
+    const int64_t saved_threshold = config::two_level_memory_threshold;
+    DeferOp restore([&]() { config::two_level_memory_threshold = saved_threshold; });
+    config::two_level_memory_threshold = 0;
+
+    aggregator->try_convert_to_two_level_map();
+    EXPECT_STREQ("phase1_slice_fx8_two_level", aggregator->_hash_map_variant.type_name());
+    EXPECT_EQ("phase1_slice_fx8_two_level", reported_variant());
+
+    aggregator->try_convert_to_two_level_map();
+    EXPECT_EQ("phase1_slice_fx8_two_level", reported_variant());
+}
+
+TEST_F(AggregatorHashVariantTest, TwoLevelFixedSize8SetConversionRefreshesReportedVariant) {
+    auto aggregator = make_aggregator({column_type(TYPE_INT, false), column_type(TYPE_INT, false)});
+    aggregator->_is_only_group_by_columns = true;
+    aggregator->_init_agg_hash_variant(aggregator->_hash_set_variant);
+    ASSERT_EQ("phase1_slice_fx8", reported_variant());
+
+    aggregator->_mem_pool = std::make_unique<MemPool>();
+
+    const int64_t saved_threshold = config::two_level_memory_threshold;
+    DeferOp restore([&]() { config::two_level_memory_threshold = saved_threshold; });
+    config::two_level_memory_threshold = 0;
+
+    aggregator->try_convert_to_two_level_set();
+    EXPECT_STREQ("phase1_slice_fx8_two_level", aggregator->_hash_set_variant.type_name());
+    EXPECT_EQ("phase1_slice_fx8_two_level", reported_variant());
+}
+
+TEST_F(AggregatorHashVariantTest, TwoLevelFixedSize16ConversionRefreshesReportedVariant) {
+    auto aggregator =
+            make_aggregator({column_type(TYPE_INT, true), column_type(TYPE_INT, true), column_type(TYPE_INT, true)});
+    aggregator->_init_agg_hash_variant(aggregator->_hash_map_variant);
+    ASSERT_EQ("phase1_slice_fx16", reported_variant());
+
+    aggregator->_mem_pool = std::make_unique<MemPool>();
+
+    const int64_t saved_threshold = config::two_level_memory_threshold;
+    DeferOp restore([&]() { config::two_level_memory_threshold = saved_threshold; });
+    config::two_level_memory_threshold = 0;
+
+    aggregator->try_convert_to_two_level_map();
+    EXPECT_STREQ("phase1_slice_fx16_two_level", aggregator->_hash_map_variant.type_name());
+    EXPECT_EQ("phase1_slice_fx16_two_level", reported_variant());
+
+    aggregator->try_convert_to_two_level_map();
+    EXPECT_EQ("phase1_slice_fx16_two_level", reported_variant());
+}
+
+TEST_F(AggregatorHashVariantTest, TwoLevelFixedSize16SetConversionRefreshesReportedVariant) {
+    auto aggregator =
+            make_aggregator({column_type(TYPE_INT, true), column_type(TYPE_INT, true), column_type(TYPE_INT, true)});
+    aggregator->_is_only_group_by_columns = true;
+    aggregator->_init_agg_hash_variant(aggregator->_hash_set_variant);
+    ASSERT_EQ("phase1_slice_fx16", reported_variant());
+
+    aggregator->_mem_pool = std::make_unique<MemPool>();
+
+    const int64_t saved_threshold = config::two_level_memory_threshold;
+    DeferOp restore([&]() { config::two_level_memory_threshold = saved_threshold; });
+    config::two_level_memory_threshold = 0;
+
+    aggregator->try_convert_to_two_level_set();
+    EXPECT_STREQ("phase1_slice_fx16_two_level", aggregator->_hash_set_variant.type_name());
+    EXPECT_EQ("phase1_slice_fx16_two_level", reported_variant());
 }
 
 // An aggregate with no grouping keys accumulates into a single state and never touches the hash
