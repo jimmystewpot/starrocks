@@ -143,6 +143,30 @@ struct SliceKey16 {
     SliceKey16(SliceKey16&& x) noexcept { u.value = x.u.value; }
 };
 
+struct SliceKey32 {
+    union U {
+        struct {
+            char data[31];
+            uint8_t size;
+        } __attribute__((packed));
+        uint64_t ui64[4];
+    } u;
+    static_assert(sizeof(u) == 32);
+
+    ALWAYS_INLINE bool operator==(const SliceKey32& k) const {
+        return (u.ui64[0] == k.u.ui64[0]) & (u.ui64[1] == k.u.ui64[1]) & (u.ui64[2] == k.u.ui64[2]) &
+               (u.ui64[3] == k.u.ui64[3]);
+    }
+    SliceKey32() = default;
+    SliceKey32(const SliceKey32&) = default;
+    SliceKey32& operator=(const SliceKey32&) = default;
+    SliceKey32(SliceKey32&&) noexcept = default;
+    SliceKey32& operator=(SliceKey32&&) noexcept = default;
+};
+static_assert(sizeof(SliceKey32) == 32);
+static_assert(alignof(SliceKey32) == 8);
+static_assert(std::is_trivially_copyable_v<SliceKey32>);
+
 template <typename SliceKey, PhmapSeed seed>
 class FixedSizeSliceKeyHash {
 public:
@@ -151,9 +175,16 @@ public:
             return phmap_mix_with_seed<sizeof(size_t), seed>()(std::hash<int32_t>()(s.u.value));
         } else if constexpr (sizeof(SliceKey) == 8) {
             return phmap_mix_with_seed<sizeof(size_t), seed>()(std::hash<size_t>()(s.u.value));
-        } else {
+        } else if constexpr (sizeof(SliceKey) == 16) {
             static_assert(sizeof(s.u.value) == 16);
             return Hash128WithSeed<seed>()(s.u.value);
+        } else {
+            static_assert(sizeof(SliceKey) == 32);
+            uint64_t hash = seed;
+            for (int i = 0; i < 4; ++i) {
+                hash_combine(hash, s.u.ui64[i]);
+            }
+            return phmap_mix_with_seed<sizeof(size_t), seed>()(hash);
         }
     }
 };

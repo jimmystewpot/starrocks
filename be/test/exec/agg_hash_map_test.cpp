@@ -783,6 +783,38 @@ TEST_F(AggHashMapTest, FixedSizeTwoLevelConversionPreservesKeyStateAndDeserializ
     }
 }
 
+TEST_F(AggHashMapTest, SliceKey32LayoutEqualityAndHash) {
+    static_assert(sizeof(SliceKey32) == 32);
+    static_assert(alignof(SliceKey32) == 8);
+    static_assert(std::is_trivially_copyable_v<SliceKey32>);
+    static_assert(std::is_trivially_default_constructible_v<SliceKey32>);
+
+    SliceKey32 base{};
+    base.u.ui64[0] = 0x0123456789abcdefULL;
+    base.u.ui64[1] = 0xfedcba9876543210ULL;
+    base.u.ui64[2] = 0x1122334455667788ULL;
+    base.u.ui64[3] = 0x99aabbccddeeff00ULL;
+
+    SliceKey32 copy = base;
+    EXPECT_TRUE(base == copy);
+    FixedSizeSliceKeyHash<SliceKey32, PhmapSeed1> hash1;
+    FixedSizeSliceKeyHash<SliceKey32, PhmapSeed2> hash2;
+    const size_t base_h1 = hash1(base);
+    const size_t base_h2 = hash2(base);
+    EXPECT_EQ(base_h1, hash1(copy));
+    EXPECT_EQ(base_h2, hash2(copy));
+
+    for (int word = 0; word < 4; ++word) {
+        for (int bit = 0; bit < 64; ++bit) {
+            SliceKey32 flipped = base;
+            flipped.u.ui64[word] ^= (uint64_t{1} << bit);
+            EXPECT_FALSE(base == flipped) << "word=" << word << " bit=" << bit;
+            EXPECT_NE(base_h1, hash1(flipped)) << "word=" << word << " bit=" << bit;
+            EXPECT_NE(base_h2, hash2(flipped)) << "word=" << word << " bit=" << bit;
+        }
+    }
+}
+
 // Guards the latent trap: a combined fixed-size key whose has_null_column is dropped stops
 // writing the null byte into the key and silently merges distinct groups.
 TEST(HashMapTest, CopyAggKeyStateCarriesCombinedFixedSizeFields) {
