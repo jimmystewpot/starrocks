@@ -542,6 +542,225 @@ static void BM_AggSlice17To32B_Baseline(benchmark::State& state) {
 
 BENCHMARK(BM_AggSlice17To32B_Baseline)->Apply(BM_AggSlice17To32B_Baseline_Args);
 
+template <typename SingleHashMap, typename TwoLevelHashMap, typename KeyMaker>
+static void run_agg_two_level(benchmark::State& state, KeyMaker&& make_key) {
+    const auto distinct_keys = static_cast<size_t>(state.range(0));
+    const bool is_zipf = state.range(1) != 0;
+    auto keys = gen_agg_bench_keys(distinct_keys, is_zipf, std::forward<KeyMaker>(make_key));
+
+    constexpr size_t kChunkSize = 4096;
+    constexpr size_t kTwoLevelByteThreshold = 4 * 1024 * 1024;
+    constexpr size_t kTwoLevelSizeThreshold = 65536;
+
+    size_t table_bytes = 0;
+    size_t converted_count = 0;
+    for (auto _ : state) {
+        SingleHashMap single_map;
+        TwoLevelHashMap two_level_map;
+        bool is_two_level = false;
+        AggDataPtr dummy_state = nullptr;
+
+        for (size_t offset = 0; offset < keys.size(); offset += kChunkSize) {
+            const size_t end = std::min(offset + kChunkSize, keys.size());
+            if (!is_two_level) {
+                for (size_t i = offset; i < end; ++i) {
+                    const auto& k = keys[i];
+                    single_map.lazy_emplace(k, [&](const auto& ctor) { ctor(k, dummy_state); });
+                }
+                if (single_map.size() >= kTwoLevelSizeThreshold || single_map.dump_bound() > kTwoLevelByteThreshold) {
+                    two_level_map.reserve(single_map.capacity());
+                    two_level_map.insert(single_map.begin(), single_map.end());
+                    single_map = SingleHashMap();
+                    is_two_level = true;
+                }
+            } else {
+                for (size_t i = offset; i < end; ++i) {
+                    const auto& k = keys[i];
+                    two_level_map.lazy_emplace(k, [&](const auto& ctor) { ctor(k, dummy_state); });
+                }
+            }
+        }
+        table_bytes = is_two_level ? two_level_map.dump_bound() : single_map.dump_bound();
+        converted_count = is_two_level ? 1 : 0;
+        benchmark::DoNotOptimize(single_map);
+        benchmark::DoNotOptimize(two_level_map);
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(keys.size()));
+    state.counters["table_bytes"] = static_cast<double>(table_bytes);
+    state.counters["is_two_level"] = static_cast<double>(converted_count);
+}
+
+static void BM_AggTwoLevel_Int32(benchmark::State& state) {
+    run_agg_two_level<Int32AggHashMap<PhmapSeed1>, Int32AggTwoLevelHashMap<PhmapSeed1>>(
+            state, [](size_t i) -> int32_t { return static_cast<int32_t>(i); });
+}
+
+static void BM_AggTwoLevel_Int64(benchmark::State& state) {
+    run_agg_two_level<Int64AggHashMap<PhmapSeed1>, Int64AggTwoLevelHashMap<PhmapSeed1>>(
+            state, [](size_t i) -> int64_t { return static_cast<int64_t>(i); });
+}
+
+static void BM_AggTwoLevel_FixedSize8(benchmark::State& state) {
+    run_agg_two_level<FixedSize8SliceAggHashMap<PhmapSeed1>, FixedSize8SliceAggTwoLevelHashMap<PhmapSeed1>>(
+            state, [](size_t i) -> SliceKey8 {
+                SliceKey8 k{};
+                k.u.value = static_cast<int64_t>(i);
+                return k;
+            });
+}
+
+static void BM_AggTwoLevel_FixedSize16(benchmark::State& state) {
+    run_agg_two_level<FixedSize16SliceAggHashMap<PhmapSeed1>, FixedSize16SliceAggTwoLevelHashMap<PhmapSeed1>>(
+            state, [](size_t i) -> SliceKey16 {
+                SliceKey16 k{};
+                k.u.ui64[0] = static_cast<uint64_t>(i);
+                k.u.ui64[1] = static_cast<uint64_t>(i) ^ 0x9E3779B97F4A7C15ULL;
+                return k;
+            });
+}
+
+static void BM_AggTwoLevel_FixedSize32(benchmark::State& state) {
+    run_agg_two_level<FixedSize32SliceAggHashMap<PhmapSeed1>, FixedSize32SliceAggTwoLevelHashMap<PhmapSeed1>>(
+            state, [](size_t i) -> SliceKey32 {
+                SliceKey32 k{};
+                k.u.ui64[0] = static_cast<uint64_t>(i);
+                k.u.ui64[1] = static_cast<uint64_t>(i) ^ 0x9E3779B97F4A7C15ULL;
+                k.u.ui64[2] = static_cast<uint64_t>(i) * 0xBF58476D1CE4E5B9ULL;
+                k.u.ui64[3] = static_cast<uint64_t>(i) ^ 0x94D049BB133111EBULL;
+                return k;
+            });
+}
+
+BENCHMARK(BM_AggTwoLevel_Int32)->Apply(BM_AggSingleLevel_Baseline_Args);
+BENCHMARK(BM_AggTwoLevel_Int64)->Apply(BM_AggSingleLevel_Baseline_Args);
+BENCHMARK(BM_AggTwoLevel_FixedSize8)->Apply(BM_AggSingleLevel_Baseline_Args);
+BENCHMARK(BM_AggTwoLevel_FixedSize16)->Apply(BM_AggSingleLevel_Baseline_Args);
+BENCHMARK(BM_AggTwoLevel_FixedSize32)->Apply(BM_AggSingleLevel_Baseline_Args);
+
+struct SliceKey32WordMixHash {
+    std::size_t operator()(const SliceKey32& s) const {
+        int256_t val;
+        memcpy(static_cast<void*>(&val), &s, sizeof(SliceKey32));
+        return Hash256WithSeed<PhmapSeed1>()(val);
+    }
+};
+
+static void BM_SliceKey32_CRC32C_vs_WordMix_Args(benchmark::Benchmark* b) {
+    for (int64_t use_word_mix : {0, 1}) {
+        for (int64_t num_keys : {10000, 100000, 1000000}) {
+            b->Args({use_word_mix, num_keys});
+        }
+    }
+    b->MinTime(0.05);
+}
+
+static void BM_SliceKey32_CRC32C_vs_WordMix(benchmark::State& state) {
+    const bool use_word_mix = state.range(0) != 0;
+    const auto num_keys = static_cast<size_t>(state.range(1));
+    auto keys = gen_agg_bench_keys(num_keys, false, [](size_t i) -> SliceKey32 {
+        SliceKey32 k{};
+        k.u.ui64[0] = static_cast<uint64_t>(i);
+        k.u.ui64[1] = static_cast<uint64_t>(i) ^ 0x9E3779B97F4A7C15ULL;
+        k.u.ui64[2] = static_cast<uint64_t>(i) * 0xBF58476D1CE4E5B9ULL;
+        k.u.ui64[3] = static_cast<uint64_t>(i) ^ 0x94D049BB133111EBULL;
+        return k;
+    });
+
+    if (!use_word_mix) {
+        FixedSizeSliceKeyHash<SliceKey32, PhmapSeed1> hasher;
+        for (auto _ : state) {
+            size_t acc = 0;
+            for (const auto& k : keys) {
+                acc ^= hasher(k);
+            }
+            benchmark::DoNotOptimize(acc);
+        }
+    } else {
+        SliceKey32WordMixHash hasher;
+        for (auto _ : state) {
+            size_t acc = 0;
+            for (const auto& k : keys) {
+                acc ^= hasher(k);
+            }
+            benchmark::DoNotOptimize(acc);
+        }
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(keys.size()));
+}
+
+BENCHMARK(BM_SliceKey32_CRC32C_vs_WordMix)->Apply(BM_SliceKey32_CRC32C_vs_WordMix_Args);
+
+static void BM_FixedSize32_vs_GenericSlice_Q35_Args(benchmark::Benchmark* b) {
+    for (int64_t use_fixed_size32 : {0, 1}) {
+        for (int64_t key_bytes : {20, 32}) {
+            for (int64_t distinct_keys : {10000, 100000, 1000000}) {
+                b->Args({use_fixed_size32, key_bytes, distinct_keys});
+            }
+        }
+    }
+    b->MinTime(0.05);
+}
+
+static void BM_FixedSize32_vs_GenericSlice_Q35(benchmark::State& state) {
+    const bool use_fixed_size32 = state.range(0) != 0;
+    const auto key_bytes = static_cast<size_t>(state.range(1));
+    const auto distinct_keys = static_cast<size_t>(state.range(2));
+
+    std::vector<char> raw_keys(distinct_keys * key_bytes + SLICE_MEMEQUAL_OVERFLOW_PADDING, 0);
+    for (size_t i = 0; i < distinct_keys; ++i) {
+        char* dst = raw_keys.data() + i * key_bytes;
+        uint64_t lo = static_cast<uint64_t>(i);
+        uint64_t hi = static_cast<uint64_t>(i) ^ 0x9E3779B97F4A7C15ULL;
+        memcpy(dst, &lo, sizeof(lo));
+        memcpy(dst + 8, &hi, sizeof(hi));
+        uint64_t tail = static_cast<uint64_t>(i) * 0xBF58476D1CE4E5B9ULL;
+        memcpy(dst + 16, &tail, std::min<size_t>(sizeof(tail), key_bytes - 16));
+    }
+
+    size_t pool_bytes = 0;
+    size_t table_bytes = 0;
+    if (!use_fixed_size32) {
+        for (auto _ : state) {
+            MemPool pool;
+            MemPool escape_pool;
+            SliceAggHashMap<PhmapSeed1> map;
+            AggDataPtr dummy_state = nullptr;
+            for (size_t i = 0; i < distinct_keys; ++i) {
+                Slice s(raw_keys.data() + i * key_bytes, key_bytes);
+                const auto key = make_agg_slice_key<SliceWithHash32<PhmapSeed1>>(s, &escape_pool);
+                map.lazy_emplace(key, [&](const auto& ctor) {
+                    auto pk = persist_agg_slice_key(key, &pool);
+                    ctor(pk, dummy_state);
+                });
+            }
+            pool_bytes = static_cast<size_t>(pool.total_allocated_bytes());
+            table_bytes = map.dump_bound();
+            benchmark::DoNotOptimize(map);
+        }
+    } else {
+        for (auto _ : state) {
+            FixedSize32SliceAggHashMap<PhmapSeed1> map;
+            AggDataPtr dummy_state = nullptr;
+            for (size_t i = 0; i < distinct_keys; ++i) {
+                SliceKey32 key{};
+                memcpy(key.u.data, raw_keys.data() + i * key_bytes, key_bytes);
+                if (key_bytes < sizeof(SliceKey32)) {
+                    key.u.size = static_cast<uint8_t>(key_bytes);
+                }
+                map.lazy_emplace(key, [&](const auto& ctor) { ctor(key, dummy_state); });
+            }
+            pool_bytes = 0;
+            table_bytes = map.dump_bound();
+            benchmark::DoNotOptimize(map);
+        }
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(distinct_keys));
+    state.counters["pool_bytes"] = static_cast<double>(pool_bytes);
+    state.counters["table_bytes"] = static_cast<double>(table_bytes);
+}
+
+BENCHMARK(BM_FixedSize32_vs_GenericSlice_Q35)->Apply(BM_FixedSize32_vs_GenericSlice_Q35_Args);
+
 } // namespace starrocks
 
 BENCHMARK_MAIN();
