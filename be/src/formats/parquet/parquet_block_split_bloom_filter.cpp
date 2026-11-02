@@ -24,7 +24,19 @@
 
 namespace starrocks {
 
-#if defined(__ARM_NEON) && defined(__aarch64__)
+#ifdef __AVX2__
+namespace {
+inline __m256i compute_masks_avx2(uint32_t key) {
+    const __m256i v_salt = _mm256_setr_epi32(0x47b6137b, 0x44974d91, 0x8824ad5b, 0xa2b7289d, 0x705495c7, 0x2df1424b,
+                                             0x9efc4947, 0x5c6bfb31);
+    const __m256i v_ones = _mm256_set1_epi32(1);
+    __m256i v_key = _mm256_set1_epi32(key);
+    __m256i v_hash = _mm256_mullo_epi32(v_key, v_salt);
+    __m256i v_shift = _mm256_srli_epi32(v_hash, 27);
+    return _mm256_sllv_epi32(v_ones, v_shift);
+}
+} // namespace
+#elif defined(__ARM_NEON) && defined(__aarch64__)
 namespace {
 static inline void compute_neon_masks(uint32_t key, uint32x4_t* mask_lo, uint32x4_t* mask_hi) {
     static constexpr uint32_t kSaltLo[4] = {0x47b6137bU, 0x44974d91U, 0x8824ad5bU, 0xa2b7289dU};
@@ -54,22 +66,19 @@ void ParquetBlockSplitBloomFilter::add_hash(uint64_t hash) {
     uint32x4_t block_hi = vreinterpretq_u32_u8(vld1q_u8(block_bytes + 16));
     vst1q_u8(block_bytes, vreinterpretq_u8_u32(vorrq_u32(block_lo, mask_lo)));
     vst1q_u8(block_bytes + 16, vreinterpretq_u8_u32(vorrq_u32(block_hi, mask_hi)));
-#else
-    // Calculate masks for bucket.
-    uint32_t masks[8];
-    _set_masks(key, masks);
+#elif defined(__AVX2__)
     auto* block_offset = (uint32_t*)(_data + BYTES_PER_BLOCK * block_index);
-
-#ifdef __AVX2__
-    // OR the 8 mask lanes into the 8 block lanes in one 256-bit op instead of the loop.
+    // Compute mask lanes directly in AVX2 registers without stack spills.
+    __m256i v_masks = compute_masks_avx2(key);
     __m256i v_block = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block_offset));
-    __m256i v_masks = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(masks));
     _mm256_storeu_si256(reinterpret_cast<__m256i*>(block_offset), _mm256_or_si256(v_block, v_masks));
 #else
+    auto* block_offset = (uint32_t*)(_data + BYTES_PER_BLOCK * block_index);
+    uint32_t masks[BITS_SET_PER_BLOCK];
+    _set_masks(key, masks);
     for (int i = 0; i < BITS_SET_PER_BLOCK; ++i) {
         *(block_offset + i) |= masks[i];
     }
-#endif
 #endif
 }
 
@@ -88,27 +97,24 @@ bool ParquetBlockSplitBloomFilter::test_hash(uint64_t hash) const {
     uint32x4_t block_hi = vreinterpretq_u32_u8(vld1q_u8(block_bytes + 16));
     uint32x4_t diff = vorrq_u32(vbicq_u32(mask_lo, block_lo), vbicq_u32(mask_hi, block_hi));
     return vmaxvq_u32(diff) == 0;
-#else
-    // Calculate masks for bucket.
-    uint32_t masks[BITS_SET_PER_BLOCK];
-    _set_masks(key, masks);
+#elif defined(__AVX2__)
     auto* block_offset = (uint32_t*)(_data + BYTES_PER_BLOCK * block_index);
-
-#ifdef __AVX2__
     // Hash is present iff every mask lane is also set in the block lane, i.e.
     // (~v_block) & v_masks == 0. PTEST sets CF on exactly that condition, so
     // _mm256_testc_si256 returns 1 when the hash may be present.
+    __m256i v_masks = compute_masks_avx2(key);
     __m256i v_block = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block_offset));
-    __m256i v_masks = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(masks));
     return _mm256_testc_si256(v_block, v_masks);
 #else
+    auto* block_offset = (uint32_t*)(_data + BYTES_PER_BLOCK * block_index);
+    uint32_t masks[BITS_SET_PER_BLOCK];
+    _set_masks(key, masks);
     for (int i = 0; i < BITS_SET_PER_BLOCK; ++i) {
         if ((*(block_offset + i) & masks[i]) == 0) {
             return false;
         }
     }
     return true;
-#endif
 #endif
 }
 
