@@ -261,6 +261,14 @@ static_assert(agg_key_state_is_convertible<SerializedKeyAggHashSetFixedSize16<Ph
                                            SerializedKeyAggHashSetFixedSize16TwoLevel<PhmapSeed1>>);
 static_assert(agg_key_state_is_convertible<SerializedKeyAggHashSetFixedSize16<PhmapSeed2>,
                                            SerializedKeyAggHashSetFixedSize16TwoLevel<PhmapSeed2>>);
+static_assert(agg_key_state_is_convertible<SerializedKeyFixedSize32AggHashMap<PhmapSeed1>,
+                                           SerializedKeyFixedSize32TwoLevelAggHashMap<PhmapSeed1>>);
+static_assert(agg_key_state_is_convertible<SerializedKeyFixedSize32AggHashMap<PhmapSeed2>,
+                                           SerializedKeyFixedSize32TwoLevelAggHashMap<PhmapSeed2>>);
+static_assert(agg_key_state_is_convertible<SerializedKeyAggHashSetFixedSize32<PhmapSeed1>,
+                                           SerializedKeyAggHashSetFixedSize32TwoLevel<PhmapSeed1>>);
+static_assert(agg_key_state_is_convertible<SerializedKeyAggHashSetFixedSize32<PhmapSeed2>,
+                                           SerializedKeyAggHashSetFixedSize32TwoLevel<PhmapSeed2>>);
 
 // ...and every way of silently dropping out-of-table state has to be rejected. Without these the
 // guard could be vacuously true and nobody would notice.
@@ -453,6 +461,12 @@ TEST(HashMapTest, ConvertToTwoLevelPreservesEveryDeclaredMapPair) {
     check_map_converts_to_two_level<SerializedKeyFixedSize16AggHashMap<PhmapSeed2>,
                                     SerializedKeyFixedSize16TwoLevelAggHashMap<PhmapSeed2>>("phase2_slice_fx16",
                                                                                             Type::phase2_slice_fx16);
+    check_map_converts_to_two_level<SerializedKeyFixedSize32AggHashMap<PhmapSeed1>,
+                                    SerializedKeyFixedSize32TwoLevelAggHashMap<PhmapSeed1>>("phase1_slice_fx32",
+                                                                                            Type::phase1_slice_fx32);
+    check_map_converts_to_two_level<SerializedKeyFixedSize32AggHashMap<PhmapSeed2>,
+                                    SerializedKeyFixedSize32TwoLevelAggHashMap<PhmapSeed2>>("phase2_slice_fx32",
+                                                                                            Type::phase2_slice_fx32);
 }
 
 TEST(HashMapTest, ConvertToTwoLevelPreservesEveryDeclaredSetPair) {
@@ -493,6 +507,12 @@ TEST(HashMapTest, ConvertToTwoLevelPreservesEveryDeclaredSetPair) {
     check_set_converts_to_two_level<SerializedKeyAggHashSetFixedSize16<PhmapSeed2>,
                                     SerializedKeyAggHashSetFixedSize16TwoLevel<PhmapSeed2>>("phase2_slice_fx16",
                                                                                             Type::phase2_slice_fx16);
+    check_set_converts_to_two_level<SerializedKeyAggHashSetFixedSize32<PhmapSeed1>,
+                                    SerializedKeyAggHashSetFixedSize32TwoLevel<PhmapSeed1>>("phase1_slice_fx32",
+                                                                                            Type::phase1_slice_fx32);
+    check_set_converts_to_two_level<SerializedKeyAggHashSetFixedSize32<PhmapSeed2>,
+                                    SerializedKeyAggHashSetFixedSize32TwoLevel<PhmapSeed2>>("phase2_slice_fx32",
+                                                                                            Type::phase2_slice_fx32);
 }
 
 TEST(HashMapTest, ConvertToTwoLevelInt32IdempotentAndPreservesNullKeyData) {
@@ -788,6 +808,7 @@ TEST_F(AggHashMapTest, SliceKey32LayoutEqualityAndHash) {
     static_assert(alignof(SliceKey32) == 8);
     static_assert(std::is_trivially_copyable_v<SliceKey32>);
     static_assert(std::is_trivially_default_constructible_v<SliceKey32>);
+    static_assert(sizeof(SerializedKeyFixedSize32AggHashMap<PhmapSeed1>::CacheEntry) == 40);
 
     SliceKey32 base{};
     base.u.ui64[0] = 0x0123456789abcdefULL;

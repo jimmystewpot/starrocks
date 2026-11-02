@@ -232,6 +232,8 @@ template <PhmapSeed seed>
 using FixedSize8SliceAggHashSet = phmap::flat_hash_set<SliceKey8, FixedSizeSliceKeyHash<SliceKey8, seed>>;
 template <PhmapSeed seed>
 using FixedSize16SliceAggHashSet = phmap::flat_hash_set<SliceKey16, FixedSizeSliceKeyHash<SliceKey16, seed>>;
+template <PhmapSeed seed>
+using FixedSize32SliceAggHashSet = phmap::flat_hash_set<SliceKey32, FixedSizeSliceKeyHash<SliceKey32, seed>>;
 
 // =====================
 // two level agg hash set
@@ -245,6 +247,9 @@ using FixedSize8SliceAggTwoLevelHashSet =
 template <PhmapSeed seed>
 using FixedSize16SliceAggTwoLevelHashSet =
         phmap::parallel_flat_hash_set<SliceKey16, FixedSizeSliceKeyHash<SliceKey16, seed>>;
+template <PhmapSeed seed>
+using FixedSize32SliceAggTwoLevelHashSet =
+        phmap::parallel_flat_hash_set<SliceKey32, FixedSizeSliceKeyHash<SliceKey32, seed>>;
 
 template <PhmapSeed seed>
 using SliceAggTwoLevelHashSet =

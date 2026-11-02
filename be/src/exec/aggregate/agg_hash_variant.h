@@ -113,11 +113,16 @@ using SerializedKeyFixedSize8AggHashMap = AggHashMapWithSerializedKeyFixedSize<F
 template <PhmapSeed seed>
 using SerializedKeyFixedSize16AggHashMap = AggHashMapWithSerializedKeyFixedSize<FixedSize16SliceAggHashMap<seed>>;
 template <PhmapSeed seed>
+using SerializedKeyFixedSize32AggHashMap = AggHashMapWithSerializedKeyFixedSize<FixedSize32SliceAggHashMap<seed>>;
+template <PhmapSeed seed>
 using SerializedKeyFixedSize8TwoLevelAggHashMap =
         AggHashMapWithSerializedKeyFixedSize<FixedSize8SliceAggTwoLevelHashMap<seed>>;
 template <PhmapSeed seed>
 using SerializedKeyFixedSize16TwoLevelAggHashMap =
         AggHashMapWithSerializedKeyFixedSize<FixedSize16SliceAggTwoLevelHashMap<seed>>;
+template <PhmapSeed seed>
+using SerializedKeyFixedSize32TwoLevelAggHashMap =
+        AggHashMapWithSerializedKeyFixedSize<FixedSize32SliceAggTwoLevelHashMap<seed>>;
 
 // fixed compress key
 template <PhmapSeed seed>
@@ -215,12 +220,19 @@ template <PhmapSeed seed>
 using SerializedKeyAggHashSetFixedSize16 = AggHashSetOfSerializedKeyFixedSize<FixedSize16SliceAggHashSet<seed>>;
 
 template <PhmapSeed seed>
+using SerializedKeyAggHashSetFixedSize32 = AggHashSetOfSerializedKeyFixedSize<FixedSize32SliceAggHashSet<seed>>;
+
+template <PhmapSeed seed>
 using SerializedKeyAggHashSetFixedSize8TwoLevel =
         AggHashSetOfSerializedKeyFixedSize<FixedSize8SliceAggTwoLevelHashSet<seed>>;
 
 template <PhmapSeed seed>
 using SerializedKeyAggHashSetFixedSize16TwoLevel =
         AggHashSetOfSerializedKeyFixedSize<FixedSize16SliceAggTwoLevelHashSet<seed>>;
+
+template <PhmapSeed seed>
+using SerializedKeyAggHashSetFixedSize32TwoLevel =
+        AggHashSetOfSerializedKeyFixedSize<FixedSize32SliceAggTwoLevelHashSet<seed>>;
 
 template <PhmapSeed seed>
 using CompressedAggHashSetFixedSize1 = AggHashSetCompressedFixedSize<Int8AggHashSet<seed>>;
@@ -351,8 +363,10 @@ using AggHashMapWithKeyPtr = std::variant<
         std::unique_ptr<SerializedKeyFixedSize4AggHashMap<PhmapSeed1>>,
         std::unique_ptr<SerializedKeyFixedSize8AggHashMap<PhmapSeed1>>,
         std::unique_ptr<SerializedKeyFixedSize16AggHashMap<PhmapSeed1>>,
+        std::unique_ptr<SerializedKeyFixedSize32AggHashMap<PhmapSeed1>>,
         std::unique_ptr<SerializedKeyFixedSize8TwoLevelAggHashMap<PhmapSeed1>>,
         std::unique_ptr<SerializedKeyFixedSize16TwoLevelAggHashMap<PhmapSeed1>>,
+        std::unique_ptr<SerializedKeyFixedSize32TwoLevelAggHashMap<PhmapSeed1>>,
         std::unique_ptr<CompressedFixedSize1AggHashMap<PhmapSeed1>>,
         std::unique_ptr<CompressedFixedSize4AggHashMap<PhmapSeed1>>,
         std::unique_ptr<CompressedFixedSize8AggHashMap<PhmapSeed1>>,
@@ -391,8 +405,10 @@ using AggHashMapWithKeyPtr = std::variant<
         std::unique_ptr<SerializedKeyFixedSize4AggHashMap<PhmapSeed2>>,
         std::unique_ptr<SerializedKeyFixedSize8AggHashMap<PhmapSeed2>>,
         std::unique_ptr<SerializedKeyFixedSize16AggHashMap<PhmapSeed2>>,
+        std::unique_ptr<SerializedKeyFixedSize32AggHashMap<PhmapSeed2>>,
         std::unique_ptr<SerializedKeyFixedSize8TwoLevelAggHashMap<PhmapSeed2>>,
         std::unique_ptr<SerializedKeyFixedSize16TwoLevelAggHashMap<PhmapSeed2>>,
+        std::unique_ptr<SerializedKeyFixedSize32TwoLevelAggHashMap<PhmapSeed2>>,
         std::unique_ptr<CompressedFixedSize1AggHashMap<PhmapSeed2>>,
         std::unique_ptr<CompressedFixedSize4AggHashMap<PhmapSeed2>>,
         std::unique_ptr<CompressedFixedSize8AggHashMap<PhmapSeed2>>,
@@ -464,13 +480,17 @@ using AggHashSetWithKeyPtr = std::variant<
         std::unique_ptr<SerializedKeyAggHashSetFixedSize4<PhmapSeed1>>,
         std::unique_ptr<SerializedKeyAggHashSetFixedSize8<PhmapSeed1>>,
         std::unique_ptr<SerializedKeyAggHashSetFixedSize16<PhmapSeed1>>,
+        std::unique_ptr<SerializedKeyAggHashSetFixedSize32<PhmapSeed1>>,
         std::unique_ptr<SerializedKeyAggHashSetFixedSize8TwoLevel<PhmapSeed1>>,
         std::unique_ptr<SerializedKeyAggHashSetFixedSize16TwoLevel<PhmapSeed1>>,
+        std::unique_ptr<SerializedKeyAggHashSetFixedSize32TwoLevel<PhmapSeed1>>,
         std::unique_ptr<SerializedKeyAggHashSetFixedSize4<PhmapSeed2>>,
         std::unique_ptr<SerializedKeyAggHashSetFixedSize8<PhmapSeed2>>,
         std::unique_ptr<SerializedKeyAggHashSetFixedSize16<PhmapSeed2>>,
+        std::unique_ptr<SerializedKeyAggHashSetFixedSize32<PhmapSeed2>>,
         std::unique_ptr<SerializedKeyAggHashSetFixedSize8TwoLevel<PhmapSeed2>>,
         std::unique_ptr<SerializedKeyAggHashSetFixedSize16TwoLevel<PhmapSeed2>>,
+        std::unique_ptr<SerializedKeyAggHashSetFixedSize32TwoLevel<PhmapSeed2>>,
 
         std::unique_ptr<CompressedAggHashSetFixedSize1<PhmapSeed1>>,
         std::unique_ptr<CompressedAggHashSetFixedSize4<PhmapSeed1>>,
@@ -519,8 +539,10 @@ struct AggHashMapVariant {
         phase1_slice_fx4,
         phase1_slice_fx8,
         phase1_slice_fx16,
+        phase1_slice_fx32,
         phase1_slice_fx8_two_level,
         phase1_slice_fx16_two_level,
+        phase1_slice_fx32_two_level,
 
         phase1_slice_cx1,
         phase1_slice_cx4,
@@ -563,8 +585,10 @@ struct AggHashMapVariant {
         phase2_slice_fx4,
         phase2_slice_fx8,
         phase2_slice_fx16,
+        phase2_slice_fx32,
         phase2_slice_fx8_two_level,
         phase2_slice_fx16_two_level,
+        phase2_slice_fx32_two_level,
 
         phase2_slice_cx1,
         phase2_slice_cx4,
@@ -696,13 +720,17 @@ struct AggHashSetVariant {
         phase1_slice_fx4,
         phase1_slice_fx8,
         phase1_slice_fx16,
+        phase1_slice_fx32,
         phase1_slice_fx8_two_level,
         phase1_slice_fx16_two_level,
+        phase1_slice_fx32_two_level,
         phase2_slice_fx4,
         phase2_slice_fx8,
         phase2_slice_fx16,
+        phase2_slice_fx32,
         phase2_slice_fx8_two_level,
         phase2_slice_fx16_two_level,
+        phase2_slice_fx32_two_level,
 
         phase1_slice_cx1,
         phase1_slice_cx4,

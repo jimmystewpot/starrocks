@@ -90,13 +90,17 @@
     M(phase1_slice_fx4)              \
     M(phase1_slice_fx8)              \
     M(phase1_slice_fx16)             \
+    M(phase1_slice_fx32)             \
     M(phase1_slice_fx8_two_level)    \
     M(phase1_slice_fx16_two_level)   \
+    M(phase1_slice_fx32_two_level)   \
     M(phase2_slice_fx4)              \
     M(phase2_slice_fx8)              \
     M(phase2_slice_fx16)             \
+    M(phase2_slice_fx32)             \
     M(phase2_slice_fx8_two_level)    \
     M(phase2_slice_fx16_two_level)   \
+    M(phase2_slice_fx32_two_level)   \
     M(phase1_slice_cx1)              \
     M(phase1_slice_cx4)              \
     M(phase1_slice_cx8)              \
@@ -152,10 +156,13 @@ DEFINE_MAP_TYPE(AggHashMapVariant::Type::phase1_string_two_level, OneStringTwoLe
 DEFINE_MAP_TYPE(AggHashMapVariant::Type::phase1_slice_fx4, SerializedKeyFixedSize4AggHashMap<PhmapSeed1>);
 DEFINE_MAP_TYPE(AggHashMapVariant::Type::phase1_slice_fx8, SerializedKeyFixedSize8AggHashMap<PhmapSeed1>);
 DEFINE_MAP_TYPE(AggHashMapVariant::Type::phase1_slice_fx16, SerializedKeyFixedSize16AggHashMap<PhmapSeed1>);
+DEFINE_MAP_TYPE(AggHashMapVariant::Type::phase1_slice_fx32, SerializedKeyFixedSize32AggHashMap<PhmapSeed1>);
 DEFINE_MAP_TYPE(AggHashMapVariant::Type::phase1_slice_fx8_two_level,
                 SerializedKeyFixedSize8TwoLevelAggHashMap<PhmapSeed1>);
 DEFINE_MAP_TYPE(AggHashMapVariant::Type::phase1_slice_fx16_two_level,
                 SerializedKeyFixedSize16TwoLevelAggHashMap<PhmapSeed1>);
+DEFINE_MAP_TYPE(AggHashMapVariant::Type::phase1_slice_fx32_two_level,
+                SerializedKeyFixedSize32TwoLevelAggHashMap<PhmapSeed1>);
 DEFINE_MAP_TYPE(AggHashMapVariant::Type::phase1_slice_cx1, CompressedFixedSize1AggHashMap<PhmapSeed1>);
 DEFINE_MAP_TYPE(AggHashMapVariant::Type::phase1_slice_cx4, CompressedFixedSize4AggHashMap<PhmapSeed1>);
 DEFINE_MAP_TYPE(AggHashMapVariant::Type::phase1_slice_cx8, CompressedFixedSize8AggHashMap<PhmapSeed1>);
@@ -195,10 +202,13 @@ DEFINE_MAP_TYPE(AggHashMapVariant::Type::phase2_string_two_level, OneStringTwoLe
 DEFINE_MAP_TYPE(AggHashMapVariant::Type::phase2_slice_fx4, SerializedKeyFixedSize4AggHashMap<PhmapSeed2>);
 DEFINE_MAP_TYPE(AggHashMapVariant::Type::phase2_slice_fx8, SerializedKeyFixedSize8AggHashMap<PhmapSeed2>);
 DEFINE_MAP_TYPE(AggHashMapVariant::Type::phase2_slice_fx16, SerializedKeyFixedSize16AggHashMap<PhmapSeed2>);
+DEFINE_MAP_TYPE(AggHashMapVariant::Type::phase2_slice_fx32, SerializedKeyFixedSize32AggHashMap<PhmapSeed2>);
 DEFINE_MAP_TYPE(AggHashMapVariant::Type::phase2_slice_fx8_two_level,
                 SerializedKeyFixedSize8TwoLevelAggHashMap<PhmapSeed2>);
 DEFINE_MAP_TYPE(AggHashMapVariant::Type::phase2_slice_fx16_two_level,
                 SerializedKeyFixedSize16TwoLevelAggHashMap<PhmapSeed2>);
+DEFINE_MAP_TYPE(AggHashMapVariant::Type::phase2_slice_fx32_two_level,
+                SerializedKeyFixedSize32TwoLevelAggHashMap<PhmapSeed2>);
 DEFINE_MAP_TYPE(AggHashMapVariant::Type::phase2_slice_cx1, CompressedFixedSize1AggHashMap<PhmapSeed2>);
 DEFINE_MAP_TYPE(AggHashMapVariant::Type::phase2_slice_cx4, CompressedFixedSize4AggHashMap<PhmapSeed2>);
 DEFINE_MAP_TYPE(AggHashMapVariant::Type::phase2_slice_cx8, CompressedFixedSize8AggHashMap<PhmapSeed2>);
@@ -282,17 +292,23 @@ DEFINE_SET_TYPE(AggHashSetVariant::Type::phase2_null_string_two_level, NullOneSt
 DEFINE_SET_TYPE(AggHashSetVariant::Type::phase1_slice_fx4, SerializedKeyAggHashSetFixedSize4<PhmapSeed1>);
 DEFINE_SET_TYPE(AggHashSetVariant::Type::phase1_slice_fx8, SerializedKeyAggHashSetFixedSize8<PhmapSeed1>);
 DEFINE_SET_TYPE(AggHashSetVariant::Type::phase1_slice_fx16, SerializedKeyAggHashSetFixedSize16<PhmapSeed1>);
+DEFINE_SET_TYPE(AggHashSetVariant::Type::phase1_slice_fx32, SerializedKeyAggHashSetFixedSize32<PhmapSeed1>);
 DEFINE_SET_TYPE(AggHashSetVariant::Type::phase1_slice_fx8_two_level,
                 SerializedKeyAggHashSetFixedSize8TwoLevel<PhmapSeed1>);
 DEFINE_SET_TYPE(AggHashSetVariant::Type::phase1_slice_fx16_two_level,
                 SerializedKeyAggHashSetFixedSize16TwoLevel<PhmapSeed1>);
+DEFINE_SET_TYPE(AggHashSetVariant::Type::phase1_slice_fx32_two_level,
+                SerializedKeyAggHashSetFixedSize32TwoLevel<PhmapSeed1>);
 DEFINE_SET_TYPE(AggHashSetVariant::Type::phase2_slice_fx4, SerializedKeyAggHashSetFixedSize4<PhmapSeed2>);
 DEFINE_SET_TYPE(AggHashSetVariant::Type::phase2_slice_fx8, SerializedKeyAggHashSetFixedSize8<PhmapSeed2>);
 DEFINE_SET_TYPE(AggHashSetVariant::Type::phase2_slice_fx16, SerializedKeyAggHashSetFixedSize16<PhmapSeed2>);
+DEFINE_SET_TYPE(AggHashSetVariant::Type::phase2_slice_fx32, SerializedKeyAggHashSetFixedSize32<PhmapSeed2>);
 DEFINE_SET_TYPE(AggHashSetVariant::Type::phase2_slice_fx8_two_level,
                 SerializedKeyAggHashSetFixedSize8TwoLevel<PhmapSeed2>);
 DEFINE_SET_TYPE(AggHashSetVariant::Type::phase2_slice_fx16_two_level,
                 SerializedKeyAggHashSetFixedSize16TwoLevel<PhmapSeed2>);
+DEFINE_SET_TYPE(AggHashSetVariant::Type::phase2_slice_fx32_two_level,
+                SerializedKeyAggHashSetFixedSize32TwoLevel<PhmapSeed2>);
 
 DEFINE_SET_TYPE(AggHashSetVariant::Type::phase1_slice_cx1, CompressedAggHashSetFixedSize1<PhmapSeed1>);
 DEFINE_SET_TYPE(AggHashSetVariant::Type::phase1_slice_cx4, CompressedAggHashSetFixedSize4<PhmapSeed1>);
@@ -368,6 +384,9 @@ void AggHashMapVariant::convert_to_two_level(RuntimeState* state) {
 
     CONVERT_TO_TWO_LEVEL_MAP(phase1_slice_fx16_two_level, phase1_slice_fx16);
     CONVERT_TO_TWO_LEVEL_MAP(phase2_slice_fx16_two_level, phase2_slice_fx16);
+
+    CONVERT_TO_TWO_LEVEL_MAP(phase1_slice_fx32_two_level, phase1_slice_fx32);
+    CONVERT_TO_TWO_LEVEL_MAP(phase2_slice_fx32_two_level, phase2_slice_fx32);
 }
 
 #define AGG_VARIANT_TYPE_NAME_CASE(NAME) \
@@ -506,6 +525,9 @@ void AggHashSetVariant::convert_to_two_level(RuntimeState* state) {
 
     CONVERT_TO_TWO_LEVEL_SET(phase1_slice_fx16_two_level, phase1_slice_fx16);
     CONVERT_TO_TWO_LEVEL_SET(phase2_slice_fx16_two_level, phase2_slice_fx16);
+
+    CONVERT_TO_TWO_LEVEL_SET(phase1_slice_fx32_two_level, phase1_slice_fx32);
+    CONVERT_TO_TWO_LEVEL_SET(phase2_slice_fx32_two_level, phase2_slice_fx32);
 }
 
 void AggHashSetVariant::reset() {
