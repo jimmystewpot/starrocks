@@ -62,3 +62,6 @@ target_sources(flat_json_vertical_compaction_mem_bench PRIVATE ${SRC_DIR}/servic
 ADD_BE_BENCH(${SRC_DIR}/bench/bitshuffle_page_bench)
 # Measure with the same malloc hooks as starrocks_be (jemalloc), not glibc malloc.
 target_sources(bitshuffle_page_bench PRIVATE ${SRC_DIR}/service/mem_hook.cpp)
+ADD_BE_BENCH(${SRC_DIR}/bench/gather_bench)
+# Use the same malloc hooks as starrocks_be so allocator behavior matches production.
+target_sources(gather_bench PRIVATE ${SRC_DIR}/service/mem_hook.cpp)
