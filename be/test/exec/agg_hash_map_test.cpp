@@ -803,6 +803,13 @@ TEST_F(AggHashMapTest, SliceKey32LayoutEqualityAndHash) {
     const size_t base_h2 = hash2(base);
     EXPECT_EQ(base_h1, hash1(copy));
     EXPECT_EQ(base_h2, hash2(copy));
+    EXPECT_NE(base_h1, base_h2);
+    EXPECT_EQ((phmap_mix_with_seed<sizeof(size_t), PhmapSeed1>()(
+                      crc_hash_64(base.u.data, sizeof(SliceKey32), PhmapSeed1))),
+              base_h1);
+    EXPECT_EQ((phmap_mix_with_seed<sizeof(size_t), PhmapSeed2>()(
+                      crc_hash_64(base.u.data, sizeof(SliceKey32), PhmapSeed2))),
+              base_h2);
 
     for (int word = 0; word < 4; ++word) {
         for (int bit = 0; bit < 64; ++bit) {
@@ -811,6 +818,26 @@ TEST_F(AggHashMapTest, SliceKey32LayoutEqualityAndHash) {
             EXPECT_FALSE(base == flipped) << "word=" << word << " bit=" << bit;
             EXPECT_NE(base_h1, hash1(flipped)) << "word=" << word << " bit=" << bit;
             EXPECT_NE(base_h2, hash2(flipped)) << "word=" << word << " bit=" << bit;
+            EXPECT_NE(hash1(flipped), hash2(flipped)) << "word=" << word << " bit=" << bit;
+        }
+    }
+
+    // Byte-order sensitivity: permuting any two distinct bytes or any two 64-bit words changes the hash.
+    for (int i = 0; i < 4; ++i) {
+        for (int j = i + 1; j < 4; ++j) {
+            SliceKey32 swapped = base;
+            std::swap(swapped.u.ui64[i], swapped.u.ui64[j]);
+            EXPECT_FALSE(base == swapped);
+            EXPECT_NE(base_h1, hash1(swapped));
+            EXPECT_NE(base_h2, hash2(swapped));
+        }
+    }
+    for (int i = 0; i < 31; ++i) {
+        SliceKey32 swapped = base;
+        std::swap(swapped.u.data[i], swapped.u.data[(i + 7) % 31]);
+        if (!(base == swapped)) {
+            EXPECT_NE(base_h1, hash1(swapped)) << "byte=" << i;
+            EXPECT_NE(base_h2, hash2(swapped)) << "byte=" << i;
         }
     }
 }

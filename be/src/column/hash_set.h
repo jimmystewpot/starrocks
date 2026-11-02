@@ -180,11 +180,7 @@ public:
             return Hash128WithSeed<seed>()(s.u.value);
         } else {
             static_assert(sizeof(SliceKey) == 32);
-            uint64_t hash = seed;
-            for (int i = 0; i < 4; ++i) {
-                hash_combine(hash, s.u.ui64[i]);
-            }
-            return phmap_mix_with_seed<sizeof(size_t), seed>()(hash);
+            return phmap_mix_with_seed<sizeof(size_t), seed>()(crc_hash_64(s.u.data, sizeof(SliceKey32), seed));
         }
     }
 };
