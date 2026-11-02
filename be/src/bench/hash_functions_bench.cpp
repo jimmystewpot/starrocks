@@ -743,7 +743,7 @@ static void BM_FixedSize32_vs_GenericSlice_Q35(benchmark::State& state) {
             AggDataPtr dummy_state = nullptr;
             for (size_t i = 0; i < distinct_keys; ++i) {
                 SliceKey32 key{};
-                memcpy(key.u.data, raw_keys.data() + i * key_bytes, key_bytes);
+                memcpy(&key.u, raw_keys.data() + i * key_bytes, key_bytes);
                 if (key_bytes < sizeof(SliceKey32)) {
                     key.u.size = static_cast<uint8_t>(key_bytes);
                 }

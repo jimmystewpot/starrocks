@@ -986,7 +986,7 @@ struct AggHashMapWithSerializedKeyFixedSize
             : Base(chunk_size, std::forward<Args>(args)...),
               mem_pool(std::make_unique<MemPool>()),
               _chunk_size(chunk_size) {
-        caches.reserve(chunk_size);
+        caches.resize(chunk_size);
         auto* buffer = reinterpret_cast<uint8_t*>(caches.data());
         memset(buffer, 0x0, max_fixed_size * _chunk_size);
     }
@@ -1043,29 +1043,28 @@ struct AggHashMapWithSerializedKeyFixedSize
                                                 ExtraAggParam* extra) {
         [[maybe_unused]] size_t hash_table_size = this->hash_map.size();
         auto* __restrict not_founds = extra->not_founds;
-        constexpr int key_size = sizeof(FixedSizeSliceKey);
         auto* buffer = reinterpret_cast<uint8_t*>(caches.data());
         for (const auto& key_column : key_columns) {
-            key_column->serialize_batch(buffer, slice_sizes, chunk_size, key_size);
+            key_column->serialize_batch(buffer, slice_sizes, chunk_size, max_fixed_size);
         }
-        auto* key = reinterpret_cast<FixedSizeSliceKey*>(caches.data());
         if (has_null_column) {
             for (size_t i = 0; i < chunk_size; ++i) {
-                key[i].u.size = slice_sizes[i];
+                caches[i].key.u.size = slice_sizes[i];
             }
         }
         for (size_t i = 0; i < chunk_size; ++i) {
+            FixedSizeSliceKey& key = caches[i].key;
             if constexpr (HTBuildOp::process_limit) {
                 if (hash_table_size < extra->limits) {
-                    _emplace_key(key[i], (*agg_states)[i], allocate_func, [&] { hash_table_size++; });
+                    _emplace_key(key, (*agg_states)[i], allocate_func, [&] { hash_table_size++; });
                 } else {
-                    _find_key((*agg_states)[i], (*not_founds)[i], key[i]);
+                    _find_key((*agg_states)[i], (*not_founds)[i], key);
                 }
             } else if constexpr (HTBuildOp::allocate) {
-                _emplace_key(key[i], (*agg_states)[i], allocate_func,
+                _emplace_key(key, (*agg_states)[i], allocate_func,
                              FillNotFounds<HTBuildOp::fill_not_found>(not_founds, i));
             } else if constexpr (HTBuildOp::fill_not_found) {
-                _find_key((*agg_states)[i], (*not_founds)[i], key[i]);
+                _find_key((*agg_states)[i], (*not_founds)[i], key);
             }
         }
     }
@@ -1076,6 +1075,10 @@ struct AggHashMapWithSerializedKeyFixedSize
         DCHECK(has_null_column || fixed_byte_size != -1);
         slice_sizes.assign(chunk_size, 0);
 
+        if (UNLIKELY(chunk_size > caches.size())) {
+            caches.resize(chunk_size);
+            memset(reinterpret_cast<uint8_t*>(caches.data()), 0x0, max_fixed_size * chunk_size);
+        }
         auto* buffer = reinterpret_cast<uint8_t*>(caches.data());
         if (has_null_column) {
             memset(buffer, 0x0, max_fixed_size * chunk_size);
@@ -1128,7 +1131,7 @@ struct AggHashMapWithSerializedKeyFixedSize
         if (!has_null_column) {
             for (int i = 0; i < chunk_size; i++) {
                 FixedSizeSliceKey& key = keys[i];
-                tmp_slices[i].data = key.u.data;
+                tmp_slices[i].data = reinterpret_cast<char*>(&key.u);
                 tmp_slices[i].size = fixed_byte_size;
             }
         } else {

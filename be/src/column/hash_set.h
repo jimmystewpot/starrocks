@@ -149,6 +149,7 @@ struct SliceKey32 {
             char data[31];
             uint8_t size;
         } __attribute__((packed));
+        char raw[32];
         uint64_t ui64[4];
     } u;
     static_assert(sizeof(u) == 32);
@@ -180,7 +181,7 @@ public:
             return Hash128WithSeed<seed>()(s.u.value);
         } else {
             static_assert(sizeof(SliceKey) == 32);
-            return phmap_mix_with_seed<sizeof(size_t), seed>()(crc_hash_64(s.u.data, sizeof(SliceKey32), seed));
+            return phmap_mix_with_seed<sizeof(size_t), seed>()(crc_hash_64(&s.u, sizeof(SliceKey32), seed));
         }
     }
 };

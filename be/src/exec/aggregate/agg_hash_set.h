@@ -888,7 +888,7 @@ struct AggHashSetOfSerializedKeyFixedSize : public AggHashSet<HashSet, AggHashSe
         if (!has_null_column) {
             for (int i = 0; i < chunk_size; i++) {
                 FixedSizeSliceKey& key = keys[i];
-                tmp_slices[i].data = key.u.data;
+                tmp_slices[i].data = reinterpret_cast<char*>(&key.u);
                 tmp_slices[i].size = fixed_byte_size;
             }
         } else {
