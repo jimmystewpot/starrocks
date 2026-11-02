@@ -18,6 +18,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cmath>
 #include <memory>
 #include <random>
 #include <vector>
@@ -26,6 +27,7 @@
 #include "base/phmap/phmap.h"
 #include "base/string/memcmp.h"
 #include "bench/bench_util.h"
+#include "exec/aggregate/agg_hash_map.h"
 #include "exec/aggregate/agg_hash_set.h"
 #include "exprs/function_context.h"
 #include "exprs/hash_functions.h"
@@ -389,6 +391,156 @@ static void BM_SliceAggHashSet_Insert(benchmark::State& state) {
 // BM_SliceAggHashSet_Insert/100000     2056348 ns      2055800 ns           34
 // BM_SliceAggHashSet_Insert/1000000   74175602 ns     74170807 ns            1
 BENCHMARK(BM_SliceAggHashSet_Insert)->Arg(1000)->Arg(100000)->Arg(1000000);
+
+template <typename KeyMaker>
+static auto gen_agg_bench_keys(size_t distinct_keys, bool is_zipf, KeyMaker&& make_key) {
+    using Key = decltype(make_key(size_t{0}));
+    std::vector<Key> keys;
+    keys.reserve(distinct_keys);
+    uint64_t rng_state = 0x123456789ABCDEF0ULL;
+    auto next_u64 = [&]() -> uint64_t {
+        uint64_t z = (rng_state += 0x9E3779B97F4A7C15ULL);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+        return z ^ (z >> 31);
+    };
+
+    if (!is_zipf) {
+        for (size_t i = 0; i < distinct_keys; ++i) {
+            keys.push_back(make_key(i));
+        }
+    } else {
+        constexpr size_t kTableSize = 4096;
+        std::vector<double> inv_cdf(kTableSize + 1);
+        const double log_n = std::log(static_cast<double>(distinct_keys + 1));
+        for (size_t j = 0; j <= kTableSize; ++j) {
+            double u = static_cast<double>(j) / static_cast<double>(kTableSize);
+            inv_cdf[j] = std::exp(u * log_n) - 1.0;
+        }
+        for (size_t i = 0; i < distinct_keys; ++i) {
+            uint64_t r = next_u64();
+            size_t idx = r & (kTableSize - 1);
+            double frac = static_cast<double>((r >> 12) & 0xFFFFFULL) * (1.0 / 1048576.0);
+            auto rank = static_cast<size_t>(inv_cdf[idx] + frac * (inv_cdf[idx + 1] - inv_cdf[idx]));
+            if (rank >= distinct_keys) {
+                rank = distinct_keys - 1;
+            }
+            keys.push_back(make_key(rank));
+        }
+    }
+    return keys;
+}
+
+template <typename HashMap, typename KeyMaker>
+static void run_agg_single_level_baseline(benchmark::State& state, KeyMaker&& make_key) {
+    const auto distinct_keys = static_cast<size_t>(state.range(0));
+    const bool is_zipf = state.range(1) != 0;
+    auto keys = gen_agg_bench_keys(distinct_keys, is_zipf, std::forward<KeyMaker>(make_key));
+
+    size_t table_bytes = 0;
+    for (auto _ : state) {
+        HashMap map;
+        AggDataPtr dummy_state = nullptr;
+        for (const auto& k : keys) {
+            map.lazy_emplace(k, [&](const auto& ctor) { ctor(k, dummy_state); });
+        }
+        table_bytes = map.dump_bound();
+        benchmark::DoNotOptimize(map);
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(keys.size()));
+    state.counters["table_bytes"] = static_cast<double>(table_bytes);
+}
+
+static void BM_AggSingleLevel_Baseline_Args(benchmark::Benchmark* b) {
+    for (int64_t distinct_keys : {10000, 100000, 1000000, 10000000}) {
+        for (int64_t is_zipf : {0, 1}) {
+            b->Args({distinct_keys, is_zipf});
+        }
+    }
+    b->MinTime(0.05);
+}
+
+static void BM_AggSingleLevel_Int32_Baseline(benchmark::State& state) {
+    run_agg_single_level_baseline<Int32AggHashMap<PhmapSeed1>>(
+            state, [](size_t i) -> int32_t { return static_cast<int32_t>(i); });
+}
+
+static void BM_AggSingleLevel_Int64_Baseline(benchmark::State& state) {
+    run_agg_single_level_baseline<Int64AggHashMap<PhmapSeed1>>(
+            state, [](size_t i) -> int64_t { return static_cast<int64_t>(i); });
+}
+
+static void BM_AggSingleLevel_FixedSize8_Baseline(benchmark::State& state) {
+    run_agg_single_level_baseline<FixedSize8SliceAggHashMap<PhmapSeed1>>(state, [](size_t i) -> SliceKey8 {
+        SliceKey8 k{};
+        k.u.value = static_cast<int64_t>(i);
+        return k;
+    });
+}
+
+static void BM_AggSingleLevel_FixedSize16_Baseline(benchmark::State& state) {
+    run_agg_single_level_baseline<FixedSize16SliceAggHashMap<PhmapSeed1>>(state, [](size_t i) -> SliceKey16 {
+        SliceKey16 k{};
+        k.u.ui64[0] = static_cast<uint64_t>(i);
+        k.u.ui64[1] = static_cast<uint64_t>(i) ^ 0x9E3779B97F4A7C15ULL;
+        return k;
+    });
+}
+
+BENCHMARK(BM_AggSingleLevel_Int32_Baseline)->Apply(BM_AggSingleLevel_Baseline_Args);
+BENCHMARK(BM_AggSingleLevel_Int64_Baseline)->Apply(BM_AggSingleLevel_Baseline_Args);
+BENCHMARK(BM_AggSingleLevel_FixedSize8_Baseline)->Apply(BM_AggSingleLevel_Baseline_Args);
+BENCHMARK(BM_AggSingleLevel_FixedSize16_Baseline)->Apply(BM_AggSingleLevel_Baseline_Args);
+
+static void BM_AggSlice17To32B_Baseline_Args(benchmark::Benchmark* b) {
+    for (int64_t key_bytes : {20, 32}) {
+        for (int64_t distinct_keys : {10000, 100000, 1000000}) {
+            b->Args({key_bytes, distinct_keys});
+        }
+    }
+    b->MinTime(0.05);
+}
+
+static void BM_AggSlice17To32B_Baseline(benchmark::State& state) {
+    const auto key_bytes = static_cast<size_t>(state.range(0));
+    const auto distinct_keys = static_cast<size_t>(state.range(1));
+
+    std::vector<char> raw_keys(distinct_keys * key_bytes + SLICE_MEMEQUAL_OVERFLOW_PADDING, 0);
+    for (size_t i = 0; i < distinct_keys; ++i) {
+        char* dst = raw_keys.data() + i * key_bytes;
+        uint64_t lo = static_cast<uint64_t>(i);
+        uint64_t hi = static_cast<uint64_t>(i) ^ 0x9E3779B97F4A7C15ULL;
+        memcpy(dst, &lo, sizeof(lo));
+        memcpy(dst + 8, &hi, sizeof(hi));
+        uint64_t tail = static_cast<uint64_t>(i) * 0xBF58476D1CE4E5B9ULL;
+        memcpy(dst + 16, &tail, std::min<size_t>(sizeof(tail), key_bytes - 16));
+    }
+
+    size_t pool_bytes = 0;
+    size_t table_bytes = 0;
+    for (auto _ : state) {
+        MemPool pool;
+        MemPool escape_pool;
+        SliceAggHashMap<PhmapSeed1> map;
+        AggDataPtr dummy_state = nullptr;
+        for (size_t i = 0; i < distinct_keys; ++i) {
+            Slice s(raw_keys.data() + i * key_bytes, key_bytes);
+            const auto key = make_agg_slice_key<SliceWithHash32<PhmapSeed1>>(s, &escape_pool);
+            map.lazy_emplace(key, [&](const auto& ctor) {
+                auto pk = persist_agg_slice_key(key, &pool);
+                ctor(pk, dummy_state);
+            });
+        }
+        pool_bytes = static_cast<size_t>(pool.total_allocated_bytes());
+        table_bytes = map.dump_bound();
+        benchmark::DoNotOptimize(map);
+    }
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(distinct_keys));
+    state.counters["pool_bytes"] = static_cast<double>(pool_bytes);
+    state.counters["table_bytes"] = static_cast<double>(table_bytes);
+}
+
+BENCHMARK(BM_AggSlice17To32B_Baseline)->Apply(BM_AggSlice17To32B_Baseline_Args);
 
 } // namespace starrocks
 
