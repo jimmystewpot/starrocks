@@ -148,3 +148,13 @@
   - `main-custom-default` vs `main-custom-lse` (isolating LSE).
   - `4.1.7-official` vs `main-custom-lse` (total release delta).
 - [x] **Step 6.6**: Publish final benchmark analysis report into `docs/specs/2026-11-02-arm64-clickbench-benchmark-results.md`.
+
+---
+
+### Task 7: Hardware-Identical ClickHouse Comparative Benchmark on C4A (`c4a-standard-16`)
+
+- [x] **Step 7.1**: Install official ClickHouse 26.10.3 (AArch64) binary on `starrocks-arm64-clickbench`.
+- [x] **Step 7.2**: Download ClickBench partitioned Parquet dataset (100M rows) and load into native ClickHouse `MergeTree` (timed at 83.6s, 9.44 GB on disk).
+- [x] **Step 7.3**: Execute full 43-query ClickBench suite (Q0–Q42) with OS page cache drops before cold runs.
+- [x] **Step 7.4**: Compare ClickHouse against StarRocks `main-custom-default`, `main-baseline`, and `4.1.7` via `compare.py`.
+- [x] **Step 7.5**: Document comparative results, architectural breakdown, and diagnostic profiling plan in Section 12 of `docs/specs/2026-11-02-arm64-clickbench-benchmark-results.md`.
