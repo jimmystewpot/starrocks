@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build, automate, and execute an empirical ARM64 ClickBench benchmarking pipeline evaluating StarRocks upstream `main` baseline, 4.1.7 official release, consolidated custom candidate (25 PRs), and custom candidate with LSE on Google Cloud C4A Axion instances.
+**Goal:** Build, automate, and execute an empirical ARM64 ClickBench benchmarking pipeline evaluating StarRocks upstream `main` baseline, 4.1.7 official release, consolidated custom candidate (35 PRs + Bitshuffle NEON/8KB buffer patches), and custom candidate with LSE on Google Cloud C4A Axion instances.
 
 **Architecture:** A native VM execution pipeline based on `ClickBench/starrocks-versions`. Uses StarRocks `dev-env-ubuntu:main` container on the C4A VM strictly for native compiling and tarball generation, then executes benchmarks directly on the bare Linux host OS with OS-level cache drops, capturing timing metrics across native and Parquet suites into structured JSON diffs via `compare.py`.
 
@@ -16,7 +16,7 @@
 
 - Platform: Linux AArch64 (ARM64), specifically Google Compute Engine C4A (Google Axion).
 - Baseline reference: Upstream `main` at common merge-base and StarRocks 4.1.7 official CDN tarball.
-- Target branch: `perf/arm64-aggregate-rc` integrating all 25 performance branches.
+- Target branch: `perf/arm64-aggregate-rc` integrating all 35 performance branches + Bitshuffle patches.
 - Compiler flags: Baseline (`-march=armv8-a+crc`); LSE candidate (`-march=armv8-a+crc+lse`).
 - ClickBench methodology: 100M rows, 43 queries (Q0–Q42), 1 cold run with OS cache drop + 2 hot runs.
 - Execution environment: Bare host OS (no Docker runtime overhead during benchmark execution).
@@ -25,7 +25,7 @@
 
 ## Review Focus
 
-1. **Git Merge Conflicts during Consolidation**: Merging 25 branches onto `main` must resolve cleanly without dropping localized SIMD dispatch paths or introducing compilation regressions.
+1. **Git Merge Conflicts during Consolidation**: Merging all 35 branches onto `main` must resolve cleanly without dropping localized SIMD dispatch paths or introducing compilation regressions.
 2. **BE Startup on C4A**: Verify BE passes `CpuInfo` checks and registers successfully with FE (`backend_alive`) before running queries.
 3. **OS Page Cache Drop Rights**: Ensure `sync; echo 3 | sudo tee /proc/sys/vm/drop_caches` functions properly on C4A VM for true cold-query timing.
 4. **Memory Sizing**: Avoid OOM on 100M-row TSV load by enforcing appropriate `query_mem_limit` and JVM heap bounds.
