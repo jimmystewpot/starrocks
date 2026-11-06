@@ -43,6 +43,7 @@
 #include <string_view>
 #include <vector>
 
+#include "base/simd/filter.h"
 #include "base/simd/rle_simd.h"
 #include "base/simd/simd.h"
 #include "base/simd/string_length_filter.h"
@@ -1426,6 +1427,42 @@ BENCHMARK(BM_LikeSubstring_MultiThread_Optimized)
         ->Threads(24)
         ->Threads(32)
         ->UseRealTime();
+
+// =====================================================================
+// SIMD::Filter::filter_range across sizes and per-mille selectivities
+// =====================================================================
+
+static void GenerateFilterRangeMatrixArgs(benchmark::Benchmark* b) {
+    for (int64_t n : {16, 64, 512, 4096, 65536}) {
+        for (int64_t permille : {0, 1, 10, 50, 500, 950, 1000}) {
+            b->Args({n, permille});
+        }
+    }
+}
+
+template <typename T>
+static void BM_FilterRange_Width(benchmark::State& state) {
+    const size_t n = static_cast<size_t>(state.range(0));
+    const int permille = static_cast<int>(state.range(1));
+    std::vector<T> src(n);
+    std::vector<T> dst(n + 64 / sizeof(T));
+    std::vector<uint8_t> sel(n, 0);
+    std::mt19937_64 rng(0x514DF17E);
+    std::uniform_int_distribution<int> dist(0, 999);
+    for (size_t i = 0; i < n; ++i) {
+        src[i] = static_cast<T>(i + 1);
+        sel[i] = (dist(rng) < permille) ? 1 : 0;
+    }
+    for (auto _ : state) {
+        size_t out = SIMD::Filter::filter_range(dst.data(), src.data(), sel.data(), 0, n);
+        benchmark::DoNotOptimize(out);
+        benchmark::DoNotOptimize(dst.data());
+    }
+    state.SetItemsProcessed(state.iterations() * n);
+}
+
+BENCHMARK_TEMPLATE(BM_FilterRange_Width, uint32_t)->Name("BM_FilterRange_4B")->Apply(GenerateFilterRangeMatrixArgs);
+BENCHMARK_TEMPLATE(BM_FilterRange_Width, uint64_t)->Name("BM_FilterRange_8B")->Apply(GenerateFilterRangeMatrixArgs);
 
 } // namespace starrocks
 
