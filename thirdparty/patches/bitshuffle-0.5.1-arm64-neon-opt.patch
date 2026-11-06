@@ -1,0 +1,593 @@
+diff -u -r -N thirdparty/src/bitshuffle-0.5.1/src/bitshuffle.c /tmp/test_bitshuffle/src/bitshuffle.c
+--- a/src/bitshuffle.c
++++ b/src/bitshuffle.c
+@@ -93,24 +93,29 @@
+     ioc_set_next_out(C_ptr, &this_iter,
+             (void *) ((char *) out + size * elem_size));
+ 
+-    tmp_buf = malloc(size * elem_size);
+-    if (tmp_buf == NULL) return -1;
+-
+-    nbytes = LZ4_decompress_safe((const char*) in + 4, (char *) tmp_buf, nbytes_from_header,
++    nbytes = LZ4_decompress_safe((const char*) in + 4, (char *) out, nbytes_from_header,
+                                  size * elem_size);
+-    CHECK_ERR_FREE_LZ(nbytes, tmp_buf);
+-    if (nbytes != size * elem_size) {
+-        free(tmp_buf);
+-        return -91;
++    if (nbytes < 0) return nbytes - 1000;
++    if (nbytes != (int64_t)(size * elem_size)) return -91;
++
++    size_t nbytes_uncomp = size * elem_size;
++    uint64_t stack_buf[BSHUF_TARGET_BLOCK_SIZE_B / sizeof(uint64_t)];
++    int need_free = 0;
++    if (nbytes_uncomp <= BSHUF_TARGET_BLOCK_SIZE_B) {
++        tmp_buf = stack_buf;
++    } else {
++        tmp_buf = malloc(nbytes_uncomp);
++        if (tmp_buf == NULL) return -1;
++        need_free = 1;
+     }
+-    nbytes = nbytes_from_header;
+ 
+-    count = bshuf_untrans_bit_elem(tmp_buf, out, size, elem_size);
+-    CHECK_ERR_FREE(count, tmp_buf);
+-    nbytes += 4;
++    count = bshuf_untrans_bit_elem_with_buf(out, out, size, elem_size, tmp_buf);
++    if (need_free) {
++        free(tmp_buf);
++    }
++    if (count < 0) return count;
+ 
+-    free(tmp_buf);
+-    return nbytes;
++    return nbytes_from_header + 4;
+ }
+ 
+ #ifdef ZSTD_SUPPORT
+@@ -179,23 +184,28 @@
+     ioc_set_next_out(C_ptr, &this_iter,
+             (void *) ((char *) out + size * elem_size));
+ 
+-    tmp_buf = malloc(size * elem_size);
+-    if (tmp_buf == NULL) return -1;
++    nbytes = ZSTD_decompress(out, size * elem_size, (void *)((char *) in + 4), nbytes_from_header);
++    if (nbytes < 0) return nbytes - 1000;
++    if (nbytes != (int64_t)(size * elem_size)) return -91;
++
++    size_t nbytes_uncomp = size * elem_size;
++    uint64_t stack_buf[BSHUF_TARGET_BLOCK_SIZE_B / sizeof(uint64_t)];
++    int need_free = 0;
++    if (nbytes_uncomp <= BSHUF_TARGET_BLOCK_SIZE_B) {
++        tmp_buf = stack_buf;
++    } else {
++        tmp_buf = malloc(nbytes_uncomp);
++        if (tmp_buf == NULL) return -1;
++        need_free = 1;
++    }
+ 
+-    nbytes = ZSTD_decompress(tmp_buf, size * elem_size, (void *)((char *) in + 4), nbytes_from_header);
+-    CHECK_ERR_FREE_LZ(nbytes, tmp_buf);
+-    if (nbytes != size * elem_size) {
++    count = bshuf_untrans_bit_elem_with_buf(out, out, size, elem_size, tmp_buf);
++    if (need_free) {
+         free(tmp_buf);
+-        return -91;
+     }
++    if (count < 0) return count;
+ 
+-    nbytes = nbytes_from_header;
+-    count = bshuf_untrans_bit_elem(tmp_buf, out, size, elem_size);
+-    CHECK_ERR_FREE(count, tmp_buf);
+-    nbytes += 4;
+-
+-    free(tmp_buf);
+-    return nbytes;
++    return nbytes_from_header + 4;
+ }
+ #endif // ZSTD_SUPPORT
+ 
+diff -u -r -N thirdparty/src/bitshuffle-0.5.1/src/bitshuffle_core.c /tmp/test_bitshuffle/src/bitshuffle_core.c
+--- a/src/bitshuffle_core.c
++++ b/src/bitshuffle_core.c
+@@ -361,23 +361,49 @@
+ }
+ 
+ 
++/* Untranspose bits within elements with user-provided buffer. */
++int64_t bshuf_untrans_bit_elem_scal_with_buf(const void* in, void* out, const size_t size,
++         const size_t elem_size, void* tmp_buf) {
++
++    int64_t count;
++
++    CHECK_MULT_EIGHT(size);
++    if (tmp_buf == NULL) return -1;
++
++    count = bshuf_trans_byte_bitrow_scal(in, tmp_buf, size, elem_size);
++    if (count < 0) return count;
++    count = bshuf_shuffle_bit_eightelem_scal(tmp_buf, out, size, elem_size);
++
++    return count;
++}
++
++
+ /* Untranspose bits within elements. */
+ int64_t bshuf_untrans_bit_elem_scal(const void* in, void* out, const size_t size,
+          const size_t elem_size) {
+ 
+     int64_t count;
+-    void *tmp_buf;
++    size_t total_bytes;
++    uint64_t stack_buf[BSHUF_TARGET_BLOCK_SIZE_B / sizeof(uint64_t)];
++    void* tmp_buf;
++    int is_heap = 0;
+ 
+     CHECK_MULT_EIGHT(size);
+ 
+-    tmp_buf = malloc(size * elem_size);
+-    if (tmp_buf == NULL) return -1;
++    total_bytes = size * elem_size;
++    if (total_bytes <= BSHUF_TARGET_BLOCK_SIZE_B) {
++        tmp_buf = stack_buf;
++    } else {
++        tmp_buf = malloc(total_bytes);
++        if (tmp_buf == NULL) return -1;
++        is_heap = 1;
++    }
+ 
+-    count = bshuf_trans_byte_bitrow_scal(in, tmp_buf, size, elem_size);
+-    CHECK_ERR_FREE(count, tmp_buf);
+-    count =  bshuf_shuffle_bit_eightelem_scal(tmp_buf, out, size, elem_size);
++    count = bshuf_untrans_bit_elem_scal_with_buf(in, out, size, elem_size, tmp_buf);
+ 
+-    free(tmp_buf);
++    if (is_heap) {
++        free(tmp_buf);
++    }
+ 
+     return count;
+ }
+@@ -707,7 +733,6 @@
+ 
+     int8x16_t a0, b0, c0, d0, e0, f0, g0, h0;
+     int8x16_t a1, b1, c1, d1, e1, f1, g1, h1;
+-    int64x1_t *as, *bs, *cs, *ds, *es, *fs, *gs, *hs;
+ 
+     for (ii = 0; ii + 7 < nrows; ii += 8) {
+         for (jj = 0; jj + 15 < nbyte_row; jj += 16) {
+@@ -747,31 +772,22 @@
+             g1 = (int8x16_t) vzip1q_s32 (vreinterpretq_s32_s8 (g0), vreinterpretq_s32_s8 (h0));
+             h1 = (int8x16_t) vzip2q_s32 (vreinterpretq_s32_s8 (g0), vreinterpretq_s32_s8 (h0));
+ 
+-            as = (int64x1_t *) &a1;
+-            bs = (int64x1_t *) &b1;
+-            cs = (int64x1_t *) &c1;
+-            ds = (int64x1_t *) &d1;
+-            es = (int64x1_t *) &e1;
+-            fs = (int64x1_t *) &f1;
+-            gs = (int64x1_t *) &g1;
+-            hs = (int64x1_t *) &h1;
+-
+-            vst1_s64((int64_t *)(out_b + (jj + 0) * nrows + ii), *as);
+-            vst1_s64((int64_t *)(out_b + (jj + 1) * nrows + ii), *(as + 1));
+-            vst1_s64((int64_t *)(out_b + (jj + 2) * nrows + ii), *bs);
+-            vst1_s64((int64_t *)(out_b + (jj + 3) * nrows + ii), *(bs + 1));
+-            vst1_s64((int64_t *)(out_b + (jj + 4) * nrows + ii), *cs);
+-            vst1_s64((int64_t *)(out_b + (jj + 5) * nrows + ii), *(cs + 1));
+-            vst1_s64((int64_t *)(out_b + (jj + 6) * nrows + ii), *ds);
+-            vst1_s64((int64_t *)(out_b + (jj + 7) * nrows + ii), *(ds + 1));
+-            vst1_s64((int64_t *)(out_b + (jj + 8) * nrows + ii), *es);
+-            vst1_s64((int64_t *)(out_b + (jj + 9) * nrows + ii), *(es + 1));
+-            vst1_s64((int64_t *)(out_b + (jj + 10) * nrows + ii), *fs);
+-            vst1_s64((int64_t *)(out_b + (jj + 11) * nrows + ii), *(fs + 1));
+-            vst1_s64((int64_t *)(out_b + (jj + 12) * nrows + ii), *gs);
+-            vst1_s64((int64_t *)(out_b + (jj + 13) * nrows + ii), *(gs + 1));
+-            vst1_s64((int64_t *)(out_b + (jj + 14) * nrows + ii), *hs);
+-            vst1_s64((int64_t *)(out_b + (jj + 15) * nrows + ii), *(hs + 1));
++            vst1q_lane_s64((int64_t *)(out_b + (jj + 0) * nrows + ii), vreinterpretq_s64_s8(a1), 0);
++            vst1q_lane_s64((int64_t *)(out_b + (jj + 1) * nrows + ii), vreinterpretq_s64_s8(a1), 1);
++            vst1q_lane_s64((int64_t *)(out_b + (jj + 2) * nrows + ii), vreinterpretq_s64_s8(b1), 0);
++            vst1q_lane_s64((int64_t *)(out_b + (jj + 3) * nrows + ii), vreinterpretq_s64_s8(b1), 1);
++            vst1q_lane_s64((int64_t *)(out_b + (jj + 4) * nrows + ii), vreinterpretq_s64_s8(c1), 0);
++            vst1q_lane_s64((int64_t *)(out_b + (jj + 5) * nrows + ii), vreinterpretq_s64_s8(c1), 1);
++            vst1q_lane_s64((int64_t *)(out_b + (jj + 6) * nrows + ii), vreinterpretq_s64_s8(d1), 0);
++            vst1q_lane_s64((int64_t *)(out_b + (jj + 7) * nrows + ii), vreinterpretq_s64_s8(d1), 1);
++            vst1q_lane_s64((int64_t *)(out_b + (jj + 8) * nrows + ii), vreinterpretq_s64_s8(e1), 0);
++            vst1q_lane_s64((int64_t *)(out_b + (jj + 9) * nrows + ii), vreinterpretq_s64_s8(e1), 1);
++            vst1q_lane_s64((int64_t *)(out_b + (jj + 10) * nrows + ii), vreinterpretq_s64_s8(f1), 0);
++            vst1q_lane_s64((int64_t *)(out_b + (jj + 11) * nrows + ii), vreinterpretq_s64_s8(f1), 1);
++            vst1q_lane_s64((int64_t *)(out_b + (jj + 12) * nrows + ii), vreinterpretq_s64_s8(g1), 0);
++            vst1q_lane_s64((int64_t *)(out_b + (jj + 13) * nrows + ii), vreinterpretq_s64_s8(g1), 1);
++            vst1q_lane_s64((int64_t *)(out_b + (jj + 14) * nrows + ii), vreinterpretq_s64_s8(h1), 0);
++            vst1q_lane_s64((int64_t *)(out_b + (jj + 15) * nrows + ii), vreinterpretq_s64_s8(h1), 1);
+         }
+         for (jj = nbyte_row - nbyte_row % 16; jj < nbyte_row; jj ++) {
+             out_b[jj * nrows + ii + 0] = in_b[(ii + 0)*nbyte_row + jj];
+@@ -802,7 +818,34 @@
+     size_t ii, jj, kk;
+     size_t nbyte = elem_size * size;
+ 
+-    if (elem_size % 2) {
++    if (elem_size == 1) {
++#if !defined(__AARCH64EB__) && (!defined(__BYTE_ORDER__) || (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__))
++        // 2-lane uint64x2_t TRANS_BIT_8X8 delta-swap assumes little-endian byte
++        // ordering within each 64-bit lane; big-endian targets fall back to
++        // bshuf_shuffle_bit_eightelem_scal (TRANS_BIT_8X8_BE).
++        uint8_t* out_b = (uint8_t*) out;
++        const uint64x2_t m0 = vdupq_n_u64(0x00AA00AA00AA00AAULL);
++        const uint64x2_t m1 = vdupq_n_u64(0x0000CCCC0000CCCCULL);
++        const uint64x2_t m2 = vdupq_n_u64(0x00000000F0F0F0F0ULL);
++        for (ii = 0; ii + 15 < nbyte; ii += 16) {
++            uint64x2_t x = vreinterpretq_u64_u8(
++                    vld1q_u8((const uint8_t *) &in_b[ii]));
++            uint64x2_t t;
++            t = vandq_u64(veorq_u64(x, vshrq_n_u64(x, 7)), m0);
++            x = veorq_u64(x, veorq_u64(t, vshlq_n_u64(t, 7)));
++            t = vandq_u64(veorq_u64(x, vshrq_n_u64(x, 14)), m1);
++            x = veorq_u64(x, veorq_u64(t, vshlq_n_u64(t, 14)));
++            t = vandq_u64(veorq_u64(x, vshrq_n_u64(x, 28)), m2);
++            x = veorq_u64(x, veorq_u64(t, vshlq_n_u64(t, 28)));
++            vst1q_u8(&out_b[ii], vreinterpretq_u8_u64(x));
++        }
++        if (ii < nbyte) {
++            bshuf_shuffle_bit_eightelem_scal(in_b + ii, out_b + ii, 8, 1);
++        }
++#else
++        bshuf_shuffle_bit_eightelem_scal(in, out, size, elem_size);
++#endif
++    } else if (elem_size % 2) {
+         bshuf_shuffle_bit_eightelem_scal(in, out, size, elem_size);
+     } else {
+         const uint8x16_t a0 = vdupq_n_u8(0x80);
+@@ -841,28 +884,61 @@
+ }
+ 
+ 
++/* Untranspose bits within elements with user-provided buffer. */
++int64_t bshuf_untrans_bit_elem_NEON_with_buf(const void* in, void* out, const size_t size,
++         const size_t elem_size, void* tmp_buf) {
++
++    int64_t count;
++
++    CHECK_MULT_EIGHT(size);
++    if (tmp_buf == NULL) return -1;
++
++    count = bshuf_trans_byte_bitrow_NEON(in, tmp_buf, size, elem_size);
++    if (count < 0) return count;
++    count = bshuf_shuffle_bit_eightelem_NEON(tmp_buf, out, size, elem_size);
++
++    return count;
++}
++
++
+ /* Untranspose bits within elements. */
+ int64_t bshuf_untrans_bit_elem_NEON(const void* in, void* out, const size_t size,
+          const size_t elem_size) {
+ 
+     int64_t count;
++    size_t total_bytes;
++    uint64_t stack_buf[BSHUF_TARGET_BLOCK_SIZE_B / sizeof(uint64_t)];
++    void* tmp_buf;
++    int is_heap = 0;
+ 
+     CHECK_MULT_EIGHT(size);
+ 
+-    void* tmp_buf = malloc(size * elem_size);
+-    if (tmp_buf == NULL) return -1;
++    total_bytes = size * elem_size;
++    if (total_bytes <= BSHUF_TARGET_BLOCK_SIZE_B) {
++        tmp_buf = stack_buf;
++    } else {
++        tmp_buf = malloc(total_bytes);
++        if (tmp_buf == NULL) return -1;
++        is_heap = 1;
++    }
+ 
+-    count = bshuf_trans_byte_bitrow_NEON(in, tmp_buf, size, elem_size);
+-    CHECK_ERR_FREE(count, tmp_buf);
+-    count =  bshuf_shuffle_bit_eightelem_NEON(tmp_buf, out, size, elem_size);
++    count = bshuf_untrans_bit_elem_NEON_with_buf(in, out, size, elem_size, tmp_buf);
+ 
+-    free(tmp_buf);
++    if (is_heap) {
++        free(tmp_buf);
++    }
+ 
+     return count;
+ }
+ 
+ #else // #ifdef USEARMNEON
+ 
++int64_t bshuf_untrans_bit_elem_NEON_with_buf(const void* in, void* out, const size_t size,
++         const size_t elem_size, void* tmp_buf) {
++    return -13;
++}
++
++
+ int64_t bshuf_untrans_bit_elem_NEON(const void* in, void* out, const size_t size,
+          const size_t elem_size) {
+     return -13;
+@@ -1340,22 +1416,49 @@
+ }
+ 
+ 
++/* Untranspose bits within elements with user-provided buffer. */
++int64_t bshuf_untrans_bit_elem_SSE_with_buf(const void* in, void* out, const size_t size,
++         const size_t elem_size, void* tmp_buf) {
++
++    int64_t count;
++
++    CHECK_MULT_EIGHT(size);
++    if (tmp_buf == NULL) return -1;
++
++    count = bshuf_trans_byte_bitrow_SSE(in, tmp_buf, size, elem_size);
++    if (count < 0) return count;
++    count = bshuf_shuffle_bit_eightelem_SSE(tmp_buf, out, size, elem_size);
++
++    return count;
++}
++
++
+ /* Untranspose bits within elements. */
+ int64_t bshuf_untrans_bit_elem_SSE(const void* in, void* out, const size_t size,
+          const size_t elem_size) {
+ 
+     int64_t count;
++    size_t total_bytes;
++    uint64_t stack_buf[BSHUF_TARGET_BLOCK_SIZE_B / sizeof(uint64_t)];
++    void* tmp_buf;
++    int is_heap = 0;
+ 
+     CHECK_MULT_EIGHT(size);
+ 
+-    void* tmp_buf = malloc(size * elem_size);
+-    if (tmp_buf == NULL) return -1;
++    total_bytes = size * elem_size;
++    if (total_bytes <= BSHUF_TARGET_BLOCK_SIZE_B) {
++        tmp_buf = stack_buf;
++    } else {
++        tmp_buf = malloc(total_bytes);
++        if (tmp_buf == NULL) return -1;
++        is_heap = 1;
++    }
+ 
+-    count = bshuf_trans_byte_bitrow_SSE(in, tmp_buf, size, elem_size);
+-    CHECK_ERR_FREE(count, tmp_buf);
+-    count =  bshuf_shuffle_bit_eightelem_SSE(tmp_buf, out, size, elem_size);
++    count = bshuf_untrans_bit_elem_SSE_with_buf(in, out, size, elem_size, tmp_buf);
+ 
+-    free(tmp_buf);
++    if (is_heap) {
++        free(tmp_buf);
++    }
+ 
+     return count;
+ }
+@@ -1363,6 +1466,12 @@
+ #else // #ifdef USESSE2
+ 
+ 
++int64_t bshuf_untrans_bit_elem_SSE_with_buf(const void* in, void* out, const size_t size,
++         const size_t elem_size, void* tmp_buf) {
++    return -11;
++}
++
++
+ int64_t bshuf_untrans_bit_elem_SSE(const void* in, void* out, const size_t size,
+          const size_t elem_size) {
+     return -11;
+@@ -1616,22 +1725,50 @@
+ }
+ 
+ 
++/* Untranspose bits within elements with user-provided buffer. */
++int64_t bshuf_untrans_bit_elem_AVX_with_buf(const void* in, void* out, const size_t size,
++         const size_t elem_size, void* tmp_buf) {
++
++    int64_t count;
++
++    CHECK_MULT_EIGHT(size);
++    if (tmp_buf == NULL) return -1;
++
++    count = bshuf_trans_byte_bitrow_AVX(in, tmp_buf, size, elem_size);
++    if (count < 0) return count;
++    count = bshuf_shuffle_bit_eightelem_AVX(tmp_buf, out, size, elem_size);
++
++    return count;
++}
++
++
+ /* Untranspose bits within elements. */
+ int64_t bshuf_untrans_bit_elem_AVX(const void* in, void* out, const size_t size,
+          const size_t elem_size) {
+ 
+     int64_t count;
++    size_t total_bytes;
++    uint64_t stack_buf[BSHUF_TARGET_BLOCK_SIZE_B / sizeof(uint64_t)];
++    void* tmp_buf;
++    int is_heap = 0;
+ 
+     CHECK_MULT_EIGHT(size);
+ 
+-    void* tmp_buf = malloc(size * elem_size);
+-    if (tmp_buf == NULL) return -1;
++    total_bytes = size * elem_size;
++    if (total_bytes <= BSHUF_TARGET_BLOCK_SIZE_B) {
++        tmp_buf = stack_buf;
++    } else {
++        tmp_buf = malloc(total_bytes);
++        if (tmp_buf == NULL) return -1;
++        is_heap = 1;
++    }
+ 
+-    count = bshuf_trans_byte_bitrow_AVX(in, tmp_buf, size, elem_size);
+-    CHECK_ERR_FREE(count, tmp_buf);
+-    count =  bshuf_shuffle_bit_eightelem_AVX(tmp_buf, out, size, elem_size);
++    count = bshuf_untrans_bit_elem_AVX_with_buf(in, out, size, elem_size, tmp_buf);
++
++    if (is_heap) {
++        free(tmp_buf);
++    }
+ 
+-    free(tmp_buf);
+     return count;
+ }
+ 
+@@ -1662,6 +1799,12 @@
+ }
+ 
+ 
++int64_t bshuf_untrans_bit_elem_AVX_with_buf(const void* in, void* out, const size_t size,
++         const size_t elem_size, void* tmp_buf) {
++    return -12;
++}
++
++
+ int64_t bshuf_untrans_bit_elem_AVX(const void* in, void* out, const size_t size,
+          const size_t elem_size) {
+     return -12;
+@@ -1781,22 +1924,50 @@
+     return size * elem_size;
+ }
+ 
++/* Untranspose bits within elements with user-provided buffer. */
++int64_t bshuf_untrans_bit_elem_AVX512_with_buf(const void* in, void* out, const size_t size,
++         const size_t elem_size, void* tmp_buf) {
++
++    int64_t count;
++
++    CHECK_MULT_EIGHT(size);
++    if (tmp_buf == NULL) return -1;
++
++    count = bshuf_trans_byte_bitrow_AVX(in, tmp_buf, size, elem_size);
++    if (count < 0) return count;
++    count = bshuf_shuffle_bit_eightelem_AVX512(tmp_buf, out, size, elem_size);
++
++    return count;
++}
++
++
+ /* Untranspose bits within elements. */
+ int64_t bshuf_untrans_bit_elem_AVX512(const void* in, void* out, const size_t size,
+          const size_t elem_size) {
+ 
+     int64_t count;
++    size_t total_bytes;
++    uint64_t stack_buf[BSHUF_TARGET_BLOCK_SIZE_B / sizeof(uint64_t)];
++    void* tmp_buf;
++    int is_heap = 0;
+ 
+     CHECK_MULT_EIGHT(size);
+ 
+-    void* tmp_buf = malloc(size * elem_size);
+-    if (tmp_buf == NULL) return -1;
++    total_bytes = size * elem_size;
++    if (total_bytes <= BSHUF_TARGET_BLOCK_SIZE_B) {
++        tmp_buf = stack_buf;
++    } else {
++        tmp_buf = malloc(total_bytes);
++        if (tmp_buf == NULL) return -1;
++        is_heap = 1;
++    }
+ 
+-    count = bshuf_trans_byte_bitrow_AVX(in, tmp_buf, size, elem_size);
+-    CHECK_ERR_FREE(count, tmp_buf);
+-    count =  bshuf_shuffle_bit_eightelem_AVX512(tmp_buf, out, size, elem_size);
++    count = bshuf_untrans_bit_elem_AVX512_with_buf(in, out, size, elem_size, tmp_buf);
++
++    if (is_heap) {
++        free(tmp_buf);
++    }
+ 
+-    free(tmp_buf);
+     return count;
+ }
+ 
+@@ -1819,6 +1990,12 @@
+     return -14;
+ }
+ 
++int64_t bshuf_untrans_bit_elem_AVX512_with_buf(const void* in, void* out, const size_t size,
++         const size_t elem_size, void* tmp_buf) {
++    return -14;
++}
++
++
+ int64_t bshuf_untrans_bit_elem_AVX512(const void* in, void* out, const size_t size,
+          const size_t elem_size) {
+     return -14;
+@@ -1847,24 +2024,54 @@
+ }
+ 
+ 
+-int64_t bshuf_untrans_bit_elem(const void* in, void* out, const size_t size, 
+-        const size_t elem_size) {
++int64_t bshuf_untrans_bit_elem_with_buf(const void* in, void* out, const size_t size,
++        const size_t elem_size, void* tmp_buf) {
+ 
+     int64_t count;
+ #ifdef USEAVX512
+-    count = bshuf_untrans_bit_elem_AVX512(in, out, size, elem_size);
++    count = bshuf_untrans_bit_elem_AVX512_with_buf(in, out, size, elem_size, tmp_buf);
+ #elif defined USEAVX2
+-    count = bshuf_untrans_bit_elem_AVX(in, out, size, elem_size);
++    count = bshuf_untrans_bit_elem_AVX_with_buf(in, out, size, elem_size, tmp_buf);
+ #elif defined(USESSE2)
+-    count = bshuf_untrans_bit_elem_SSE(in, out, size, elem_size);
++    count = bshuf_untrans_bit_elem_SSE_with_buf(in, out, size, elem_size, tmp_buf);
+ #elif defined(USEARMNEON)
+-    count = bshuf_untrans_bit_elem_NEON(in, out, size, elem_size);
++    count = bshuf_untrans_bit_elem_NEON_with_buf(in, out, size, elem_size, tmp_buf);
+ #else
+-    count = bshuf_untrans_bit_elem_scal(in, out, size, elem_size);
++    count = bshuf_untrans_bit_elem_scal_with_buf(in, out, size, elem_size, tmp_buf);
+ #endif
+     return count;
+ }
+ 
++
++int64_t bshuf_untrans_bit_elem(const void* in, void* out, const size_t size,
++        const size_t elem_size) {
++
++    int64_t count;
++    size_t total_bytes;
++    uint64_t stack_buf[BSHUF_TARGET_BLOCK_SIZE_B / sizeof(uint64_t)];
++    void* tmp_buf;
++    int is_heap = 0;
++
++    CHECK_MULT_EIGHT(size);
++
++    total_bytes = size * elem_size;
++    if (total_bytes <= BSHUF_TARGET_BLOCK_SIZE_B) {
++        tmp_buf = stack_buf;
++    } else {
++        tmp_buf = malloc(total_bytes);
++        if (tmp_buf == NULL) return -1;
++        is_heap = 1;
++    }
++
++    count = bshuf_untrans_bit_elem_with_buf(in, out, size, elem_size, tmp_buf);
++
++    if (is_heap) {
++        free(tmp_buf);
++    }
++
++    return count;
++}
++
+ 
+ /* ---- Wrappers for implementing blocking ---- */
+ 
+diff -u -r -N thirdparty/src/bitshuffle-0.5.1/src/bitshuffle_internals.h /tmp/test_bitshuffle/src/bitshuffle_internals.h
+--- a/src/bitshuffle_internals.h
++++ b/src/bitshuffle_internals.h
+@@ -59,6 +59,9 @@
+ int64_t bshuf_untrans_bit_elem(const void* in, void* out, const size_t size,
+         const size_t elem_size);
+ 
++int64_t bshuf_untrans_bit_elem_with_buf(const void* in, void* out, const size_t size,
++        const size_t elem_size, void* tmp_buf);
++
+ /* Function definition for worker functions that process a single block. */
+ typedef int64_t (*bshufBlockFunDef)(ioc_chain* C_ptr,
+         const size_t size, const size_t elem_size, const int option);

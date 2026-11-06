@@ -839,6 +839,7 @@ if [[ -d $TP_SOURCE_DIR/$BITSHUFFLE_SOURCE ]] ; then
     cd $TP_SOURCE_DIR/$BITSHUFFLE_SOURCE
     if [ ! -f "$PATCHED_MARK" ] && [[ $BITSHUFFLE_SOURCE == "bitshuffle-0.5.1" ]] ; then
         apply_patch -p1 "$TP_PATCH_DIR/bitshuffle-0.5.1.patch"
+        apply_patch -p1 "$TP_PATCH_DIR/bitshuffle-0.5.1-arm64-neon-opt.patch"
         touch "$PATCHED_MARK"
     fi
     cd -
