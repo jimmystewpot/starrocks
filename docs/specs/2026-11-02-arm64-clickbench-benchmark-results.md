@@ -421,9 +421,9 @@ The table below contrasts ClickHouse 26.10.3 against StarRocks `main-custom-defa
 | **Q24** | 1.498 | 1.300 | **-13.2%** | 0.011 | 0.040 | +263.6% | **StarRocks 1.15x faster cold** (`LIKE '%google%'` substring search) |
 | **Q25** | 1.328 | 1.340 | +0.9% | 0.096 | 0.080 | **-16.7%** | **StarRocks 1.20x faster hot** (`LIKE '%google%'` substring search) |
 | **Q26** | 1.491 | 1.280 | **-14.2%** | 0.012 | 0.050 | +316.7% | **StarRocks 1.16x faster cold** (`ORDER BY EventTime, SearchPhrase LIMIT 10`) |
-| **Q27** | 0.508 | 7.300 | +1337.0% | 0.093 | 0.420 | +351.6% | Complex expression + `MIN(URL)` (Volnitsky string search in CH) |
+| **Q27** | 0.508 | 7.300 | +1337.0% | 0.093 | 0.420 | +351.6% | `CounterID, AVG(length(URL)) ... GROUP BY CounterID` |
 | **Q28** | 4.521 | 6.350 | +40.5% | 0.745 | 4.200 | +463.8% | **ClickHouse 5.6x faster hot** (Vectorscan/Hyperscan regex evaluation) |
-| **Q29** | 0.246 | 0.510 | +107.3% | 0.027 | 0.060 | +122.2% | URL search with filter |
+| **Q29** | 0.246 | 0.510 | +107.3% | 0.027 | 0.060 | +122.2% | ResolutionWidth 90-column arithmetic sum |
 | **Q30** | 1.067 | 2.710 | +154.0% | 0.130 | 0.290 | +123.1% | Search phrase aggregation |
 | **Q31** | 3.067 | 5.510 | +79.7% | 0.160 | 0.380 | +137.5% | Search phrase aggregation |
 | **Q32** | 3.823 | 3.170 | **-17.1%** | 0.742 | 1.620 | +118.3% | **StarRocks 1.21x faster cold** (`ORDER BY SearchPhrase LIMIT 10`) |
@@ -456,9 +456,16 @@ The table below contrasts ClickHouse 26.10.3 against StarRocks `main-custom-defa
 - **Metadata-Only Aggregation Short-Circuit (Q0, Q1)**:
   - ClickHouse answers `SELECT count(*)` in **0.001s** (1 millisecond) by directly consulting the active part metadata (`total_rows`), bypassing query plan construction and executor thread scheduling entirely.
   - StarRocks coordinates between the Java FE and C++ BE: the FE parses the AST, runs cost-based optimization (CBO), serializes a query fragment via Thrift, submits it to BE, and BE reads tablet metadata, incurring a baseline ~30–90ms RPC and scheduling overhead.
-- **SIMD String Search & Algorithmic Specialization (Q27)**:
-  - In Q27 (`WHERE URL LIKE '%google%' AND SearchPhrase <> ''`), ClickHouse executes in **0.508s cold / 0.093s hot** vs StarRocks **7.300s cold / 0.420s hot** (**14.4x slower cold**).
-  - ClickHouse leverages the Volnitsky n-gram substring search algorithm, which uses AVX2/NEON vector instructions to skip up to 16 bytes per cycle when searching for needle substrings like `'google'`. StarRocks scans bytes more sequentially within BinaryColumn chunks.
+- **Large String Scans & Vectorized Length (Q27)**:
+  - In Q27 (`SELECT CounterID, AVG(length(URL)) ... GROUP BY CounterID HAVING COUNT(*) > 100000`), ClickHouse executes in **0.508s cold / 0.093s hot** vs StarRocks **7.300s cold / 0.420s hot**.
+  - *Cold gap*: StarRocks had to read and decompress 17.65 GB of segment data from disk vs ClickHouse's 9.44 GB.
+  - *Hot gap*: In ClickHouse, `length(String)` is computed via an $O(1)$ vectorized subtraction of adjacent row offsets (`offsets[i] - offsets[i-1]`) without loading string character bytes into CPU cache. StarRocks recently added a similar offset difference in `be/src/exprs/string_functions.cpp:1990`, but ClickHouse's lower aggregation overhead and tighter memory layout yield 93ms vs 420ms.
+- **SIMD Substring Matching: PR #82006 vs ClickHouse StringZilla (Q20–Q24)**:
+  - In StarRocks, **PR #82006 (`perf/simd-substring-search`)** introduced major improvements: hoisting searcher construction out of execution loops into `LikePredicateState::setup_like_state`, and adding hybrid binary/linear offset lookups to rapidly resolve matched bytes back to `BinaryColumn` row indices. This yielded a ~30% speedup across `LIKE` queries (e.g. Q33/Q34/Q20) and allowed StarRocks to beat ClickHouse cold on Q24 (1.30s vs 1.50s) and hot on Q25 (0.080s vs 0.096s).
+  - *Why ClickHouse still leads on hot Q20/Q21*:
+    1. **StringZilla Integration**: ClickHouse integrated `contrib/StringZilla`, a hyper-optimized SIMD library targeting ARM64 Neon/SVE and x86 AVX-512 that uses vectorized bit-matrix sliding windows achieving 15–20 GB/s per core, outperforming hand-rolled 3-anchor NEON checks.
+    2. **Volnitsky Thresholding**: StarRocks (`be/src/base/string/volnitsky.h:65`) defines `min_needle_size_for_algorithm = 33`. Substrings under 33 bytes (like `'google'` = 6 bytes) bypass the 2-gram Volnitsky hash table completely and fall back to `StringSearcher`. ClickHouse handles sub-32-byte needles with StringZilla and uses 2-gram hashing for short patterns.
+    3. **Continuous Buffer Dispatch**: ClickHouse scans entire columnar string buffers in a single pass, whereas StarRocks executes in chunked pipeline batches.
 - **Regular Expression Engine on ARM64 (Q28)**:
   - In Q28 (`extract(URL, ...) IN (...)`), ClickHouse takes **0.745s hot** vs StarRocks **4.200s hot** (**5.6x slower**).
   - ClickHouse compiles regular expressions using Vectorscan/Hyperscan or an optimized RE2 branchless DFA. StarRocks currently relies on RE2 with per-row evaluation and intermediate string allocations in `BinaryColumn`.
@@ -531,8 +538,9 @@ Based on the empirical findings from ClickBench on C4A:
 
 1. **FE Metadata-Only Count Query Short-Circuit**:
    - For `SELECT COUNT(*) FROM table [WHERE no filters]`, allow the FE planner to return the sum of row counts from the metadata catalog without dispatching physical query execution fragments to BEs. (Closes 30ms -> 1ms gap on Q0/Q1).
-2. **Volnitsky SIMD Substring Algorithm**:
-   - Implement the Volnitsky n-gram algorithm using NEON vectors in `simd_search.cpp` to accelerate multi-character `LIKE '%pattern%'` queries. (Targets Q27, Q33, Q34).
+2. **StringZilla SIMD Engine & Volnitsky Threshold Tuning**:
+   - Integrate `StringZilla` (or adopt its bit-matrix SIMD algorithm for NEON/SVE) in `be/src/base/string/string_searcher.h` to replace hand-rolled 3-anchor checks with 15–20 GB/s vector matching.
+   - Re-evaluate the 33-byte `min_needle_size_for_algorithm` threshold in `volnitsky.h` so 2-gram hashing can accelerate short patterns (like `'google'`). (Targets Q20–Q24, Q33, Q34).
 3. **Vectorscan / Hyperscan Integration on ARM64**:
    - Extend StarRocks' regex execution pipeline to leverage `Vectorscan` (ARM-compatible Hyperscan fork) for multi-pattern regex matching and `regexp_extract`. (Targets Q28).
 4. **Direct-Mapped Array Aggregator for Low-Cardinality Keys**:
