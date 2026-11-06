@@ -361,6 +361,10 @@ CONF_mInt32(scanner_row_num, "16384");
 CONF_mInt32(shared_scan_output_chunk_batch_size, "8");
 // Number of max hdfs scanners.
 CONF_Int32(max_hdfs_scanner_num, "50");
+// Timeout of the RPC with which a scan asks its coordinator for renewed vended credentials (Iceberg REST)
+// once they are due. Not retried: on failure the scan keeps its current credentials and asks
+// again a minute later. A value <= 0 turns the refresh off for scans that start afterwards.
+CONF_mInt32(scan_credential_refresh_rpc_timeout_ms, "10000");
 // Number of max scan keys.
 CONF_mInt32(max_scan_key_num, "1024");
 // The max number of push down values of a single column.
@@ -2398,7 +2402,8 @@ CONF_mBool(enable_profile_for_external_plan, "false");
 // the max length supported for varchar type
 CONF_mInt32(olap_string_max_length, "1048576");
 
-// Skip get from pk index when light pk compaction publish is enabled
+// Skip get from pk index when light pk compaction publish is enabled.
+// Only for shared-nothing primary key tables: shared-data primary key tables always use light compaction publish.
 CONF_mBool(enable_light_pk_compaction_publish, "true");
 
 // jit LRU object cache size for total 32 shards, it will be an auto value if it < 0

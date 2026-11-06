@@ -222,7 +222,6 @@ Status AppendWithMaskVisitor<PositiveSelect>::append_binary(BinaryColumn* column
     }
 
     const auto& src_offsets = src_column->get_offset();
-    const auto* src_bytes = src_column->raw_bytes();
 
     size_t total_bytes = 0;
     src_offsets.visit_storage([&](const auto& src_offsets_buf) {
@@ -244,6 +243,53 @@ Status AppendWithMaskVisitor<PositiveSelect>::append_binary(BinaryColumn* column
         }
     });
 
+    if (column->is_offset_only() || src_column->is_offset_only()) {
+        column->set_offset_only(true);
+        auto& offsets = column->get_offset();
+        size_t old_rows = offsets.size() - 1;
+        uint64_t old_offset = offsets.back();
+        offsets.resize_uninitialized(old_rows + selected + 1, old_offset + total_bytes);
+
+        using Offsets = BinaryColumn::Offsets;
+        Offsets::visit_storage_pair(offsets, src_offsets, [&](auto& dst_offsets_buf, const auto& src_offsets_buf) {
+            using DstValue = typename std::decay_t<decltype(dst_offsets_buf)>::value_type;
+            const auto* __restrict src_offsets_data = src_offsets_buf.data();
+            auto* __restrict dest_offsets = dst_offsets_buf.data() + old_rows + 1;
+
+            uint64_t current_offset = old_offset;
+            dst_offsets_buf[old_rows] = static_cast<DstValue>(current_offset);
+
+            size_t i = 0;
+            while (i < _count) {
+                while (i < _count && !is_selected(_mask[i])) {
+                    ++i;
+                }
+                if (i >= _count) {
+                    break;
+                }
+                size_t run_start = i;
+                while (i < _count && is_selected(_mask[i])) {
+                    ++i;
+                }
+                size_t run_end = i;
+                size_t run_len = run_end - run_start;
+                size_t run_bytes = src_offsets_data[run_end] - src_offsets_data[run_start];
+
+                const uint64_t run_start_offset = src_offsets_data[run_start];
+                for (size_t j = 0; j < run_len; ++j) {
+                    dest_offsets[j] = static_cast<DstValue>(current_offset +
+                                                            (src_offsets_data[run_start + 1 + j] - run_start_offset));
+                }
+                dest_offsets += run_len;
+                current_offset += run_bytes;
+            }
+        });
+
+        column->invalidate_slice_cache();
+        return Status::OK();
+    }
+
+    const auto* src_bytes = src_column->raw_bytes();
     auto& offsets = column->get_offset();
     auto& bytes = column->get_bytes();
     size_t old_rows = offsets.size() - 1;

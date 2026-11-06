@@ -1963,9 +1963,9 @@ StatusOr<ColumnPtr> StringFunctions::length(FunctionContext* context, const Colu
     }
     const auto& col = columns[0];
     if (col->is_constant()) {
-        auto const_col = down_cast<const ConstColumn*>(col.get());
+        const auto* const_col = down_cast<const ConstColumn*>(col.get());
         ASSIGN_OR_RETURN(auto res, length(context, {const_col->data_column()}));
-        return ConstColumn::create(res, const_col->size());
+        return ConstColumn::create(std::move(res), const_col->size());
     }
 
     const Column* data_col = col.get();

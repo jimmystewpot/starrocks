@@ -850,6 +850,10 @@ Status TabletReader::init_rowset_read_options(const TabletReaderParams& params, 
     options->tablet_schema = _tablet_schema;
     options->global_dictmaps = params.global_dictmaps;
     options->unused_output_column_ids = params.unused_output_column_ids;
+    options->offset_only_column_ids =
+            tablet_reader_supports_offset_only(keys_type, params.skip_aggregation, params.sorted_by_keys_per_tablet)
+                    ? params.offset_only_column_ids
+                    : nullptr;
     options->runtime_range_pruner = params.runtime_range_pruner;
     options->lake_io_opts = params.lake_io_opts;
     options->enable_join_runtime_filter_pushdown = params.enable_join_runtime_filter_pushdown;
@@ -1385,9 +1389,7 @@ Status TabletReader::init_collector(const TabletReaderParams& params) {
         if (_is_vertical_merge && !_is_key) {
             _collect_iter = new_mask_merge_iterator(seg_iters, _mask_buffer, _selection_buffer);
         } else {
-            _collect_iter = new_heap_merge_iterator(
-                    seg_iters,
-                    (keys_type == PRIMARY_KEYS) && StorageEngine::instance()->enable_light_pk_compaction_publish());
+            _collect_iter = new_heap_merge_iterator(seg_iters, keys_type == PRIMARY_KEYS);
         }
     } else if (params.sorted_by_keys_per_tablet && (keys_type == DUP_KEYS || keys_type == PRIMARY_KEYS) &&
                seg_iters.size() > 1) {
