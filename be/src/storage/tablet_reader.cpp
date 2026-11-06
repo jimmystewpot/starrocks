@@ -391,7 +391,10 @@ Status TabletReader::get_segment_iterators(const TabletReaderParams& params, std
     rs_opts.tablet_schema = _tablet_schema;
     rs_opts.global_dictmaps = params.global_dictmaps;
     rs_opts.unused_output_column_ids = params.unused_output_column_ids;
-    rs_opts.offset_only_column_ids = params.offset_only_column_ids;
+    rs_opts.offset_only_column_ids =
+            tablet_reader_supports_offset_only(keys_type, params.skip_aggregation, params.sorted_by_keys_per_tablet)
+                    ? params.offset_only_column_ids
+                    : nullptr;
     rs_opts.runtime_range_pruner = params.runtime_range_pruner;
     rs_opts.column_access_paths = params.column_access_paths;
     rs_opts.use_vector_index = params.use_vector_index;
