@@ -398,9 +398,6 @@ TEST_F(ColumnHelperTest, create_geo_placeholder_and_copy) {
         EXPECT_FALSE(geo->is_binary());
         // Generic creation preserves semantic metadata; storage starts unvalidated.
         EXPECT_EQ(*type.geo_type, geo->descriptor().type);
-        EXPECT_EQ(GEO_ENCODING_WKB, geo->descriptor().storage.encoding);
-        EXPECT_EQ(GEO_DIMENSION_UNKNOWN, geo->descriptor().storage.dimension);
-        EXPECT_EQ(GEO_VALIDATION_STATE_UNVALIDATED, geo->descriptor().storage.validation_state);
         for (size_t i = 0; i < geo->size(); ++i) {
             EXPECT_TRUE(geo->get_wkb(i).empty());
         }
@@ -489,7 +486,7 @@ TEST_F(ColumnHelperTest, create_nested_geo_columns) {
     for (const auto primitive : {TYPE_GEOGRAPHY, TYPE_GEOMETRY}) {
         const auto type = geo_type(primitive);
         const auto array_type = TypeDescriptor::create_array_type(type);
-        const auto map_type = TypeDescriptor::create_map_type(TypeDescriptor(TYPE_INT), array_type);
+        const auto map_type = TypeDescriptor::create_map_type(TYPE_INT_DESC, array_type);
         const auto struct_type =
                 TypeDescriptor::create_struct_type({"direct", "array", "map"}, {type, array_type, map_type});
         auto column = ColumnHelper::create_column(struct_type, false);

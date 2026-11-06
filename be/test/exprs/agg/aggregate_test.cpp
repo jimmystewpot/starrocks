@@ -806,6 +806,20 @@ TEST_F(AggregateTest, test_sum_distinct) {
                                                       DecimalV2Value(21));
 }
 
+// multi_distinct_count/sum have no V1 implementation any more: every func_version resolves to the V2 one.
+TEST_F(AggregateTest, test_multi_distinct_resolves_to_v2_for_every_func_version) {
+    ASSERT_NE(nullptr, get_aggregate_function("multi_distinct_count2", TYPE_INT, TYPE_BIGINT, false));
+    ASSERT_NE(nullptr, get_aggregate_function("multi_distinct_sum2", TYPE_INT, TYPE_BIGINT, false));
+    for (int func_version : {0, 1, 7, 8}) {
+        EXPECT_EQ(get_aggregate_function("multi_distinct_count2", TYPE_INT, TYPE_BIGINT, false),
+                  get_aggregate_function("multi_distinct_count", TYPE_INT, TYPE_BIGINT, false,
+                                         TFunctionBinaryType::BUILTIN, func_version));
+        EXPECT_EQ(get_aggregate_function("multi_distinct_sum2", TYPE_INT, TYPE_BIGINT, false),
+                  get_aggregate_function("multi_distinct_sum", TYPE_INT, TYPE_BIGINT, false,
+                                         TFunctionBinaryType::BUILTIN, func_version));
+    }
+}
+
 TEST_F(AggregateTest, test_decimal_multi_distinct_sum) {
     int64_t mem_usage;
     {
@@ -2647,7 +2661,7 @@ TEST_F(AggregateTest, test_group_concatV2) {
         gc_func->convert_to_serialize_format(local_ctx.get(), columns, int_column->size(), res_struct_col);
         ASSERT_EQ(res_struct_col->debug_string(), "[NULL, NULL]");
 
-        auto res_col = ColumnHelper::create_column(TypeDescriptor(LogicalType::TYPE_VARCHAR), true);
+        auto res_col = ColumnHelper::create_column(TYPE_VARCHAR_DESC, true);
         gc_func->finalize_to_column(local_ctx.get(), state->state(), res_col.get());
         ASSERT_EQ(res_col->debug_string(), "[NULL]");
     }

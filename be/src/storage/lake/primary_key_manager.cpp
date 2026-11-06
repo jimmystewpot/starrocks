@@ -197,16 +197,17 @@ void RssidFileInfoContainer::add_rssid_to_file(const TabletMetadata& metadata) {
     }
 }
 
-void RssidFileInfoContainer::add_rssid_to_file(const RowsetMetadataPB& meta, uint32_t rowset_id, uint32_t segment_idx,
-                                               const std::map<int, SegmentFileInfo>& replace_segments) {
-    DCHECK(segment_idx < meta.segment_metas_size());
-    uint32_t local_segment_id = get_segment_idx(meta, static_cast<int32_t>(segment_idx));
-    if (replace_segments.count(segment_idx) > 0) {
+void RssidFileInfoContainer::add_rssid_to_file(const RowsetMetadataPB& meta, uint32_t rowset_id, uint32_t segment_pos,
+                                               const std::map<int, SegmentFileInfo>& replace_segments,
+                                               uint32_t segment_idx_base) {
+    DCHECK(segment_pos < meta.segment_metas_size());
+    uint32_t local_segment_id = segment_idx_base + get_segment_idx(meta, static_cast<int32_t>(segment_pos));
+    if (replace_segments.count(segment_pos) > 0) {
         // partial update
-        _rssid_to_file_info[rowset_id + local_segment_id] = replace_segments.at(segment_idx);
+        _rssid_to_file_info[rowset_id + local_segment_id] = replace_segments.at(segment_pos);
         _rssid_to_rowid[rowset_id + local_segment_id] = rowset_id;
     } else {
-        const auto& segment_meta = meta.segment_metas(segment_idx);
+        const auto& segment_meta = meta.segment_metas(segment_pos);
         FileInfo segment_info{.path = segment_meta.filename()};
         if (segment_meta.has_bundle_file_offset()) {
             segment_info.bundle_file_offset = segment_meta.bundle_file_offset();
@@ -219,6 +220,13 @@ void RssidFileInfoContainer::add_rssid_to_file(const RowsetMetadataPB& meta, uin
         }
         _rssid_to_file_info[rowset_id + local_segment_id] = segment_info;
         _rssid_to_rowid[rowset_id + local_segment_id] = rowset_id;
+    }
+}
+
+void RssidFileInfoContainer::add_pending_rowset(const MetaFileBuilder& builder, uint32_t rowset_id) {
+    const auto& pending_rowset = builder.pending_rowset();
+    for (int pos = 0; pos < pending_rowset.segment_metas_size(); pos++) {
+        add_rssid_to_file(pending_rowset, rowset_id, pos, builder.pending_replace_segments());
     }
 }
 
@@ -442,8 +450,19 @@ Status PrimaryKeyManager::publish_primary_key_tablet(const TxnLogPB_OpWrite& op_
 
     std::vector<FileMetaPB> orphan_files;
     std::map<int, SegmentFileInfo> replace_segments;
+    // Global segment id offset assigned by builder when batch applying multiple op_write in a single publish.
+    const uint32_t assigned_global_segments = batch_apply ? builder->assigned_segment_idx() : 0;
     RssidFileInfoContainer rssid_fileinfo_container;
     rssid_fileinfo_container.add_rssid_to_file(*metadata);
+    if (batch_apply) {
+        // The op_writes applied earlier in this batch (the earlier statements of a multi-statement
+        // transaction) are not in |metadata| yet: MetaFileBuilder holds them as one pending rowset until
+        // set_final_rowset(), while the primary index already points at their rows. Register their
+        // segments under the rssids that rowset will get, with the rewritten file wherever a row-mode
+        // partial update replaced one, so that a partial update, condition update or auto-increment fill
+        // below reads the values an earlier statement wrote instead of failing to find the rssid.
+        rssid_fileinfo_container.add_pending_rowset(*builder, rowset_id);
+    }
     // Init update state.
     RowsetUpdateStateParams params{
             .op_write = op_write,
@@ -457,8 +476,6 @@ Status PrimaryKeyManager::publish_primary_key_tablet(const TxnLogPB_OpWrite& op_
     // Init delvec state.
     // Map from rssid (rowset id + segment offset) to the list of deleted rowids collected during this publish.
     PrimaryIndex::DeletesMap new_deletes;
-    // Global segment id offset assigned by builder when batch applying multiple op_write in a single publish.
-    uint32_t assigned_global_segments = batch_apply ? builder->assigned_segment_idx() : 0;
     // Number of segments in the incoming rowset of this op_write.
     uint32_t local_segments = op_write.rowset().segment_metas_size();
     std::vector<uint32_t> rowset_segment_ids;
@@ -571,8 +588,9 @@ Status PrimaryKeyManager::publish_primary_key_tablet(const TxnLogPB_OpWrite& op_
                 replace_segments.merge(per_seg_replace[idx]);
                 orphan_files.insert(orphan_files.end(), std::make_move_iterator(per_seg_orphans[idx].begin()),
                                     std::make_move_iterator(per_seg_orphans[idx].end()));
+                // Under the same rssid _do_update() gives this segment's rows (see rowset_segment_ids).
                 rssid_fileinfo_container.add_rssid_to_file(op_write.rowset(), metadata->next_rowset_id(), i,
-                                                           replace_segments);
+                                                           replace_segments, assigned_global_segments);
             }
             _update_state_cache.update_object_size(state_entry, state.memory_usage());
         }
@@ -588,8 +606,10 @@ Status PrimaryKeyManager::publish_primary_key_tablet(const TxnLogPB_OpWrite& op_
                                                    false /*no need lock*/));
                 _update_state_cache.update_object_size(state_entry, state.memory_usage());
                 RETURN_IF_ERROR(state.rewrite_segment(local_id, txn_id, params, &replace_segments, &orphan_files));
+                // Under the same rssid _do_update() gives this segment's rows (global_segment_id): in a
+                // batch that is past the earlier statements' segments, which are registered above.
                 rssid_fileinfo_container.add_rssid_to_file(op_write.rowset(), metadata->next_rowset_id(), local_id,
-                                                           replace_segments);
+                                                           replace_segments, assigned_global_segments);
             }
 
             // PK index update + condition merge.
@@ -635,8 +655,8 @@ Status PrimaryKeyManager::publish_primary_key_tablet(const TxnLogPB_OpWrite& op_
             if (auto it = del_plan.dels_after_segment.find(global_segment_id);
                 it != del_plan.dels_after_segment.end()) {
                 for (uint32_t del_id : it->second) {
-                    RETURN_IF_ERROR(
-                            _do_delete(del_id, del_plan.del_rssids[del_id], params, state, index, &new_deletes));
+                    RETURN_IF_ERROR(_do_delete(del_id, del_plan.del_rssids[del_id], params, state, index, &new_deletes,
+                                               &orphan_files));
                     update_index_cache_size(index_entry);
                     del_plan.del_applied[del_id] = true;
                 }
@@ -678,7 +698,8 @@ Status PrimaryKeyManager::publish_primary_key_tablet(const TxnLogPB_OpWrite& op_
         if (del_plan.del_applied[del_id]) {
             continue;
         }
-        RETURN_IF_ERROR(_do_delete(del_id, del_plan.del_rssids[del_id], params, state, index, &new_deletes));
+        RETURN_IF_ERROR(
+                _do_delete(del_id, del_plan.del_rssids[del_id], params, state, index, &new_deletes, &orphan_files));
         update_index_cache_size(index_entry);
         del_plan.del_applied[del_id] = true;
     }
@@ -1247,7 +1268,8 @@ Status PrimaryKeyManager::_do_update(uint32_t rowset_id, int32_t upsert_idx, con
 // current BE carry a pre-built tombstone sstable, which bulk_erase ingests directly; small del files and
 // pre-upgrade txn logs fall back to the memtable erase path.
 Status PrimaryKeyManager::_do_delete(uint32_t del_id, uint32_t del_rssid, const RowsetUpdateStateParams& params,
-                                     RowsetUpdateState& state, LakePersistentIndex& index, DeletesMap* new_deletes) {
+                                     RowsetUpdateState& state, LakePersistentIndex& index, DeletesMap* new_deletes,
+                                     std::vector<FileMetaPB>* orphan_files) {
     TRACE_COUNTER_SCOPE_LATENCY_US("do_delete_latency_us");
     RETURN_IF_ERROR(state.load_delete(del_id, params));
     DCHECK(state.deletes(del_id) != nullptr);
@@ -1256,11 +1278,17 @@ Status PrimaryKeyManager::_do_delete(uint32_t del_id, uint32_t del_rssid, const 
     const bool has_prebuilt_del_sst = op_write.del_ssts_size() == op_write.dels_meta_size() &&
                                       op_write.del_sst_ranges_size() == op_write.dels_meta_size() &&
                                       !op_write.del_ssts(del_id).name().empty();
-    if (has_prebuilt_del_sst) {
+    if (has_prebuilt_del_sst && params.metadata->enable_persistent_index() &&
+        params.metadata->persistent_index_type() == PersistentIndexTypePB::CLOUD_NATIVE) {
         RETURN_IF_ERROR(index.bulk_erase(*state.deletes(del_id), new_deletes, del_rssid, op_write.del_ssts(del_id),
                                          op_write.del_sst_ranges(del_id), params.metadata->version()));
     } else {
         RETURN_IF_ERROR(index.erase(*state.deletes(del_id), new_deletes, del_rssid));
+        if (has_prebuilt_del_sst) {
+            // Only a cloud-native persistent index can ingest the tombstone sstable. Any other index applies the
+            // delete through the memtable, and the sstable goes to vacuum instead of staying unreferenced.
+            orphan_files->push_back(op_write.del_ssts(del_id));
+        }
     }
     state.release_delete(del_id);
     return Status::OK();

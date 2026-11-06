@@ -17,15 +17,20 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <optional>
 
+#include "base/concurrency/countdown_latch.h"
 #include "base/testutil/assert.h"
 #include "base/testutil/sync_point.h"
+#include "base/time/monotime.h"
+#include "base/utility/defer_op.h"
 #include "column/column_helper.h"
 #include "column/raw_data_visitor.h"
 #include "common/config_primary_key_fwd.h"
 #include "common/config_starlet_fwd.h"
+#include "common/thread/threadpool.h"
 #include "fs/fs.h"
 #include "fs/fs_util.h"
 #include "storage/chunk_helper.h"
@@ -173,7 +178,7 @@ protected:
 
         for (int i = 0; i < count; i++) {
             auto chunk = std::make_unique<Chunk>();
-            auto col = ColumnHelper::create_column(TypeDescriptor(TYPE_INT), false);
+            auto col = ColumnHelper::create_column(TYPE_INT_DESC, false);
             col->append_datum(Datum((int32_t)(start_key + i)));
             chunk->append_column(std::move(col), (SlotId)0);
 
@@ -232,13 +237,13 @@ protected:
         auto* range = _tablet_metadata->mutable_range();
         if (lower.has_value()) {
             auto* value = range->mutable_lower_bound()->add_values();
-            value->mutable_type()->CopyFrom(TypeDescriptor(TYPE_INT).to_protobuf());
+            value->mutable_type()->CopyFrom(TYPE_INT_DESC.to_protobuf());
             value->set_value(std::to_string(*lower));
             range->set_lower_bound_included(true);
         }
         if (upper.has_value()) {
             auto* value = range->mutable_upper_bound()->add_values();
-            value->mutable_type()->CopyFrom(TypeDescriptor(TYPE_INT).to_protobuf());
+            value->mutable_type()->CopyFrom(TYPE_INT_DESC.to_protobuf());
             value->set_value(std::to_string(*upper));
             range->set_upper_bound_included(false);
         }
@@ -1107,6 +1112,111 @@ TEST_F(LakePersistentIndexParallelCompactMgrTest, test_concurrent_compaction_tas
 }
 
 // ============================================================================
+// Tests for AsyncCompactCB
+// ============================================================================
+
+// A real compaction task that records how it reported into its AsyncCompactCB: whether it ran or was cancelled, and
+// whether the AsyncCompactCB had already destroyed its members at that point. Its input is empty, because a task
+// reports into its AsyncCompactCB whatever its input.
+class RecordingCompactTask : public LakePersistentIndexParallelCompactTask {
+public:
+    RecordingCompactTask(TabletManager* tablet_mgr, TabletMetadataPtr metadata,
+                         const std::atomic<bool>* cb_members_destroyed, std::function<void()> before_run)
+            : LakePersistentIndexParallelCompactTask({}, tablet_mgr, std::move(metadata), false, UniqueId::gen_uid(),
+                                                     SstSeekRange()),
+              _cb_members_destroyed(cb_members_destroyed),
+              _before_run(std::move(before_run)) {}
+
+    void run() override {
+        if (_before_run) {
+            _before_run();
+        }
+        _ran = true;
+        _reported_into_destroyed_cb = _cb_members_destroyed->load();
+        LakePersistentIndexParallelCompactTask::run();
+    }
+
+    void cancel() override {
+        _cancelled = true;
+        _reported_into_destroyed_cb = _cb_members_destroyed->load();
+        LakePersistentIndexParallelCompactTask::cancel();
+    }
+
+    bool ran() const { return _ran; }
+    bool cancelled() const { return _cancelled; }
+    bool reported_into_destroyed_cb() const { return _reported_into_destroyed_cb; }
+
+private:
+    const std::atomic<bool>* _cb_members_destroyed;
+    std::function<void()> _before_run;
+    std::atomic<bool> _ran{false};
+    std::atomic<bool> _cancelled{false};
+    std::atomic<bool> _reported_into_destroyed_cb{false};
+};
+
+// A publish that fails after starting an early sst compaction destroys the AsyncCompactCB while its tasks are still
+// queued or running. The tasks report into the AsyncCompactCB, so destroying it must cancel the queued task and wait
+// for the running one while its members are still alive.
+TEST_F(LakePersistentIndexParallelCompactMgrTest, test_destroy_cb_with_tasks_in_flight) {
+    // One worker, so the second task stays queued while the first one runs.
+    std::unique_ptr<ThreadPool> pool;
+    ASSERT_OK(ThreadPoolBuilder("destroy_cb_test").set_min_threads(1).set_max_threads(1).build(&pool));
+
+    std::atomic<bool> cb_members_destroyed{false};
+    CountDownLatch running(1);
+    CountDownLatch destroying(1);
+    std::atomic<bool> hold_timed_out{false};
+
+    // The AsyncCompactCB destroys its callback after the members its tasks report into, so the callback holds an
+    // object that sets the flag when destroyed.
+    auto set_flag_when_destroyed =
+            std::make_shared<DeferOp<std::function<void()>>>([&]() { cb_members_destroyed = true; });
+    auto cb = std::make_unique<AsyncCompactCB>(
+            pool->new_token(ThreadPool::ExecutionMode::CONCURRENT),
+            [set_flag_when_destroyed](const std::vector<PersistentIndexSstablePB>&) { return Status::OK(); });
+    set_flag_when_destroyed.reset();
+    // Releases the running task if an assertion below returns early, so that destroying the AsyncCompactCB does not
+    // wait for it forever.
+    DeferOp release_running_task([&]() { destroying.count_down(); });
+
+    auto running_task =
+            std::make_shared<RecordingCompactTask>(_tablet_mgr.get(), _tablet_metadata, &cb_members_destroyed, [&]() {
+                running.count_down();
+                destroying.wait();
+                // Hold the only worker until the AsyncCompactCB destructor has done all it does before waiting for
+                // this task: without the fix it has destroyed the members; with it, it has shut the token down, which
+                // takes the queued task off the queue.
+                const MonoTime deadline = MonoTime::Now() + MonoDelta::FromSeconds(30);
+                while (!cb_members_destroyed && pool->num_queued_tasks() > 0) {
+                    if (MonoTime::Now() > deadline) {
+                        hold_timed_out = true;
+                        break;
+                    }
+                    SleepFor(MonoDelta::FromMilliseconds(1));
+                }
+            });
+    auto queued_task =
+            std::make_shared<RecordingCompactTask>(_tablet_mgr.get(), _tablet_metadata, &cb_members_destroyed, nullptr);
+    running_task->set_cb(cb.get());
+    queued_task->set_cb(cb.get());
+    ASSERT_OK(cb->thread_pool_token()->submit(running_task));
+    ASSERT_TRUE(running.wait_for(MonoDelta::FromSeconds(30)));
+    ASSERT_OK(cb->thread_pool_token()->submit(queued_task));
+    ASSERT_EQ(1, pool->num_queued_tasks());
+
+    destroying.count_down();
+    cb.reset();
+
+    ASSERT_TRUE(cb_members_destroyed);
+    ASSERT_FALSE(hold_timed_out);
+    ASSERT_TRUE(running_task->ran());
+    ASSERT_FALSE(running_task->reported_into_destroyed_cb());
+    ASSERT_TRUE(queued_task->cancelled());
+    ASSERT_FALSE(queued_task->ran());
+    ASSERT_FALSE(queued_task->reported_into_destroyed_cb());
+}
+
+// ============================================================================
 // Tests for sample_keys_from_sstable
 // ============================================================================
 
@@ -1442,13 +1552,13 @@ TEST_F(LakePersistentIndexParallelCompactMgrTest, test_compact_with_tablet_range
     auto* range = _tablet_metadata->mutable_range();
     auto* lower = range->mutable_lower_bound();
     auto* v_lower = lower->add_values();
-    v_lower->mutable_type()->CopyFrom(TypeDescriptor(TYPE_INT).to_protobuf());
+    v_lower->mutable_type()->CopyFrom(TYPE_INT_DESC.to_protobuf());
     v_lower->set_value("100");
     range->set_lower_bound_included(true);
 
     auto* upper = range->mutable_upper_bound();
     auto* v_upper = upper->add_values();
-    v_upper->mutable_type()->CopyFrom(TypeDescriptor(TYPE_INT).to_protobuf());
+    v_upper->mutable_type()->CopyFrom(TYPE_INT_DESC.to_protobuf());
     v_upper->set_value("200");
     range->set_upper_bound_included(false);
 
@@ -1579,19 +1689,19 @@ TEST_F(LakePersistentIndexParallelCompactMgrTest, test_compact_with_multi_column
     auto* range = _tablet_metadata->mutable_range();
     auto* lower = range->mutable_lower_bound();
     auto* v_lower1 = lower->add_values();
-    v_lower1->mutable_type()->CopyFrom(TypeDescriptor(TYPE_INT).to_protobuf());
+    v_lower1->mutable_type()->CopyFrom(TYPE_INT_DESC.to_protobuf());
     v_lower1->set_value("100");
     auto* v_lower2 = lower->add_values();
-    v_lower2->mutable_type()->CopyFrom(TypeDescriptor(TYPE_VARCHAR).to_protobuf());
+    v_lower2->mutable_type()->CopyFrom(TYPE_VARCHAR_DESC.to_protobuf());
     v_lower2->set_value("abc");
     range->set_lower_bound_included(true);
 
     auto* upper = range->mutable_upper_bound();
     auto* v_upper1 = upper->add_values();
-    v_upper1->mutable_type()->CopyFrom(TypeDescriptor(TYPE_INT).to_protobuf());
+    v_upper1->mutable_type()->CopyFrom(TYPE_INT_DESC.to_protobuf());
     v_upper1->set_value("200");
     auto* v_upper2 = upper->add_values();
-    v_upper2->mutable_type()->CopyFrom(TypeDescriptor(TYPE_VARCHAR).to_protobuf());
+    v_upper2->mutable_type()->CopyFrom(TYPE_VARCHAR_DESC.to_protobuf());
     v_upper2->set_value("def");
     range->set_upper_bound_included(false);
 
@@ -1609,7 +1719,7 @@ TEST_F(LakePersistentIndexParallelCompactMgrTest, test_compact_with_multi_column
         auto chunk = std::make_unique<Chunk>();
         auto col1 = ColumnTestHelper::build_column<int32_t>({v1});
         chunk->append_column(std::move(col1), (SlotId)0);
-        auto col2 = ColumnHelper::create_column(TypeDescriptor(TYPE_VARCHAR), false);
+        auto col2 = ColumnHelper::create_column(TYPE_VARCHAR_DESC, false);
         col2->append_datum(Datum(Slice(v2)));
         chunk->append_column(std::move(col2), (SlotId)1);
 
