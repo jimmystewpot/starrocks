@@ -58,6 +58,7 @@
   - `bugfix/parquet-missing-column-null-append` (PR #75981)
   - `perf/pb1-bitshuffle-fast-path` (PR #80190)
   - `perf/pg2-gather-prefetch` (PR #82543)
+  - `perf/track-10a-offset-only-string` (Fork PR #3: offset-only string column decoding)
 - [x] **Step 1.4**: Merge hash tables, aggregations, and hardware CRC branches:
   - `feat/arm64-hashutil-crc-dispatch` (PR #78757)
   - `pr/arm64-crc32c-scalar-and-cpuinfo` (PR #79030)
@@ -158,3 +159,19 @@
 - [x] **Step 7.3**: Execute full 43-query ClickBench suite (Q0–Q42) with OS page cache drops before cold runs.
 - [x] **Step 7.4**: Compare ClickHouse against StarRocks `main-custom-default`, `main-baseline`, and `4.1.7` via `compare.py`.
 - [x] **Step 7.5**: Document comparative results, architectural breakdown, and diagnostic profiling plan in Section 12 of `docs/specs/2026-11-02-arm64-clickbench-benchmark-results.md`.
+
+---
+
+### Task 8: 64-Core Scale-Up Evaluation Matrix on Google Axion (`c4a-standard-64`)
+
+**Context & Architectural Rationale for LSE on 64 Cores:**
+On a 16-core system (`c4a-standard-16`), lock and atomic contention across execution threads is relatively mild, resulting in modest ~0.5%–1.0% speedups for ARMv8.1-A Large System Extensions (`+lse`). However, on a **64-core system** (`c4a-standard-64`), 64 concurrent pipeline execution threads heavily contend on shared memory tracking atomics (`MemTracker::consume`), chunk allocators, thread pool scheduling queues, and jemalloc arena spinlocks.
+Without LSE, ARMv8-A relies on Load-Linked/Store-Conditional (`ldaxr`/`stlxr`) retry loops. Under 64-way concurrency, cache-line bouncing triggers repeat LL/SC aborts, causing bus saturation and interconnect stalls.
+With LSE (`-march=armv8-a+crc+lse`), single-instruction atomic operations (`ldadd`, `swp`, `cas`) execute atomically directly in the L2/LLC interconnect hierarchy without retry loops, eliminating atomic storm overhead.
+
+- [ ] **Step 8.1**: Resize GCP VM `starrocks-arm64-clickbench` in `oranged-experimentation` (`us-central1-b`) to `c4a-standard-64` (64 vCPUs, 256 GB RAM).
+- [ ] **Step 8.2**: Package and compile candidate binary with `+lse` (`-march=armv8-a+crc+lse`) incorporating updated SIMD gating PRs + PR #3 (`perf/track-10a-offset-only-string`).
+- [ ] **Step 8.3**: Execute ClickHouse 26.10.3 64-core baseline on `c4a-standard-64`.
+- [ ] **Step 8.4**: Execute StarRocks 4.1.7 upstream official on `c4a-standard-64` using updated ZSTD + Bloom Filter + Bitmap Index schema and parallel Parquet ingestion.
+- [ ] **Step 8.5**: Execute StarRocks Candidate (`+lse`) on `c4a-standard-64` using updated ZSTD + Bloom Filter + Bitmap Index schema and parallel Parquet ingestion.
+- [ ] **Step 8.6**: Run `compare.py` across all 3 systems, generate side-by-side comparison tables, and publish 64-core performance analysis in `docs/specs/2026-11-02-arm64-clickbench-benchmark-results.md`.
