@@ -17,12 +17,23 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <map>
+#include <memory>
 #include <new>
 #include <random>
 #include <utility>
 #include <vector>
+
+#ifdef __AVX2__
+#include <emmintrin.h>
+#include <immintrin.h>
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <xmmintrin.h>
+#endif
 
 #include "base/simd/gather.h"
 
@@ -30,13 +41,17 @@ namespace starrocks {
 
 namespace {
 
-// The source pool size is a benchmark argument (state.range(1)). 4M elements is much larger than L2
-// but may stay in L3; 64M elements is DRAM-bound. Index values are always < pool_size.
+// The source pool size is a benchmark argument (state.range(1)). 4M elements (16 MiB for int32,
+// 32 MiB for int64) exceeds per-core L2 (1-2 MiB) and fits in or straddles L3. 64M elements
+// (256 MiB for int32, 512 MiB for int64) exceeds typical LLCs, though with the 4M-element rotating
+// index ring below, uniform random accesses touch at most ~162 MiB (int32) or ~201 MiB (int64) of
+// 64-byte source cache lines and may still stay cache-resident on hosts with very large shared L3
+// caches (e.g. 260 MiB) after the index ring wraps. Index values are always < pool_size.
 constexpr int64_t kSmallPool = 4 * 1024 * 1024;
 constexpr int64_t kBigPool = 64 * 1024 * 1024;
 
 // Pre-generate at least 4M indexes (16 MiB of uint32_t) and rotate through disjoint num_rows slices
-// across timed iterations so small-batch runs do not stay warm in L1/L2/LLC after the untimed self-check.
+// across timed iterations so small-batch runs do not stay warm in L1/L2 after the untimed self-check.
 constexpr size_t kMinIndexRingSize = 4 * 1024 * 1024;
 
 size_t index_ring_size(size_t num_rows) {
@@ -96,9 +111,61 @@ const std::vector<uint32_t>& cached_strided_indexes(size_t pool_size, size_t num
     return it->second;
 }
 
+const std::vector<uint8_t>& cached_filter_ring(size_t num_rows, int null_pct) {
+    const size_t ring_size = index_ring_size(num_rows);
+    static std::map<std::pair<size_t, int>, std::vector<uint8_t>> cache;
+    auto key = std::make_pair(ring_size, null_pct);
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+        std::vector<uint8_t> flags(ring_size, 0);
+        if (null_pct >= 100) {
+            std::fill(flags.begin(), flags.end(), static_cast<uint8_t>(1));
+        } else if (null_pct > 0) {
+            std::mt19937 rng(54321);
+            std::uniform_int_distribution<int> dist(0, 99);
+            for (size_t i = 0; i < ring_size; ++i) {
+                flags[i] = (dist(rng) < null_pct) ? 1 : 0;
+            }
+        }
+        it = cache.emplace(key, std::move(flags)).first;
+    }
+    return it->second;
+}
+
+// One page-aligned destination buffer per (element type, num_rows), shared by every benchmark variant.
+// A per-run std::vector<T> gives each benchmark a different dest address while src and the index ring are
+// cached and shared, so variants differ in 4K-aliasing / cache-set layout of the store stream. That showed
+// up as +2..+13% between Baseline and LegacyBuffered on x86 even though they compile to byte-identical asm
+// (the built-in null control). A fixed address removes that variable.
+struct AlignedFree {
+    void operator()(void* p) const { std::free(p); }
+};
+
+template <typename T>
+struct AlignedBuffer {
+    static constexpr size_t kAlign = 4096;
+    explicit AlignedBuffer(size_t n) {
+        const size_t bytes = (n * sizeof(T) + kAlign + kAlign - 1) / kAlign * kAlign;
+        data.reset(static_cast<T*>(std::aligned_alloc(kAlign, bytes)));
+        count = data ? n : 0;
+    }
+    std::unique_ptr<T, AlignedFree> data;
+    size_t count = 0;
+};
+
+template <typename T>
+T* shared_dest(size_t num_rows) {
+    static std::map<size_t, AlignedBuffer<T>> cache;
+    auto it = cache.find(num_rows);
+    if (it == cache.end()) {
+        it = cache.emplace(num_rows, AlignedBuffer<T>(num_rows)).first;
+    }
+    return it->second.data.get();
+}
+
 // Verifies dest[i] == src[indexes[i]] once, outside the timed loop.
 template <typename T>
-bool self_check(const std::vector<T>& dest, const std::vector<T>& src, const uint32_t* indexes, size_t num_rows) {
+bool self_check(const T* dest, const std::vector<T>& src, const uint32_t* indexes, size_t num_rows) {
     for (size_t i = 0; i < num_rows; ++i) {
         if (dest[i] != src[indexes[i]]) {
             return false;
@@ -108,15 +175,193 @@ bool self_check(const std::vector<T>& dest, const std::vector<T>& src, const uin
 }
 
 template <typename T>
-void run_gather(benchmark::State& state, const std::vector<T>& src, const std::vector<uint32_t>& index_ring,
-                size_t num_rows) {
+bool self_check_filtered(const T* dest, const std::vector<T>& src, const uint32_t* indexes, const uint8_t* is_filtered,
+                         size_t num_rows) {
+    for (size_t i = 0; i < num_rows; ++i) {
+        const T expected = (is_filtered[i] == 0) ? src[indexes[i]] : static_cast<T>(0);
+        if (dest[i] != expected) {
+            return false;
+        }
+    }
+    return true;
+}
+
+template <typename T>
+inline void gather_unrolled(T* __restrict__ dest, const T* __restrict__ src, const uint32_t* __restrict__ indexes,
+                            size_t num_rows) {
+    size_t i = 0;
+    for (; i + 8 <= num_rows; i += 8) {
+        T v0 = src[indexes[i + 0]];
+        T v1 = src[indexes[i + 1]];
+        T v2 = src[indexes[i + 2]];
+        T v3 = src[indexes[i + 3]];
+        T v4 = src[indexes[i + 4]];
+        T v5 = src[indexes[i + 5]];
+        T v6 = src[indexes[i + 6]];
+        T v7 = src[indexes[i + 7]];
+
+        dest[i + 0] = v0;
+        dest[i + 1] = v1;
+        dest[i + 2] = v2;
+        dest[i + 3] = v3;
+        dest[i + 4] = v4;
+        dest[i + 5] = v5;
+        dest[i + 6] = v6;
+        dest[i + 7] = v7;
+    }
+    for (; i < num_rows; ++i) {
+        dest[i] = src[indexes[i]];
+    }
+}
+
+template <typename T, size_t Lookahead>
+inline void gather_prefetch(T* __restrict__ dest, const T* __restrict__ src, const uint32_t* __restrict__ indexes,
+                            size_t num_rows) {
+    for (size_t p = 0; p < Lookahead && p < num_rows; ++p) {
+        STARROCKS_PREFETCH(src + indexes[p]);
+    }
+    size_t i = 0;
+    static constexpr size_t kStep = (Lookahead >= 8) ? 8 : 4;
+    if constexpr (kStep == 8) {
+        for (; i + Lookahead + 8 <= num_rows; i += 8) {
+            STARROCKS_PREFETCH(src + indexes[i + Lookahead + 0]);
+            STARROCKS_PREFETCH(src + indexes[i + Lookahead + 1]);
+            STARROCKS_PREFETCH(src + indexes[i + Lookahead + 2]);
+            STARROCKS_PREFETCH(src + indexes[i + Lookahead + 3]);
+            STARROCKS_PREFETCH(src + indexes[i + Lookahead + 4]);
+            STARROCKS_PREFETCH(src + indexes[i + Lookahead + 5]);
+            STARROCKS_PREFETCH(src + indexes[i + Lookahead + 6]);
+            STARROCKS_PREFETCH(src + indexes[i + Lookahead + 7]);
+
+            T v0 = src[indexes[i + 0]];
+            T v1 = src[indexes[i + 1]];
+            T v2 = src[indexes[i + 2]];
+            T v3 = src[indexes[i + 3]];
+            T v4 = src[indexes[i + 4]];
+            T v5 = src[indexes[i + 5]];
+            T v6 = src[indexes[i + 6]];
+            T v7 = src[indexes[i + 7]];
+
+            dest[i + 0] = v0;
+            dest[i + 1] = v1;
+            dest[i + 2] = v2;
+            dest[i + 3] = v3;
+            dest[i + 4] = v4;
+            dest[i + 5] = v5;
+            dest[i + 6] = v6;
+            dest[i + 7] = v7;
+        }
+    } else {
+        for (; i + Lookahead + 4 <= num_rows; i += 4) {
+            STARROCKS_PREFETCH(src + indexes[i + Lookahead + 0]);
+            STARROCKS_PREFETCH(src + indexes[i + Lookahead + 1]);
+            STARROCKS_PREFETCH(src + indexes[i + Lookahead + 2]);
+            STARROCKS_PREFETCH(src + indexes[i + Lookahead + 3]);
+
+            T v0 = src[indexes[i + 0]];
+            T v1 = src[indexes[i + 1]];
+            T v2 = src[indexes[i + 2]];
+            T v3 = src[indexes[i + 3]];
+
+            dest[i + 0] = v0;
+            dest[i + 1] = v1;
+            dest[i + 2] = v2;
+            dest[i + 3] = v3;
+        }
+    }
+    for (; i < num_rows; ++i) {
+        dest[i] = src[indexes[i]];
+    }
+}
+
+template <typename T>
+inline void gather_avx2(T* __restrict__ dest, const T* __restrict__ src, const uint32_t* __restrict__ indexes,
+                        size_t num_rows) {
+#ifdef __AVX2__
+    if constexpr (sizeof(T) == 4) {
+        size_t i = 0;
+        for (; i + 8 <= num_rows; i += 8) {
+            __m256i idx = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(indexes + i));
+            __m256i gathered = _mm256_i32gather_epi32(reinterpret_cast<const int*>(src), idx, 4);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dest + i), gathered);
+        }
+        for (; i < num_rows; ++i) {
+            dest[i] = src[indexes[i]];
+        }
+        _mm256_zeroupper();
+    } else if constexpr (sizeof(T) == 8) {
+        size_t i = 0;
+        for (; i + 4 <= num_rows; i += 4) {
+            __m128i idx = _mm_loadu_si128(reinterpret_cast<const __m128i*>(indexes + i));
+            __m256i gathered = _mm256_i32gather_epi64(reinterpret_cast<const long long int*>(src), idx, 8);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dest + i), gathered);
+        }
+        for (; i < num_rows; ++i) {
+            dest[i] = src[indexes[i]];
+        }
+        _mm256_zeroupper();
+    } else {
+        for (size_t i = 0; i < num_rows; ++i) {
+            dest[i] = src[indexes[i]];
+        }
+    }
+#else
+    for (size_t i = 0; i < num_rows; ++i) {
+        dest[i] = src[indexes[i]];
+    }
+#endif
+}
+
+// Verbatim copy of the original buffered 4-arg SIMDGather::gather loop (commit 04e367835f4), kept as the
+// old-vs-new reference now that the header no longer contains it. Intentionally no __restrict__, like the original.
+template <typename T>
+inline void legacy_buffered_gather(T* dest, const T* src, const uint32_t* indexes, size_t num_rows) {
+#ifdef __AVX2__
+    static constexpr uint32_t SIMD_WIDTH = 256;
+#else
+    static constexpr uint32_t SIMD_WIDTH = 128;
+#endif
+    static constexpr uint32_t NUM_BATCH_VALUES = SIMD_WIDTH / (8 * sizeof(T));
+
+    size_t i = 0;
+    if constexpr (NUM_BATCH_VALUES > 0) {
+        T buffer[NUM_BATCH_VALUES];
+        for (; i + NUM_BATCH_VALUES <= num_rows; i += NUM_BATCH_VALUES) {
+            for (uint32_t j = 0; j < NUM_BATCH_VALUES; j++) {
+                buffer[j] = src[indexes[i + j]];
+            }
+            for (uint32_t j = 0; j < NUM_BATCH_VALUES; j++) {
+                dest[i + j] = buffer[j];
+            }
+        }
+    }
+    for (; i < num_rows; i++) {
+        dest[i] = src[indexes[i]];
+    }
+}
+
+template <typename T, typename GatherFn>
+void run_gather_fn(benchmark::State& state, const std::vector<T>& src, const std::vector<uint32_t>& index_ring,
+                   size_t num_rows, GatherFn&& gather_fn) {
     if (num_rows == 0 || index_ring.size() < num_rows) {
         state.SkipWithError("invalid index ring size for num_rows");
         return;
     }
-    std::vector<T> dest(num_rows);
+    T* dest = shared_dest<T>(num_rows);
+    if (dest == nullptr) {
+        state.SkipWithError("destination allocation failed");
+        return;
+    }
+    // Poison with a sentinel so a variant that writes nothing cannot pass on a previous variant's output.
+    std::fill(dest, dest + num_rows, static_cast<T>(-1));
+    for (size_t i = 0; i < num_rows; ++i) {
+        // Guard: the sentinel must not coincide with the expected value anywhere.
+        if (src[index_ring[i]] == static_cast<T>(-1)) {
+            dest[i] = static_cast<T>(0);
+        }
+    }
 
-    SIMDGather::gather(dest.data(), src.data(), index_ring.data(), num_rows);
+    gather_fn(dest, src.data(), index_ring.data(), num_rows);
     if (!self_check(dest, src, index_ring.data(), num_rows)) {
         state.SkipWithError("gathered value mismatch");
         return;
@@ -126,8 +371,53 @@ void run_gather(benchmark::State& state, const std::vector<T>& src, const std::v
     size_t offset = (num_rows < ring_size) ? num_rows : 0;
     for (auto _ : state) {
         const uint32_t* indexes = index_ring.data() + offset;
-        SIMDGather::gather(dest.data(), src.data(), indexes, num_rows);
-        benchmark::DoNotOptimize(dest.data());
+        gather_fn(dest, src.data(), indexes, num_rows);
+        benchmark::DoNotOptimize(dest);
+        benchmark::ClobberMemory();
+        offset += num_rows;
+        if (offset + num_rows > ring_size) {
+            offset = 0;
+        }
+    }
+
+    state.SetBytesProcessed(state.iterations() * num_rows * sizeof(T));
+    state.SetItemsProcessed(state.iterations() * num_rows);
+}
+
+template <typename T, typename GatherFn>
+void run_filtered_gather_fn(benchmark::State& state, const std::vector<T>& src, const std::vector<uint32_t>& index_ring,
+                            const std::vector<uint8_t>& filter_ring, size_t num_rows, GatherFn&& gather_fn) {
+    if (num_rows == 0 || index_ring.size() < num_rows || filter_ring.size() < index_ring.size()) {
+        state.SkipWithError("invalid index or filter ring size for num_rows");
+        return;
+    }
+    T* dest = shared_dest<T>(num_rows);
+    if (dest == nullptr) {
+        state.SkipWithError("destination allocation failed");
+        return;
+    }
+    // Poison with a sentinel so a variant that writes nothing cannot pass on a previous variant's output.
+    std::fill(dest, dest + num_rows, static_cast<T>(-1));
+    for (size_t i = 0; i < num_rows; ++i) {
+        const T expected = (filter_ring[i] == 0) ? src[index_ring[i]] : static_cast<T>(0);
+        if (expected == static_cast<T>(-1)) {
+            dest[i] = static_cast<T>(1);
+        }
+    }
+
+    gather_fn(dest, src.data(), index_ring.data(), filter_ring.data(), num_rows);
+    if (!self_check_filtered(dest, src, index_ring.data(), filter_ring.data(), num_rows)) {
+        state.SkipWithError("filtered gathered value mismatch");
+        return;
+    }
+
+    const size_t ring_size = index_ring.size();
+    size_t offset = (num_rows < ring_size) ? num_rows : 0;
+    for (auto _ : state) {
+        const uint32_t* indexes = index_ring.data() + offset;
+        const uint8_t* is_filtered = filter_ring.data() + offset;
+        gather_fn(dest, src.data(), indexes, is_filtered, num_rows);
+        benchmark::DoNotOptimize(dest);
         benchmark::ClobberMemory();
         offset += num_rows;
         if (offset + num_rows > ring_size) {
@@ -142,7 +432,7 @@ void run_gather(benchmark::State& state, const std::vector<T>& src, const std::v
 } // namespace
 
 template <typename T>
-static void BM_Gather_Random(benchmark::State& state) {
+static void BM_Gather_Baseline(benchmark::State& state) {
     const size_t num_rows = state.range(0);
     const size_t pool_size = state.range(1);
     if (num_rows == 0 || pool_size == 0 || pool_size - 1 > std::numeric_limits<uint32_t>::max()) {
@@ -159,7 +449,75 @@ static void BM_Gather_Random(benchmark::State& state) {
         return;
     }
 
-    run_gather<T>(state, *src, *index_ring, num_rows);
+    run_gather_fn(state, *src, *index_ring, num_rows,
+                  [](T* d, const T* s, const uint32_t* idx, size_t n) { SIMDGather::gather(d, s, idx, n); });
+}
+
+template <typename T>
+static void BM_Gather_Unrolled(benchmark::State& state) {
+    const size_t num_rows = state.range(0);
+    const size_t pool_size = state.range(1);
+    if (num_rows == 0 || pool_size == 0 || pool_size - 1 > std::numeric_limits<uint32_t>::max()) {
+        state.SkipWithError("benchmark arguments out of range for uint32 indexes");
+        return;
+    }
+    const std::vector<T>* src;
+    const std::vector<uint32_t>* index_ring;
+    try {
+        src = &cached_source<T>(pool_size);
+        index_ring = &cached_random_indexes(pool_size, num_rows);
+    } catch (const std::bad_alloc&) {
+        state.SkipWithError("out of memory building benchmark pools");
+        return;
+    }
+
+    run_gather_fn(state, *src, *index_ring, num_rows, gather_unrolled<T>);
+}
+
+template <typename T, size_t Lookahead>
+static void BM_Gather_Prefetch(benchmark::State& state) {
+    const size_t num_rows = state.range(0);
+    const size_t pool_size = state.range(1);
+    if (num_rows == 0 || pool_size == 0 || pool_size - 1 > std::numeric_limits<uint32_t>::max()) {
+        state.SkipWithError("benchmark arguments out of range for uint32 indexes");
+        return;
+    }
+    const std::vector<T>* src;
+    const std::vector<uint32_t>* index_ring;
+    try {
+        src = &cached_source<T>(pool_size);
+        index_ring = &cached_random_indexes(pool_size, num_rows);
+    } catch (const std::bad_alloc&) {
+        state.SkipWithError("out of memory building benchmark pools");
+        return;
+    }
+
+    run_gather_fn(state, *src, *index_ring, num_rows, gather_prefetch<T, Lookahead>);
+}
+
+template <typename T>
+static void BM_Gather_AVX2(benchmark::State& state) {
+#ifndef __AVX2__
+    state.SkipWithError("AVX2 not supported on this platform");
+#else
+    const size_t num_rows = state.range(0);
+    const size_t pool_size = state.range(1);
+    if (num_rows == 0 || pool_size == 0 || pool_size - 1 > std::numeric_limits<uint32_t>::max()) {
+        state.SkipWithError("benchmark arguments out of range for uint32 indexes");
+        return;
+    }
+    const std::vector<T>* src;
+    const std::vector<uint32_t>* index_ring;
+    try {
+        src = &cached_source<T>(pool_size);
+        index_ring = &cached_random_indexes(pool_size, num_rows);
+    } catch (const std::bad_alloc&) {
+        state.SkipWithError("out of memory building benchmark pools");
+        return;
+    }
+
+    run_gather_fn(state, *src, *index_ring, num_rows, gather_avx2<T>);
+#endif
 }
 
 template <typename T>
@@ -180,17 +538,178 @@ static void BM_Gather_Strided(benchmark::State& state) {
         return;
     }
 
-    run_gather<T>(state, *src, *index_ring, num_rows);
+    run_gather_fn(state, *src, *index_ring, num_rows,
+                  [](T* d, const T* s, const uint32_t* idx, size_t n) { SIMDGather::gather(d, s, idx, n); });
+}
+
+template <typename T>
+static void BM_Gather_CallerInformed(benchmark::State& state) {
+    const size_t num_rows = state.range(0);
+    const size_t pool_size = state.range(1);
+    if (num_rows == 0 || pool_size == 0 || pool_size - 1 > std::numeric_limits<uint32_t>::max()) {
+        state.SkipWithError("benchmark arguments out of range for uint32 indexes");
+        return;
+    }
+    const std::vector<T>* src;
+    const std::vector<uint32_t>* index_ring;
+    try {
+        src = &cached_source<T>(pool_size);
+        index_ring = &cached_random_indexes(pool_size, num_rows);
+    } catch (const std::bad_alloc&) {
+        state.SkipWithError("out of memory building benchmark pools");
+        return;
+    }
+
+    run_gather_fn(state, *src, *index_ring, num_rows, [pool_size](T* d, const T* s, const uint32_t* idx, size_t n) {
+        SIMDGather::gather(d, s, idx, n, SourcePoolSize{pool_size});
+    });
+}
+
+// Reference: the original buffered loop, for old-vs-new comparison in a single binary.
+template <typename T>
+static void BM_Gather_LegacyBuffered(benchmark::State& state) {
+    const size_t num_rows = state.range(0);
+    const size_t pool_size = state.range(1);
+    if (num_rows == 0 || pool_size == 0 || pool_size - 1 > std::numeric_limits<uint32_t>::max()) {
+        state.SkipWithError("benchmark arguments out of range for uint32 indexes");
+        return;
+    }
+    const std::vector<T>* src;
+    const std::vector<uint32_t>* index_ring;
+    try {
+        src = &cached_source<T>(pool_size);
+        index_ring = &cached_random_indexes(pool_size, num_rows);
+    } catch (const std::bad_alloc&) {
+        state.SkipWithError("out of memory building benchmark pools");
+        return;
+    }
+
+    run_gather_fn(state, *src, *index_ring, num_rows,
+                  [](T* d, const T* s, const uint32_t* idx, size_t n) { legacy_buffered_gather<T>(d, s, idx, n); });
+}
+
+template <typename T>
+static void BM_Gather_Filtered_Baseline(benchmark::State& state) {
+    const size_t num_rows = state.range(0);
+    const size_t pool_size = state.range(1);
+    const int null_pct = static_cast<int>(state.range(2));
+    if (num_rows == 0 || pool_size == 0 || pool_size - 1 > std::numeric_limits<uint32_t>::max()) {
+        state.SkipWithError("benchmark arguments out of range for uint32 indexes");
+        return;
+    }
+    const std::vector<T>* src;
+    const std::vector<uint32_t>* index_ring;
+    const std::vector<uint8_t>* filter_ring;
+    try {
+        src = &cached_source<T>(pool_size);
+        index_ring = &cached_random_indexes(pool_size, num_rows);
+        filter_ring = &cached_filter_ring(num_rows, null_pct);
+    } catch (const std::bad_alloc&) {
+        state.SkipWithError("out of memory building benchmark pools");
+        return;
+    }
+
+    run_filtered_gather_fn(state, *src, *index_ring, *filter_ring, num_rows,
+                           [](T* d, const T* s, const uint32_t* idx, const uint8_t* flt, size_t n) {
+                               SIMDGather::gather(d, s, idx, flt, n);
+                           });
+}
+
+template <typename T>
+static void BM_Gather_Filtered_CallerInformed(benchmark::State& state) {
+    const size_t num_rows = state.range(0);
+    const size_t pool_size = state.range(1);
+    const int null_pct = static_cast<int>(state.range(2));
+    if (num_rows == 0 || pool_size == 0 || pool_size - 1 > std::numeric_limits<uint32_t>::max()) {
+        state.SkipWithError("benchmark arguments out of range for uint32 indexes");
+        return;
+    }
+    const std::vector<T>* src;
+    const std::vector<uint32_t>* index_ring;
+    const std::vector<uint8_t>* filter_ring;
+    try {
+        src = &cached_source<T>(pool_size);
+        index_ring = &cached_random_indexes(pool_size, num_rows);
+        filter_ring = &cached_filter_ring(num_rows, null_pct);
+    } catch (const std::bad_alloc&) {
+        state.SkipWithError("out of memory building benchmark pools");
+        return;
+    }
+
+    run_filtered_gather_fn(state, *src, *index_ring, *filter_ring, num_rows,
+                           [pool_size](T* d, const T* s, const uint32_t* idx, const uint8_t* flt, size_t n) {
+                               SIMDGather::gather(d, s, idx, flt, n, SourcePoolSize{pool_size});
+                           });
 }
 
 // Args are {num_rows, pool_size}.
 #define STARROCKS_GATHER_SIZES \
-    ArgsProduct({{1024, 8192, 65536, 1048576}, {kSmallPool, kBigPool}})->ArgNames({"rows", "pool"})
+    ArgsProduct({{1024, 4096, 8192, 65536}, {kSmallPool, kBigPool}})->ArgNames({"rows", "pool"})
 
-BENCHMARK_TEMPLATE(BM_Gather_Random, int32_t)->STARROCKS_GATHER_SIZES;
-BENCHMARK_TEMPLATE(BM_Gather_Random, int64_t)->STARROCKS_GATHER_SIZES;
+// Wide matrix: sub-chunk row counts x pool sizes (in elements) from L1/L2-resident up to large pools
+// (up to ~162-201 MiB of touched source cache lines with the 4M-index ring).
+#define STARROCKS_GATHER_WIDE_SIZES                                                                               \
+    ArgsProduct({{512, 1024, 2048, 4096, 8192},                                                                   \
+                 {4096, 16 * 1024, 256 * 1024, 1024 * 1024, 2 * 1024 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024}}) \
+            ->ArgNames({"rows", "pool"})
+
+#define STARROCKS_GATHER_FILTERED_SIZES \
+    ArgsProduct({{512, 4096}, {kSmallPool, kBigPool}, {0, 50, 100}})->ArgNames({"rows", "pool", "null_pct"})
+
+BENCHMARK_TEMPLATE(BM_Gather_Baseline, int32_t)->STARROCKS_GATHER_SIZES;
+BENCHMARK_TEMPLATE(BM_Gather_Baseline, int64_t)->STARROCKS_GATHER_SIZES;
+
+BENCHMARK_TEMPLATE(BM_Gather_Unrolled, int32_t)->STARROCKS_GATHER_SIZES;
+BENCHMARK_TEMPLATE(BM_Gather_Unrolled, int64_t)->STARROCKS_GATHER_SIZES;
+
+BENCHMARK_TEMPLATE(BM_Gather_Prefetch, int32_t, 4)->STARROCKS_GATHER_SIZES;
+BENCHMARK_TEMPLATE(BM_Gather_Prefetch, int32_t, 8)->STARROCKS_GATHER_SIZES;
+BENCHMARK_TEMPLATE(BM_Gather_Prefetch, int32_t, 16)->STARROCKS_GATHER_SIZES;
+
+BENCHMARK_TEMPLATE(BM_Gather_Prefetch, int64_t, 4)->STARROCKS_GATHER_SIZES;
+BENCHMARK_TEMPLATE(BM_Gather_Prefetch, int64_t, 8)->STARROCKS_GATHER_SIZES;
+BENCHMARK_TEMPLATE(BM_Gather_Prefetch, int64_t, 16)->STARROCKS_GATHER_SIZES;
+
+BENCHMARK_TEMPLATE(BM_Gather_AVX2, int32_t)->STARROCKS_GATHER_SIZES;
+BENCHMARK_TEMPLATE(BM_Gather_AVX2, int64_t)->STARROCKS_GATHER_SIZES;
+
 BENCHMARK_TEMPLATE(BM_Gather_Strided, int32_t)->STARROCKS_GATHER_SIZES;
 BENCHMARK_TEMPLATE(BM_Gather_Strided, int64_t)->STARROCKS_GATHER_SIZES;
+
+BENCHMARK_TEMPLATE(BM_Gather_CallerInformed, int32_t)->STARROCKS_GATHER_SIZES;
+BENCHMARK_TEMPLATE(BM_Gather_CallerInformed, int64_t)->STARROCKS_GATHER_SIZES;
+
+// Wide matrix (int32/int64 only): old buffered loop, current default 4-arg gather, pool-hint overload, and one
+// prefetch ablation point. Other lookahead/AVX2/strided variants are intentionally not registered here.
+BENCHMARK_TEMPLATE(BM_Gather_LegacyBuffered, int32_t)
+        ->Name("BM_Gather_LegacyBuffered_wide<int32_t>")
+        ->STARROCKS_GATHER_WIDE_SIZES;
+BENCHMARK_TEMPLATE(BM_Gather_LegacyBuffered, int64_t)
+        ->Name("BM_Gather_LegacyBuffered_wide<int64_t>")
+        ->STARROCKS_GATHER_WIDE_SIZES;
+
+BENCHMARK_TEMPLATE(BM_Gather_Baseline, int32_t)->Name("BM_Gather_Baseline_wide<int32_t>")->STARROCKS_GATHER_WIDE_SIZES;
+BENCHMARK_TEMPLATE(BM_Gather_Baseline, int64_t)->Name("BM_Gather_Baseline_wide<int64_t>")->STARROCKS_GATHER_WIDE_SIZES;
+
+BENCHMARK_TEMPLATE(BM_Gather_CallerInformed, int32_t)
+        ->Name("BM_Gather_CallerInformed_wide<int32_t>")
+        ->STARROCKS_GATHER_WIDE_SIZES;
+BENCHMARK_TEMPLATE(BM_Gather_CallerInformed, int64_t)
+        ->Name("BM_Gather_CallerInformed_wide<int64_t>")
+        ->STARROCKS_GATHER_WIDE_SIZES;
+
+BENCHMARK_TEMPLATE(BM_Gather_Prefetch, int32_t, 8)
+        ->Name("BM_Gather_Prefetch_wide<int32_t,8>")
+        ->STARROCKS_GATHER_WIDE_SIZES;
+BENCHMARK_TEMPLATE(BM_Gather_Prefetch, int64_t, 8)
+        ->Name("BM_Gather_Prefetch_wide<int64_t,8>")
+        ->STARROCKS_GATHER_WIDE_SIZES;
+
+BENCHMARK_TEMPLATE(BM_Gather_Filtered_Baseline, int32_t)->STARROCKS_GATHER_FILTERED_SIZES;
+BENCHMARK_TEMPLATE(BM_Gather_Filtered_Baseline, int64_t)->STARROCKS_GATHER_FILTERED_SIZES;
+
+BENCHMARK_TEMPLATE(BM_Gather_Filtered_CallerInformed, int32_t)->STARROCKS_GATHER_FILTERED_SIZES;
+BENCHMARK_TEMPLATE(BM_Gather_Filtered_CallerInformed, int64_t)->STARROCKS_GATHER_FILTERED_SIZES;
 
 } // namespace starrocks
 

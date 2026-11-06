@@ -21,6 +21,8 @@
 #include <cstdint>
 #include <random>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "base/testutil/parallel_test.h"
@@ -243,6 +245,389 @@ PARALLEL_TEST(GatherTest, string_gather) {
     }
     // The source must be copied from, not moved from.
     ASSERT_EQ(src_copy, src);
+}
+
+template <typename T, typename IndexType>
+void check_caller_informed_gather(size_t num_rows, size_t pool_size) {
+    const std::vector<T> src = make_source<T>();
+    const std::vector<IndexType> indexes = make_indexes<IndexType>(num_rows, 12345 + num_rows);
+    const T sentinel = make_value<T>(999983);
+
+    std::vector<T> dest(num_rows + kGuard, sentinel);
+    SIMDGather::gather(dest.data(), src.data(), indexes.data(), num_rows, SourcePoolSize{pool_size});
+
+    for (size_t i = 0; i < num_rows; ++i) {
+        ASSERT_EQ(src[indexes[i]], dest[i]) << "num_rows=" << num_rows << " pool_size=" << pool_size << " i=" << i;
+    }
+    for (size_t i = num_rows; i < dest.size(); ++i) {
+        ASSERT_EQ(sentinel, dest[i]) << "write past the end, num_rows=" << num_rows << " pool_size=" << pool_size
+                                     << " i=" << i;
+    }
+}
+
+template <typename T, typename IndexType, typename CondType = uint8_t>
+void check_caller_informed_filtered(size_t num_rows, size_t pool_size, FilterPattern pattern = FilterPattern::ModuloMix,
+                                    bool poison_filtered_indices = false) {
+    const std::vector<T> src = make_source<T>();
+    std::vector<IndexType> indexes = make_indexes<IndexType>(num_rows, 777 + num_rows);
+    const std::vector<CondType> is_filtered = make_filter<CondType>(num_rows, pattern, 777 + num_rows);
+    const T sentinel = make_value<T>(999983);
+
+    if (poison_filtered_indices) {
+        for (size_t i = 0; i < num_rows; ++i) {
+            if (is_filtered[i] != 0) {
+                // Out-of-bounds index: accessing src[indexes[i]] would be an invalid read or segfault
+                indexes[i] = static_cast<IndexType>(kPoolSize + 50000 + i);
+            }
+        }
+    }
+
+    std::vector<T> dest(num_rows + kGuard, sentinel);
+    SIMDGather::gather(dest.data(), src.data(), indexes.data(), is_filtered.data(), num_rows,
+                       SourcePoolSize{pool_size});
+
+    for (size_t i = 0; i < num_rows; ++i) {
+        const T expected = is_filtered[i] == 0 ? src[indexes[i]] : T(0);
+        ASSERT_EQ(expected, dest[i]) << "num_rows=" << num_rows << " pool_size=" << pool_size << " i=" << i
+                                     << " pattern=" << static_cast<int>(pattern);
+    }
+    for (size_t i = num_rows; i < dest.size(); ++i) {
+        ASSERT_EQ(sentinel, dest[i]) << "write past the end, num_rows=" << num_rows << " pool_size=" << pool_size
+                                     << " i=" << i;
+    }
+}
+
+TEST(SIMDGatherTest, test_caller_informed_pool_size) {
+    const std::vector<size_t> row_counts = {0,  1,   7,    8,    15,   16,   31,   32,  63,
+                                            64, 100, 4088, 4095, 4096, 4097, 4104, 8192};
+    const std::vector<size_t> pool_sizes = {0, 1024, 4 * 1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024};
+
+    for (size_t pool_size : pool_sizes) {
+        for (size_t n : row_counts) {
+            check_caller_informed_gather<uint32_t, uint32_t>(n, pool_size);
+            check_caller_informed_gather<int32_t, uint32_t>(n, pool_size);
+            check_caller_informed_gather<int32_t, int32_t>(n, pool_size);
+            check_caller_informed_gather<uint64_t, uint32_t>(n, pool_size);
+            check_caller_informed_gather<int64_t, uint32_t>(n, pool_size);
+            check_caller_informed_gather<int64_t, int32_t>(n, pool_size);
+            check_caller_informed_gather<int16_t, uint32_t>(n, pool_size);
+            check_caller_informed_gather<int8_t, int32_t>(n, pool_size);
+        }
+    }
+
+    // String gather with caller-informed pool size
+    std::vector<std::string> src(2000);
+    for (size_t i = 0; i < src.size(); ++i) {
+        src[i] = std::string(i % 30, 'a' + (i % 26)) + std::to_string(i);
+    }
+    const std::vector<std::string> src_copy = src;
+    for (size_t pool_size : {size_t(0), size_t(4 * 1024 * 1024), size_t(64 * 1024 * 1024)}) {
+        for (size_t n : {size_t(0), size_t(1), size_t(4095), size_t(4096), size_t(4097), size_t(8192)}) {
+            std::mt19937 rng(42 + n);
+            std::uniform_int_distribution<uint32_t> dist(0, src.size() - 1);
+            std::vector<uint32_t> indexes(n);
+            for (auto& index : indexes) {
+                index = dist(rng);
+            }
+            std::vector<std::string> dest(n);
+            SIMDGather::gather(dest.data(), src.data(), indexes.data(), n, SourcePoolSize{pool_size});
+            for (size_t i = 0; i < n; ++i) {
+                ASSERT_EQ(src_copy[indexes[i]], dest[i]) << "n=" << n << " i=" << i;
+            }
+        }
+    }
+    ASSERT_EQ(src_copy, src);
+}
+
+TEST(SIMDGatherTest, test_caller_informed_filtered_pool_size) {
+    const std::vector<size_t> row_counts = {0,  1,   7,    8,    15,   16,   31,   32,  63,
+                                            64, 100, 4088, 4095, 4096, 4097, 4104, 8192};
+    const std::vector<size_t> pool_sizes = {0, 1024, 4 * 1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024};
+    const std::vector<FilterPattern> patterns = {
+            FilterPattern::AllZeros, FilterPattern::AllOnes,   FilterPattern::Alternating,
+            FilterPattern::Random,   FilterPattern::ModuloMix,
+    };
+
+    // Standard filter patterns with small and large DRAM pools
+    for (size_t pool_size : pool_sizes) {
+        for (FilterPattern pattern : patterns) {
+            for (size_t n : row_counts) {
+                check_caller_informed_filtered<uint32_t, uint32_t, uint8_t>(n, pool_size, pattern, false);
+                check_caller_informed_filtered<int32_t, uint32_t, uint8_t>(n, pool_size, pattern, false);
+                check_caller_informed_filtered<int64_t, uint32_t, uint8_t>(n, pool_size, pattern, false);
+                check_caller_informed_filtered<uint64_t, int32_t, uint8_t>(n, pool_size, pattern, false);
+            }
+        }
+    }
+
+    // Critical edge case: invalid filtered indices that should NOT be accessed
+    // Filtered entries have indices pointing far out of bounds (would crash/segfault if accessed)
+    for (size_t pool_size : {size_t(0), size_t(4 * 1024 * 1024), size_t(16 * 1024 * 1024), size_t(64 * 1024 * 1024)}) {
+        for (FilterPattern pattern : {FilterPattern::Alternating, FilterPattern::ModuloMix, FilterPattern::AllOnes}) {
+            for (size_t n : {size_t(1), size_t(8), size_t(16), size_t(4088), size_t(4095), size_t(4096), size_t(4097),
+                             size_t(4104), size_t(8192)}) {
+                check_caller_informed_filtered<uint32_t, uint32_t, uint8_t>(n, pool_size, pattern, true);
+                check_caller_informed_filtered<int32_t, int32_t, uint8_t>(n, pool_size, pattern, true);
+                check_caller_informed_filtered<uint64_t, uint32_t, uint8_t>(n, pool_size, pattern, true);
+                check_caller_informed_filtered<int64_t, int32_t, uint8_t>(n, pool_size, pattern, true);
+            }
+        }
+    }
+}
+
+namespace {
+struct TestPOD {
+    int64_t x{0};
+    int64_t y{0};
+    TestPOD() = default;
+    TestPOD(int64_t x_, int64_t y_) : x(x_), y(y_) {}
+    bool operator==(const TestPOD& o) const = default;
+};
+
+inline std::ostream& operator<<(std::ostream& os, const TestPOD& p) {
+    return os << "{" << p.x << ", " << p.y << "}";
+}
+
+struct NonZeroDefaultIntWrapper {
+    int32_t value{7};
+    constexpr NonZeroDefaultIntWrapper() = default;
+    constexpr explicit NonZeroDefaultIntWrapper(int v) : value(v) {}
+    bool operator==(const NonZeroDefaultIntWrapper& o) const = default;
+};
+static_assert(std::is_trivially_copyable_v<NonZeroDefaultIntWrapper>);
+static_assert(std::is_constructible_v<NonZeroDefaultIntWrapper, int>);
+
+inline std::ostream& operator<<(std::ostream& os, const NonZeroDefaultIntWrapper& w) {
+    return os << "Wrapper(" << w.value << ")";
+}
+} // namespace
+
+static_assert(std::is_trivially_copyable_v<TestPOD>);
+static_assert(!std::is_constructible_v<TestPOD, int>);
+
+TEST(SIMDGatherTest, test_custom_trivially_copyable_struct) {
+    constexpr size_t kPodPoolSize = 1000;
+    std::vector<TestPOD> src(kPodPoolSize);
+    for (size_t i = 0; i < kPodPoolSize; ++i) {
+        src[i] = TestPOD{static_cast<int64_t>(i * 3 + 1), static_cast<int64_t>(i * 7 + 2)};
+    }
+    const std::vector<TestPOD> src_copy = src;
+
+    const std::vector<size_t> row_counts = {0, 1, 7, 8, 15, 16, 31, 32, 63, 64, 100, 4096, 4104};
+    const std::vector<FilterPattern> patterns = {
+            FilterPattern::AllZeros, FilterPattern::AllOnes,   FilterPattern::Alternating,
+            FilterPattern::Random,   FilterPattern::ModuloMix,
+    };
+
+    for (size_t n : row_counts) {
+        std::mt19937 rng(12345 + n);
+        std::uniform_int_distribution<uint32_t> dist(0, kPodPoolSize - 1);
+        std::vector<uint32_t> indexes(n);
+        for (auto& idx : indexes) {
+            idx = dist(rng);
+        }
+
+        // 1. Basic gather (4-arg)
+        {
+            std::vector<TestPOD> dest(n + kGuard, TestPOD{-1, -1});
+            SIMDGather::gather(dest.data(), src.data(), indexes.data(), n);
+            for (size_t i = 0; i < n; ++i) {
+                ASSERT_EQ(src[indexes[i]], dest[i]) << "Basic gather failed at n=" << n << " i=" << i;
+            }
+            for (size_t g = n; g < n + kGuard; ++g) {
+                ASSERT_EQ((TestPOD{-1, -1}), dest[g]) << "Guard corrupted in basic gather at n=" << n << " g=" << g;
+            }
+        }
+
+        // 2. Caller-informed gather (5-arg)
+        for (size_t pool_size : {size_t(0), size_t(1000), size_t(16 * 1024 * 1024), size_t(64 * 1024 * 1024)}) {
+            std::vector<TestPOD> dest(n + kGuard, TestPOD{-1, -1});
+            SIMDGather::gather(dest.data(), src.data(), indexes.data(), n, SourcePoolSize{pool_size});
+            for (size_t i = 0; i < n; ++i) {
+                ASSERT_EQ(src[indexes[i]], dest[i])
+                        << "Caller-informed gather failed at n=" << n << " pool=" << pool_size;
+            }
+            for (size_t g = n; g < n + kGuard; ++g) {
+                ASSERT_EQ((TestPOD{-1, -1}), dest[g]) << "Guard corrupted at n=" << n << " g=" << g;
+            }
+        }
+
+        // 3. Filtered gather (5-arg and 6-arg)
+        for (FilterPattern pattern : patterns) {
+            auto is_filtered = make_filter<uint8_t>(n, pattern, 42 + n);
+            // 5-arg gather_filtered
+            {
+                std::vector<TestPOD> dest(n + kGuard, TestPOD{-1, -1});
+                SIMDGather::gather(dest.data(), src.data(), indexes.data(), is_filtered.data(), n);
+                for (size_t i = 0; i < n; ++i) {
+                    TestPOD expected = (is_filtered[i] == 0) ? src[indexes[i]] : TestPOD{};
+                    ASSERT_EQ(expected, dest[i]) << "Filtered gather failed at n=" << n << " i=" << i;
+                }
+                for (size_t g = n; g < n + kGuard; ++g) {
+                    ASSERT_EQ((TestPOD{-1, -1}), dest[g]) << "Guard corrupted at n=" << n << " g=" << g;
+                }
+            }
+
+            // 6-arg caller-informed gather_filtered
+            for (size_t pool_size : {size_t(0), size_t(1000), size_t(16 * 1024 * 1024), size_t(64 * 1024 * 1024)}) {
+                std::vector<TestPOD> dest(n + kGuard, TestPOD{-1, -1});
+                SIMDGather::gather(dest.data(), src.data(), indexes.data(), is_filtered.data(), n,
+                                   SourcePoolSize{pool_size});
+                for (size_t i = 0; i < n; ++i) {
+                    TestPOD expected = (is_filtered[i] == 0) ? src[indexes[i]] : TestPOD{};
+                    ASSERT_EQ(expected, dest[i])
+                            << "Caller-informed filtered gather failed at n=" << n << " pool=" << pool_size;
+                }
+                for (size_t g = n; g < n + kGuard; ++g) {
+                    ASSERT_EQ((TestPOD{-1, -1}), dest[g]) << "Guard corrupted at n=" << n << " g=" << g;
+                }
+            }
+        }
+    }
+    ASSERT_EQ(src_copy, src);
+}
+
+TEST(SIMDGatherTest, test_filtered_int_constructible_nonzero_default_wrapper) {
+    constexpr size_t kWrapperPoolSize = 1024;
+    std::vector<NonZeroDefaultIntWrapper> src(kWrapperPoolSize);
+    for (size_t i = 0; i < kWrapperPoolSize; ++i) {
+        src[i] = NonZeroDefaultIntWrapper(static_cast<int>(i * 5 + 11));
+    }
+
+    const std::vector<size_t> row_counts = {0, 1, 7, 8, 15, 16, 511, 512, 513, 520, 4096};
+    const std::vector<FilterPattern> patterns = {
+            FilterPattern::AllZeros,
+            FilterPattern::AllOnes,
+            FilterPattern::Alternating,
+            FilterPattern::ModuloMix,
+    };
+    const std::vector<size_t> pool_sizes = {0, 4 * 1024 * 1024, 16 * 1024 * 1024};
+    const NonZeroDefaultIntWrapper kSentinel(999983);
+
+    for (size_t n : row_counts) {
+        std::mt19937 rng(67890 + n);
+        std::uniform_int_distribution<uint32_t> dist(0, kWrapperPoolSize - 1);
+        std::vector<uint32_t> base_indexes(n);
+        for (auto& idx : base_indexes) {
+            idx = dist(rng);
+        }
+
+        for (FilterPattern pattern : patterns) {
+            auto is_filtered = make_filter<uint8_t>(n, pattern, 77 + n);
+            for (bool poison_filtered : {false, true}) {
+                std::vector<uint32_t> indexes = base_indexes;
+                if (poison_filtered) {
+                    for (size_t i = 0; i < n; ++i) {
+                        if (is_filtered[i] != 0) {
+                            indexes[i] = 0x3FFFFFFFu;
+                        }
+                    }
+                }
+
+                // 5-arg filtered gather
+                {
+                    std::vector<NonZeroDefaultIntWrapper> dest(n + kGuard, kSentinel);
+                    SIMDGather::gather(dest.data(), src.data(), indexes.data(), is_filtered.data(), n);
+                    for (size_t i = 0; i < n; ++i) {
+                        NonZeroDefaultIntWrapper expected =
+                                (is_filtered[i] == 0) ? src[indexes[i]] : NonZeroDefaultIntWrapper(0);
+                        ASSERT_EQ(expected, dest[i]) << "5-arg filtered gather failed at n=" << n << " i=" << i
+                                                     << " poison=" << poison_filtered;
+                    }
+                    for (size_t g = n; g < n + kGuard; ++g) {
+                        ASSERT_EQ(kSentinel, dest[g]) << "Guard corrupted at n=" << n << " g=" << g;
+                    }
+                }
+
+                // 6-arg filtered gather with SourcePoolSize
+                for (size_t pool_size : pool_sizes) {
+                    std::vector<NonZeroDefaultIntWrapper> dest(n + kGuard, kSentinel);
+                    SIMDGather::gather(dest.data(), src.data(), indexes.data(), is_filtered.data(), n,
+                                       SourcePoolSize{pool_size});
+                    for (size_t i = 0; i < n; ++i) {
+                        NonZeroDefaultIntWrapper expected =
+                                (is_filtered[i] == 0) ? src[indexes[i]] : NonZeroDefaultIntWrapper(0);
+                        ASSERT_EQ(expected, dest[i])
+                                << "6-arg filtered gather failed at n=" << n << " pool_size=" << pool_size << " i=" << i
+                                << " poison=" << poison_filtered;
+                    }
+                    for (size_t g = n; g < n + kGuard; ++g) {
+                        ASSERT_EQ(kSentinel, dest[g])
+                                << "Guard corrupted at n=" << n << " pool_size=" << pool_size << " g=" << g;
+                    }
+                }
+            }
+        }
+    }
+}
+
+namespace {
+
+template <typename... Args>
+using gather_call_t = decltype(SIMDGather::gather(std::declval<Args>()...));
+
+template <typename Void, typename... Args>
+struct IsGatherCallable : std::false_type {};
+
+template <typename... Args>
+struct IsGatherCallable<std::void_t<gather_call_t<Args...>>, Args...> : std::true_type {};
+
+template <typename... Args>
+constexpr bool is_gather_callable_v = IsGatherCallable<void, Args...>::value;
+
+} // namespace
+
+TEST(SIMDGatherTest, pool_size_hint_rejects_raw_size_t) {
+    // A raw (size_t, size_t) tail must never be accepted: it would silently swap the
+    // legacy (buckets, num_rows) arguments into the pool-size hint overload.
+    static_assert(!is_gather_callable_v<int16_t*, const int16_t*, const uint32_t*, size_t, size_t>);
+    static_assert(!is_gather_callable_v<int16_t*, const int16_t*, const uint32_t*, const uint8_t*, size_t, size_t>);
+
+    // The strongly typed hint is accepted by both hint overloads.
+    static_assert(is_gather_callable_v<int16_t*, const int16_t*, const uint32_t*, size_t, SourcePoolSize>);
+    static_assert(
+            is_gather_callable_v<int16_t*, const int16_t*, const uint32_t*, const uint8_t*, size_t, SourcePoolSize>);
+    // The legacy overload is still selected for supported 4-byte destinations.
+    static_assert(is_gather_callable_v<int32_t*, const int16_t*, const uint32_t*, size_t, int>);
+    static_assert(!std::is_convertible_v<size_t, SourcePoolSize>);
+    static_assert(SourcePoolSize{7}.elements == 7);
+}
+
+TEST(SIMDGatherTest, prefetch_constants_pinned) {
+    static_assert(SIMDGather::kPrefetchMinRows == 512);
+    static_assert(SIMDGather::kPrefetchPoolBytes == 16 * 1024 * 1024);
+    static_assert(SIMDGather::kPrefetchLookahead == 8);
+    EXPECT_EQ(512u, SIMDGather::kPrefetchMinRows);
+}
+
+// Row counts around the prefetch row gate and the unroll/lookahead tails, pool hints one below,
+// at and one above the byte threshold.
+template <typename T>
+void check_prefetch_gate_boundaries() {
+    const std::vector<size_t> row_counts = {0,   1,   7,   8,   15,  16,   17,   511, 512,
+                                            513, 519, 520, 527, 528, 1000, 4095, 4096};
+    const size_t threshold = SIMDGather::kPrefetchPoolBytes / sizeof(T);
+    for (size_t pool : {threshold - 1, threshold, threshold + 1}) {
+        for (size_t n : row_counts) {
+            check_caller_informed_gather<T, uint32_t>(n, pool);
+            check_caller_informed_gather<T, int32_t>(n, pool);
+            for (FilterPattern pattern : {FilterPattern::Alternating, FilterPattern::ModuloMix, FilterPattern::AllOnes,
+                                          FilterPattern::AllZeros}) {
+                check_caller_informed_filtered<T, uint32_t, uint8_t>(n, pool, pattern, false);
+                // Filtered rows carry out-of-range indexes: they must be neither dereferenced nor prefetched.
+                check_caller_informed_filtered<T, int32_t, uint8_t>(n, pool, pattern, true);
+            }
+        }
+    }
+}
+
+TEST(SIMDGatherTest, prefetch_gate_boundaries) {
+    check_prefetch_gate_boundaries<int32_t>();
+    check_prefetch_gate_boundaries<int64_t>();
+    // Narrow types: the prefetch loop advances in steps of 8, so the buffered default loop then
+    // starts at an index that is not a multiple of NUM_BATCH_VALUES (16 for int16, 32 for int8 under AVX2).
+    check_prefetch_gate_boundaries<int16_t>();
+    check_prefetch_gate_boundaries<int8_t>();
 }
 
 } // namespace starrocks
