@@ -96,6 +96,14 @@ size_t compress_neon_w4(uint32_t* dst, const uint32_t* src, const uint8_t* selec
 size_t compress_neon_w8(uint64_t* dst, const uint64_t* src, const uint8_t* selector, size_t from, size_t to);
 #endif
 
+#if defined(__x86_64__)
+size_t filter_range_avx2(void* dst, const void* src, size_t element_size, const uint8_t* selector, size_t from,
+                         size_t to);
+size_t compress_avx2_w4(uint32_t* dst, const uint32_t* src, const uint8_t* selector, size_t from, size_t to);
+size_t compress_avx2_w8(uint64_t* dst, const uint64_t* src, const uint8_t* selector, size_t from, size_t to);
+size_t scan_avx2_baseline_w4(uint32_t* dst, const uint32_t* src, const uint8_t* selector, size_t from, size_t to);
+size_t scan_avx2_baseline_w8(uint64_t* dst, const uint64_t* src, const uint8_t* selector, size_t from, size_t to);
+#endif
 } // namespace detail
 
 // Stream compaction: copy the elements of `src` whose selector byte is non-zero,

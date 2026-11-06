@@ -382,7 +382,7 @@ BENCHMARK_TEMPLATE(do_FillDefault, int64_t, fill_default_hoist<int64_t>)
 // and rotate across iterations so the CPU branch predictor cannot memorize a single 4096-row pattern.
 constexpr size_t kSelectorRingSize = 16;
 
-static std::vector<std::vector<uint8_t>> make_filter_selector_ring(size_t n, int keep_pct, int cluster, uint32_t seed) {
+static std::vector<std::vector<uint8_t>> make_filter_selector_ring(size_t n, int keep_pct, int cluster, uint64_t seed) {
     std::mt19937 rng(seed);
     std::uniform_int_distribution<int> dist(0, 99);
     std::vector<std::vector<uint8_t>> ring(kSelectorRingSize, std::vector<uint8_t>(n));
@@ -796,6 +796,106 @@ static void BM_CountZero_32Bit(benchmark::State& state) {
 
 BENCHMARK(BM_CountZero_8Bit)->Apply(GenerateCountZeroArgs);
 BENCHMARK(BM_CountZero_32Bit)->Apply(GenerateCountZeroArgs);
+
+
+#if defined(__x86_64__)
+
+// =====================================================================
+// SIMD filter_range stream compaction microbenchmarks (AVX2)
+// =====================================================================
+
+template <typename T, size_t (*Kernel)(T*, const T*, const uint8_t*, size_t, size_t)>
+static void BM_SimdFilterKernel(benchmark::State& state) {
+    if (!__builtin_cpu_supports("avx2")) {
+        state.SkipWithError("AVX2 is not supported on this CPU");
+        return;
+    }
+    const int selectivity = state.range(0);
+    const int cluster = state.range(1);
+
+    auto ring = make_filter_selector_ring(kChunk, selectivity, cluster, 0x12345678ULL);
+
+    std::vector<T> src(kChunk);
+    for (size_t i = 0; i < kChunk; ++i) {
+        src[i] = static_cast<T>(i * 31 + 7);
+    }
+    std::vector<T> dst(kChunk, 0);
+
+    size_t ring_idx = 0;
+    size_t total_retained = 0;
+    for (auto _ : state) {
+        const uint8_t* selector = ring[ring_idx].data();
+        size_t retained = Kernel(dst.data(), src.data(), selector, 0, kChunk);
+        total_retained += retained;
+        benchmark::DoNotOptimize(dst.data());
+        ring_idx = (ring_idx + 1) & 15;
+    }
+    benchmark::DoNotOptimize(total_retained);
+    state.SetBytesProcessed(int64_t(state.iterations()) * int64_t(kChunk * sizeof(T)));
+    state.SetItemsProcessed(int64_t(state.iterations()) * int64_t(kChunk));
+}
+
+static void SimdFilterKernelArgs(benchmark::Benchmark* b) {
+    for (int cluster : {0, 7, 13, 16}) {
+        for (int sel : {10, 20, 30, 40, 50, 60, 70, 80, 90}) {
+            b->Args({sel, cluster});
+        }
+    }
+}
+
+BENCHMARK_TEMPLATE(BM_SimdFilterKernel, uint32_t, SIMD::Filter::detail::scan_avx2_baseline_w4)
+        ->Name("BM_SimdFilterKernel_scan_avx2_baseline_w4")
+        ->Apply(SimdFilterKernelArgs);
+
+BENCHMARK_TEMPLATE(BM_SimdFilterKernel, uint32_t, SIMD::Filter::detail::compress_avx2_w4)
+        ->Name("BM_SimdFilterKernel_compress_avx2_w4")
+        ->Apply(SimdFilterKernelArgs);
+
+BENCHMARK_TEMPLATE(BM_SimdFilterKernel, uint64_t, SIMD::Filter::detail::scan_avx2_baseline_w8)
+        ->Name("BM_SimdFilterKernel_scan_avx2_baseline_w8")
+        ->Apply(SimdFilterKernelArgs);
+
+BENCHMARK_TEMPLATE(BM_SimdFilterKernel, uint64_t, SIMD::Filter::detail::compress_avx2_w8)
+        ->Name("BM_SimdFilterKernel_compress_avx2_w8")
+        ->Apply(SimdFilterKernelArgs);
+
+template <typename T>
+static void BM_SimdFilterRangeAvx2(benchmark::State& state) {
+    if (!__builtin_cpu_supports("avx2")) {
+        state.SkipWithError("AVX2 is not supported on this CPU");
+        return;
+    }
+    const int selectivity = state.range(0);
+    const int cluster = state.range(1);
+
+    auto ring = make_filter_selector_ring(kChunk, selectivity, cluster, 0x12345678ULL);
+
+    std::vector<T> src(kChunk);
+    for (size_t i = 0; i < kChunk; ++i) {
+        src[i] = static_cast<T>(i * 31 + 7);
+    }
+    std::vector<T> dst(kChunk, 0);
+
+    size_t ring_idx = 0;
+    size_t total_retained = 0;
+    for (auto _ : state) {
+        const uint8_t* selector = ring[ring_idx].data();
+        size_t retained =
+                SIMD::Filter::detail::filter_range_avx2(dst.data(), src.data(), sizeof(T), selector, 0, kChunk);
+        total_retained += retained;
+        benchmark::DoNotOptimize(dst.data());
+        ring_idx = (ring_idx + 1) & 15;
+    }
+    benchmark::DoNotOptimize(total_retained);
+    state.SetBytesProcessed(int64_t(state.iterations()) * int64_t(kChunk * sizeof(T)));
+    state.SetItemsProcessed(int64_t(state.iterations()) * int64_t(kChunk));
+}
+
+BENCHMARK_TEMPLATE(BM_SimdFilterRangeAvx2, uint32_t)->Name("BM_SimdFilterRangeAvx2_w4")->Apply(SimdFilterKernelArgs);
+
+BENCHMARK_TEMPLATE(BM_SimdFilterRangeAvx2, uint64_t)->Name("BM_SimdFilterRangeAvx2_w8")->Apply(SimdFilterKernelArgs);
+
+#endif // __x86_64__
 
 } // namespace starrocks
 
