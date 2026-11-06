@@ -420,7 +420,9 @@ if ("${CMAKE_BUILD_TARGET_ARCH}" STREQUAL "x86" OR "${CMAKE_BUILD_TARGET_ARCH}" 
         set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -mavx512f -mavx512bw -mavx512dq -mavx512cd -mavx512vl")
     endif()
 elseif ("${CMAKE_BUILD_TARGET_ARCH}" STREQUAL "aarch64")
-    if (${USE_ARM_CRC32})
+    if (DEFINED ENV{ARM_ARCH})
+        set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -march=$ENV{ARM_ARCH}")
+    elseif (${USE_ARM_CRC32})
         set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -march=armv8-a+crc")
     else()
         set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -march=armv8-a")
@@ -517,6 +519,9 @@ endif()
 
 # Add flags that are common across build types
 SET(CMAKE_CXX_FLAGS "${CXX_COMMON_FLAGS} ${CMAKE_CXX_FLAGS}")
+if (DEFINED ENV{EXTRA_CXX_FLAGS})
+    SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} $ENV{EXTRA_CXX_FLAGS}")
+endif()
 if("${WITH_RELATIVE_SRC_PATH}" STREQUAL "ON")
     # apply -ffile-prefix-map option to .c source files as well
     SET(CMAKE_C_FLAGS "${FILE_PREFIX_MAP_FLAG} ${CMAKE_C_FLAGS}")
