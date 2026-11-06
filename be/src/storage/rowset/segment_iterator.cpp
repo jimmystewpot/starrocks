@@ -2285,12 +2285,13 @@ void SegmentIterator::_mark_offset_only_chunk_columns(Chunk* chunk) const {
     for (size_t i = 0; i < schema->num_fields() && i < chunk->num_columns(); ++i) {
         const FieldPtr& f = schema->field(i);
         const ColumnId cid = f->id();
-        if (f->type()->type() == TYPE_VARCHAR && cid < _column_iterators.size() && _column_iterators[cid] != nullptr &&
-            _column_iterators[cid]->is_offset_only()) {
+        if (f->type()->type() == TYPE_VARCHAR) {
+            const bool is_offset_only = (cid < _column_iterators.size() && _column_iterators[cid] != nullptr &&
+                                         _column_iterators[cid]->is_offset_only());
             auto* col = chunk->get_column_raw_ptr_by_index(i);
             if (col->is_binary() ||
                 (col->is_nullable() && down_cast<NullableColumn*>(col)->data_column()->is_binary())) {
-                ColumnHelper::get_binary_column(col)->set_offset_only(true);
+                ColumnHelper::get_binary_column(col)->set_offset_only(is_offset_only);
             }
         }
     }
@@ -3174,11 +3175,9 @@ Status SegmentIterator::_do_get_next(Chunk* result, vector<rowid_t>* rowid) {
     _context->_dict_chunk->reset();
     _context->_final_chunk->reset();
     _context->_adapt_global_dict_chunk->reset();
-    if (UNLIKELY(_has_offset_only_columns)) {
-        _mark_offset_only_chunk_columns(_context->_read_chunk.get());
-        _mark_offset_only_chunk_columns(_context->_dict_chunk.get());
-        _mark_offset_only_chunk_columns(_context->_final_chunk.get());
-    }
+    _mark_offset_only_chunk_columns(_context->_read_chunk.get());
+    _mark_offset_only_chunk_columns(_context->_dict_chunk.get());
+    _mark_offset_only_chunk_columns(_context->_final_chunk.get());
 
     Chunk* chunk = _context->_read_chunk.get();
 

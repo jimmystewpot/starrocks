@@ -917,4 +917,118 @@ TEST_F(SegmentReaderWriterTest, TestOffsetOnlyVarcharScan) {
     }
 }
 
+TEST_F(SegmentReaderWriterTest, TestOffsetOnlyRecycledChunkAcrossSegments) {
+    constexpr size_t kNumRows = 1200;
+
+    TabletSchemaPB pb;
+    pb.set_keys_type(DUP_KEYS);
+    pb.set_num_short_key_columns(1);
+    auto* c0 = pb.add_column();
+    c0->set_unique_id(1);
+    c0->set_name("counter_id");
+    c0->set_type("INT");
+    c0->set_is_key(true);
+    c0->set_is_nullable(false);
+    c0->set_length(4);
+    c0->set_index_length(4);
+    c0->set_aggregation("NONE");
+
+    auto* c1 = pb.add_column();
+    c1->set_unique_id(2);
+    c1->set_name("url");
+    c1->set_type("VARCHAR");
+    c1->set_is_key(false);
+    c1->set_is_nullable(false);
+    c1->set_length(65535);
+    c1->set_aggregation("NONE");
+
+    auto tablet_schema = TabletSchema::create(pb);
+    auto schema = ChunkHelper::convert_schema(tablet_schema);
+
+    auto write_segment = [&](int seg_idx, std::vector<std::string>* urls_out) -> std::shared_ptr<Segment> {
+        static int seg_id = 0;
+        std::string filename = strings::Substitute("$0/offset_only_recycled_$1_$2.dat", kSegmentDir, seg_idx, seg_id++);
+        ASSIGN_OR_ABORT(auto wfile, _fs->new_writable_file(filename));
+        SegmentWriterOptions writer_opts;
+        SegmentWriter writer(std::move(wfile), seg_idx, tablet_schema, writer_opts);
+        CHECK_OK(writer.init());
+
+        urls_out->resize(kNumRows);
+        auto write_chunk = ChunkFactory::new_chunk(schema, kNumRows);
+        for (size_t rid = 0; rid < kNumRows; ++rid) {
+            int32_t counter_id = static_cast<int32_t>(rid);
+            (*urls_out)[rid] = "https://starrocks.io/seg_" + std::to_string(seg_idx) + "/row_" + std::to_string(rid) +
+                               "_" + std::string(16 + (rid % 32), 'x');
+            auto cols = write_chunk->columns();
+            cols[0]->as_mutable_ptr()->append_datum(Datum(counter_id));
+            cols[1]->as_mutable_ptr()->append_datum(Datum(Slice((*urls_out)[rid])));
+        }
+        CHECK_OK(writer.append_chunk(*write_chunk));
+        uint64_t file_size = 0, index_size = 0, footer_position = 0;
+        CHECK_OK(writer.finalize(&file_size, &index_size, &footer_position));
+        ASSIGN_OR_ABORT(auto segment, Segment::open(_fs, FileInfo{filename}, seg_idx, tablet_schema));
+        return segment;
+    };
+
+    std::vector<std::string> urls0;
+    std::vector<std::string> urls1;
+    auto seg0 = write_segment(0, &urls0);
+    auto seg1 = write_segment(1, &urls1);
+
+    SegmentReadOptions seg_options0;
+    seg_options0.fs = _fs;
+    OlapReaderStatistics stats0;
+    seg_options0.stats = &stats0;
+    seg_options0.chunk_size = 512;
+    std::unordered_set<uint32_t> offset_only_cids = {1};
+    seg_options0.offset_only_column_ids = &offset_only_cids;
+    ASSIGN_OR_ABORT(auto seg_iter0, seg0->new_iterator(schema, seg_options0));
+
+    SegmentReadOptions seg_options1;
+    seg_options1.fs = _fs;
+    OlapReaderStatistics stats1;
+    seg_options1.stats = &stats1;
+    seg_options1.chunk_size = 512;
+    seg_options1.offset_only_column_ids = nullptr;
+    ASSIGN_OR_ABORT(auto seg_iter1, seg1->new_iterator(schema, seg_options1));
+
+    auto read_chunk = ChunkFactory::new_chunk(schema, 512);
+
+    size_t rows_seg0 = 0;
+    while (true) {
+        read_chunk->reset();
+        Status st = seg_iter0->get_next(read_chunk.get());
+        if (st.is_end_of_file()) {
+            break;
+        }
+        ASSERT_OK(st);
+        auto* url_col = ColumnHelper::get_binary_column(read_chunk->get_column_raw_ptr_by_index(1));
+        ASSERT_TRUE(url_col->is_offset_only());
+        rows_seg0 += read_chunk->num_rows();
+    }
+    seg_iter0->close();
+    ASSERT_EQ(kNumRows, rows_seg0);
+
+    // At the end of seg_iter0, read_chunk holds a BinaryColumn with is_offset_only() == true.
+    ASSERT_TRUE(ColumnHelper::get_binary_column(read_chunk->get_column_raw_ptr_by_index(1))->is_offset_only());
+
+    size_t rows_seg1 = 0;
+    while (true) {
+        read_chunk->reset();
+        Status st = seg_iter1->get_next(read_chunk.get());
+        if (st.is_end_of_file()) {
+            break;
+        }
+        ASSERT_OK(st);
+        auto* url_col = ColumnHelper::get_binary_column(read_chunk->get_column_raw_ptr_by_index(1));
+        ASSERT_FALSE(url_col->is_offset_only());
+        for (size_t i = 0; i < read_chunk->num_rows(); ++i) {
+            ASSERT_EQ(urls1[rows_seg1 + i], url_col->get_slice(i).to_string());
+        }
+        rows_seg1 += read_chunk->num_rows();
+    }
+    seg_iter1->close();
+    ASSERT_EQ(kNumRows, rows_seg1);
+}
+
 } // namespace starrocks
