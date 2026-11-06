@@ -107,9 +107,9 @@
 **Files:**
 - Modify: `/home/jalamb/go/src/github.com/jimmystewpot/ClickBench/starrocks-versions/run-version.sh`
 
-- [ ] **Step 3.1**: Add support for running both `starrocks` (native TSV table) and `starrocks-parquet` (Parquet queries).
-- [ ] **Step 3.2**: Configure port safety checks (killing stale processes on 9030, 9050, 8040, 8030).
-- [ ] **Step 3.3**: Ensure cold run cache drops (`sync; echo 3 | sudo tee /proc/sys/vm/drop_caches`) execute gracefully.
+- [x] **Step 3.1**: Add support for running both `starrocks` (native TSV table) and `starrocks-parquet` (Parquet queries).
+- [x] **Step 3.2**: Configure port safety checks (killing stale processes on 9030, 9050, 8040, 8030).
+- [x] **Step 3.3**: Ensure cold run cache drops (`sync; echo 3 | sudo tee /proc/sys/vm/drop_caches`) execute gracefully.
 - [x] **Step 3.4**: Test execution with `./run-version.sh --dry-run 4.1.7` to verify synthetic output generation.
 
 ---
@@ -131,20 +131,20 @@
 **Files:**
 - Create: `ClickBench/starrocks-versions/C4A-RUNBOOK.md`
 
-- [ ] **Step 5.1**: Document exact `gcloud compute instances create` command for `c4a-standard-8` (Ubuntu 24.04 ARM64, 100GB Hyperdisk Balanced).
-- [ ] **Step 5.2**: Build and execute baseline `main-baseline` and candidate `main-custom-default` smoke runs on 10M / 100M rows.
-- [ ] **Step 5.3**: Run `compare.py` on smoke outputs to verify automated metrics pipeline.
+- [x] **Step 5.1**: Document exact `gcloud compute instances create` command for `c4a-standard-8` (Ubuntu 24.04 ARM64, 100GB Hyperdisk Balanced).
+- [x] **Step 5.2**: Build and execute baseline `main-baseline` and candidate `main-custom-default` smoke runs on 10M / 100M rows (superseded by direct execution on `c4a-standard-16`).
+- [x] **Step 5.3**: Run `compare.py` on smoke outputs to verify automated metrics pipeline.
 
 ---
 
 ### Task 6: Execution of Full Evaluation Matrix on `c4a-standard-16`
 
-- [ ] **Step 6.1**: Execute Matrix-1: `4.1.7-official` (downloaded CDN release).
-- [ ] **Step 6.2**: Execute Matrix-2: `main-baseline` (clean upstream merge-base).
-- [ ] **Step 6.3**: Execute Matrix-3: `main-custom-default` (`perf/arm64-aggregate-rc`, baseline flags).
-- [ ] **Step 6.4**: Execute Matrix-4: `main-custom-lse` (`perf/arm64-aggregate-rc`, `+lse` flags).
-- [ ] **Step 6.5**: Run `compare.py` comparing:
+- [x] **Step 6.1**: Execute Matrix-1: `4.1.7-official` (downloaded CDN release).
+- [x] **Step 6.2**: Execute Matrix-2: `main-baseline` (clean upstream merge-base).
+- [x] **Step 6.3**: Execute Matrix-3: `main-custom-default` (`perf/arm64-aggregate-rc`, baseline flags).
+- [x] **Step 6.4**: Execute Matrix-4: `main-custom-lse` (`perf/arm64-aggregate-rc`, `+lse` flags).
+- [x] **Step 6.5**: Run `compare.py` comparing:
   - `main-baseline` vs `main-custom-default` (isolating PRs).
   - `main-custom-default` vs `main-custom-lse` (isolating LSE).
   - `4.1.7-official` vs `main-custom-lse` (total release delta).
-- [ ] **Step 6.6**: Publish final benchmark analysis report into `docs/specs/2026-11-02-arm64-clickbench-benchmark-results.md`.
+- [x] **Step 6.6**: Publish final benchmark analysis report into `docs/specs/2026-11-02-arm64-clickbench-benchmark-results.md`.
