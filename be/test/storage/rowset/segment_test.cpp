@@ -60,6 +60,7 @@
 #include "storage/tablet_schema.h"
 #include "storage/tablet_schema_helper.h"
 #include "storage_primitive/chunk_iterator.h"
+#include "storage_primitive/column_predicate.h"
 
 namespace starrocks {
 
@@ -770,6 +771,150 @@ TEST_F(SegmentReaderWriterTest, TestCheckColumnUniqueIdUniqueness) {
             << "Expected InternalError, got: " << st.code() << ", message: " << st.message();
     EXPECT_EQ(st.message(), "Duplicate column id found in tablet schema")
             << "Error message should indicate duplicate column id in tablet schema.";
+}
+
+TEST_F(SegmentReaderWriterTest, TestOffsetOnlyVarcharScan) {
+    constexpr size_t kNumRows = 2048;
+
+    TabletSchemaPB pb;
+    pb.set_keys_type(DUP_KEYS);
+    pb.set_num_short_key_columns(1);
+    auto* c0 = pb.add_column();
+    c0->set_unique_id(1);
+    c0->set_name("counter_id");
+    c0->set_type("INT");
+    c0->set_is_key(true);
+    c0->set_is_nullable(false);
+    c0->set_length(4);
+    c0->set_index_length(4);
+    c0->set_aggregation("NONE");
+
+    auto* c1 = pb.add_column();
+    c1->set_unique_id(2);
+    c1->set_name("url");
+    c1->set_type("VARCHAR");
+    c1->set_is_key(false);
+    c1->set_is_nullable(false);
+    c1->set_length(65535);
+    c1->set_aggregation("NONE");
+
+    auto tablet_schema = TabletSchema::create(pb);
+    auto schema = ChunkHelper::convert_schema(tablet_schema);
+
+    static int seg_id = 0;
+    std::string filename = strings::Substitute("$0/offset_only_$1.dat", kSegmentDir, seg_id++);
+    ASSIGN_OR_ABORT(auto wfile, _fs->new_writable_file(filename));
+    SegmentWriterOptions writer_opts;
+    SegmentWriter writer(std::move(wfile), 0, tablet_schema, writer_opts);
+    ASSERT_OK(writer.init());
+
+    std::vector<std::string> urls(kNumRows);
+    std::vector<int32_t> expected_counters;
+    std::vector<uint32_t> expected_lengths;
+    auto write_chunk = ChunkFactory::new_chunk(schema, kNumRows);
+    for (size_t rid = 0; rid < kNumRows; ++rid) {
+        int32_t counter_id = static_cast<int32_t>(rid);
+        if (rid % 10 == 0) {
+            urls[rid] = "";
+        } else {
+            urls[rid] = "https://starrocks.io/clickbench/q27/row_" + std::to_string(rid) + "_" +
+                        std::string(16 + (rid % 48), 'u');
+            expected_counters.push_back(counter_id);
+            expected_lengths.push_back(static_cast<uint32_t>(urls[rid].size()));
+        }
+        auto cols = write_chunk->columns();
+        cols[0]->as_mutable_ptr()->append_datum(Datum(counter_id));
+        cols[1]->as_mutable_ptr()->append_datum(Datum(Slice(urls[rid])));
+    }
+    ASSERT_OK(writer.append_chunk(*write_chunk));
+    uint64_t file_size = 0, index_size = 0, footer_position = 0;
+    ASSERT_OK(writer.finalize(&file_size, &index_size, &footer_position));
+
+    ASSIGN_OR_ABORT(auto segment, Segment::open(_fs, FileInfo{filename}, 0, tablet_schema));
+    ASSERT_EQ(kNumRows, segment->num_rows());
+
+    // Case 1: URL is projected as an offset-only column (e.g. SELECT CounterID, AVG(length(URL)) WHERE URL <> '')
+    {
+        std::unique_ptr<ColumnPredicate> ne_empty_pred(new_column_ne_predicate(get_type_info(TYPE_VARCHAR), 1, ""));
+        PredicateAndNode root;
+        root.add_child(PredicateColumnNode{ne_empty_pred.get()});
+
+        SegmentReadOptions seg_options;
+        seg_options.fs = _fs;
+        OlapReaderStatistics stats;
+        seg_options.stats = &stats;
+        seg_options.pred_tree_for_zone_map = PredicateTree::create(std::move(root));
+        PredicateAndNode eval_root;
+        eval_root.add_child(PredicateColumnNode{ne_empty_pred.get()});
+        seg_options.pred_tree = PredicateTree::create(std::move(eval_root));
+
+        std::unordered_set<uint32_t> offset_only_cids = {1};
+        seg_options.offset_only_column_ids = &offset_only_cids;
+
+        ASSIGN_OR_ABORT(auto seg_iter, segment->new_iterator(schema, seg_options));
+        auto read_chunk = ChunkFactory::new_chunk(schema, 512);
+
+        std::vector<int32_t> actual_counters;
+        std::vector<uint32_t> actual_lengths;
+        while (true) {
+            read_chunk->reset();
+            Status st = seg_iter->get_next(read_chunk.get());
+            if (st.is_end_of_file()) {
+                break;
+            }
+            ASSERT_OK(st);
+            auto* counter_col = down_cast<const Int32Column*>(read_chunk->get_column_by_index(0).get());
+            auto* url_col = ColumnHelper::get_binary_column(read_chunk->get_column_raw_ptr_by_index(1));
+            ASSERT_TRUE(url_col->is_offset_only());
+            ASSERT_EQ(0u, url_col->get_immutable_bytes().size());
+
+            const auto& offsets = url_col->get_offset();
+            for (size_t i = 0; i < read_chunk->num_rows(); ++i) {
+                actual_counters.push_back(counter_col->get_data()[i]);
+                actual_lengths.push_back(offsets[i + 1] - offsets[i]);
+            }
+        }
+        seg_iter->close();
+
+        ASSERT_EQ(expected_counters, actual_counters);
+        ASSERT_EQ(expected_lengths, actual_lengths);
+    }
+
+    // Case 2: URL is in unused_output_column_ids (e.g. SELECT CounterID, COUNT(*) WHERE URL <> '')
+    {
+        std::unique_ptr<ColumnPredicate> ne_empty_pred(new_column_ne_predicate(get_type_info(TYPE_VARCHAR), 1, ""));
+        PredicateAndNode eval_root;
+        eval_root.add_child(PredicateColumnNode{ne_empty_pred.get()});
+
+        SegmentReadOptions seg_options;
+        seg_options.fs = _fs;
+        OlapReaderStatistics stats;
+        seg_options.stats = &stats;
+        seg_options.pred_tree = PredicateTree::create(std::move(eval_root));
+
+        std::unordered_set<uint32_t> unused_cids = {1};
+        seg_options.unused_output_column_ids = &unused_cids;
+
+        ASSIGN_OR_ABORT(auto seg_iter, segment->new_iterator(schema, seg_options));
+        auto read_chunk = ChunkFactory::new_chunk(schema, 512);
+
+        std::vector<int32_t> actual_counters;
+        while (true) {
+            read_chunk->reset();
+            Status st = seg_iter->get_next(read_chunk.get());
+            if (st.is_end_of_file()) {
+                break;
+            }
+            ASSERT_OK(st);
+            auto* counter_col = down_cast<const Int32Column*>(read_chunk->get_column_by_index(0).get());
+            for (size_t i = 0; i < read_chunk->num_rows(); ++i) {
+                actual_counters.push_back(counter_col->get_data()[i]);
+            }
+        }
+        seg_iter->close();
+
+        ASSERT_EQ(expected_counters, actual_counters);
+    }
 }
 
 } // namespace starrocks

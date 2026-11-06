@@ -412,6 +412,7 @@ Status Rowset::init_segment_read_options(const RowsetReadOptions& options, const
     segment_options->chunk_size = options.chunk_size;
     segment_options->global_dictmaps = options.global_dictmaps;
     segment_options->unused_output_column_ids = options.unused_output_column_ids;
+    segment_options->offset_only_column_ids = options.offset_only_column_ids;
     segment_options->runtime_range_pruner = options.runtime_range_pruner;
     segment_options->tablet_schema = options.tablet_schema;
     segment_options->lake_io_opts = lake_io_opts;

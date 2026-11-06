@@ -158,7 +158,11 @@ public:
 
     // NOTE: do *NOT* copy |_slices|
     BinaryColumn(BinaryColumn&& rhs) noexcept
-            : _bytes(std::move(rhs._bytes)), _offsets(std::move(rhs._offsets)), _resource(std::move(rhs._resource)) {}
+            : _bytes(std::move(rhs._bytes)),
+              _offsets(std::move(rhs._offsets)),
+              _resource(std::move(rhs._resource)),
+              _is_binary_type(rhs._is_binary_type),
+              _is_offset_only(rhs._is_offset_only) {}
 
     BinaryColumn& operator=(BinaryColumn&& rhs) noexcept {
         BinaryColumn tmp(std::move(rhs));
@@ -198,9 +202,9 @@ public:
             return;
         }
 #endif
-        // When we hold a view via _resource, _bytes is empty and data comes from external memory,
-        // so we should not check the consistency between _bytes and _offsets
-        if (_resource.empty()) {
+        // When we hold a view via _resource or operate in offset-only mode, _bytes is empty,
+        // so we should not check the consistency between _bytes and _offsets.
+        if (_resource.empty() && !_is_offset_only) {
             if (!_offsets.empty()) {
                 DCHECK_EQ(_bytes.size(), _offsets.back());
             } else {
@@ -235,12 +239,18 @@ public:
 
     size_t byte_size(size_t from, size_t size) const override {
         DCHECK_LE(from + size, this->size()) << "Range error";
+        if (UNLIKELY(_is_offset_only)) {
+            return size * _offsets.element_size();
+        }
         return (_offsets[from + size] - _offsets[from]) + size * _offsets.element_size();
     }
 
     size_t byte_size(size_t idx) const override { return _offsets[idx + 1] - _offsets[idx] + sizeof(uint32_t); }
 
     Slice get_slice(size_t idx) const {
+        if (UNLIKELY(_is_offset_only)) {
+            _throw_offset_only_access_error("get_slice");
+        }
         const uint8_t* base = _data_base();
         return _offsets.visit_storage([&](const auto& offsets) -> Slice {
             const auto offset = offsets[idx];
@@ -269,12 +279,16 @@ public:
     // n means the number of strings, byte_size is the total length of the string
     void reserve(size_t n, size_t byte_size) {
         _offsets.reserve(n + 1);
-        _bytes.reserve(byte_size);
+        if (!_is_offset_only) {
+            _bytes.reserve(byte_size);
+        }
     }
 
     void resize(size_t n) override {
         _offsets.resize(n + 1, _offsets.back());
-        _bytes.resize(_offsets.back());
+        if (!_is_offset_only) {
+            _bytes.resize(_offsets.back());
+        }
     }
 
     void assign(size_t n, size_t idx) override;
@@ -295,6 +309,10 @@ public:
     bool append_nulls(size_t count) override { return false; }
 
     void append_string(const std::string& str) {
+        if (UNLIKELY(_is_offset_only)) {
+            _offsets.emplace_back(_offsets.back() + str.size());
+            return;
+        }
         _bytes.insert(_bytes.end(), str.data(), str.data() + str.size());
         _offsets.emplace_back(_bytes.size());
     }
@@ -314,7 +332,7 @@ public:
 
     void append_value_multiple_times(const void* value, size_t count) override;
 
-    void append_default() override { _offsets.emplace_back(_bytes.size()); }
+    void append_default() override { _offsets.emplace_back(_offsets.back()); }
 
     void append_default(size_t count) override { _offsets.append_empty_values(count); }
 
@@ -376,7 +394,12 @@ public:
         return static_cast<uint32_t>(sizeof(uint32_t) + _offsets[idx + 1] - _offsets[idx]);
     }
 
-    MutableColumnPtr clone_empty() const override { return BinaryColumn::create(); }
+    MutableColumnPtr clone_empty() const override {
+        auto col = BinaryColumn::create();
+        col->set_is_binary_type(_is_binary_type);
+        col->set_offset_only(_is_offset_only);
+        return col;
+    }
 
     MutableColumnPtr clone() const override {
         auto p = clone_empty();
@@ -398,6 +421,12 @@ public:
     void set_is_binary_type(bool v) { _is_binary_type = v; }
     bool is_binary_type() const { return _is_binary_type; }
 
+    // Mark this column as offset-only (metadata-only): _offsets stores cumulative string lengths
+    // while _bytes remains empty, avoiding payload allocation and memcpy when only lengths or
+    // emptiness predicates are evaluated.
+    void set_offset_only(bool v) { _is_offset_only = v; }
+    bool is_offset_only() const { return _is_offset_only; }
+
     std::string get_name() const override { return "binary"; }
 
     GermanStringContainer& get_german_strings() {
@@ -417,6 +446,9 @@ public:
     ImmContainer immutable_data() const { return ImmContainer(*this); }
 
     Bytes& get_bytes() {
+        if (UNLIKELY(_is_offset_only)) {
+            _throw_offset_only_access_error("get_bytes");
+        }
         _ensure_materialized();
         return _bytes;
     }
@@ -449,6 +481,8 @@ public:
         swap(_bytes, r._bytes);
         swap(_offsets, r._offsets);
         swap(_resource, r._resource);
+        swap(_is_binary_type, r._is_binary_type);
+        swap(_is_offset_only, r._is_offset_only);
     }
 
     void reset_column() override {
@@ -490,6 +524,7 @@ private:
 
     void _build_german_strings() const;
     void _ensure_materialized();
+    [[noreturn]] static void _throw_offset_only_access_error(const char* method);
     ALWAYS_INLINE const uint8_t* _data_base() const {
         return _resource.empty() ? _bytes.data() : reinterpret_cast<const uint8_t*>(_resource.data());
     }
@@ -506,6 +541,7 @@ private:
     // use push_binary (hex/base64 encoding) instead of push_string when inside a
     // nested type context.
     bool _is_binary_type = false;
+    bool _is_offset_only = false;
 };
 
 using Offsets = BinaryColumn::Offsets;
