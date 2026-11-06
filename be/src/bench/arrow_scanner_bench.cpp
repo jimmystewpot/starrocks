@@ -21,12 +21,14 @@
 
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <memory>
 #include <utility>
 #include <vector>
 
 #include "base/utility/defer_op.h"
 #include "column/chunk.h"
+#include "common/simdjson_util.h"
 #include "compute_env/load/load_stream_mgr.h"
 #include "compute_env/load/stream_load_pipe.h"
 #include "connector/file/scanner/arrow_scanner.h"
@@ -42,7 +44,9 @@
 namespace starrocks {
 
 static void generate_test_files(const std::string& arrow_path, const std::string& arrow_lz4_path,
-                                const std::string& json_path, int64_t num_rows) {
+                                const std::string& json_path, const std::string& json_unicode_path,
+                                const std::string& json_number_path, const std::string& json_wide_path,
+                                int64_t num_rows) {
     // 1. Generate Arrow IPC Stream File
     arrow::Int32Builder int_builder;
     arrow::StringBuilder str_builder;
@@ -117,107 +121,179 @@ static void generate_test_files(const std::string& arrow_path, const std::string
                   << "\",\"c2_double\":" << (static_cast<double>(i) * 1.5) << "}\n";
     }
     json_file.close();
+
+    // 4. Generate Unicode-escape-heavy NDJSON File
+    std::ofstream json_unicode_file(json_unicode_path);
+    if (!json_unicode_file.is_open()) {
+        LOG(FATAL) << "Failed to open JSON unicode file for writing: " << json_unicode_path;
+    }
+    for (int64_t i = 0; i < num_rows; ++i) {
+        json_unicode_file << "{\"c0_int\":" << i << ",\"c1_str\":\"prefix_\\u6C49\\u5B57\\u4E2D\\u6587\\u6D4B\\u8BD5_"
+                          << (i % 100) << "\",\"c2_double\":" << (static_cast<double>(i) * 1.5) << "}\n";
+    }
+    json_unicode_file.close();
+
+    // 5. Generate Number-heavy NDJSON File
+    std::ofstream json_number_file(json_number_path);
+    if (!json_number_file.is_open()) {
+        LOG(FATAL) << "Failed to open JSON number file for writing: " << json_number_path;
+    }
+    json_number_file << std::fixed << std::setprecision(6);
+    for (int64_t i = 0; i < num_rows; ++i) {
+        json_number_file << "{\"c0_int\":" << (100000000 + i)
+                         << ",\"c1_str\":\"n\",\"c2_double\":" << (123456.789012 + static_cast<double>(i) * 0.125)
+                         << "}\n";
+    }
+    json_number_file.close();
+
+    // 6. Generate Wide-record NDJSON File (16 unprojected fields followed by 3 projected table columns)
+    std::ofstream json_wide_file(json_wide_path);
+    if (!json_wide_file.is_open()) {
+        LOG(FATAL) << "Failed to open JSON wide file for writing: " << json_wide_path;
+    }
+    static constexpr const char* kWidePrefix =
+            "{\"f01\":\"payload_padding_string_0123456789\","
+            "\"f02\":\"payload_padding_string_0123456789\","
+            "\"f03\":\"payload_padding_string_0123456789\","
+            "\"f04\":\"payload_padding_string_0123456789\","
+            "\"f05\":\"payload_padding_string_0123456789\","
+            "\"f06\":\"payload_padding_string_0123456789\","
+            "\"f07\":\"payload_padding_string_0123456789\","
+            "\"f08\":\"payload_padding_string_0123456789\","
+            "\"f09\":\"payload_padding_string_0123456789\","
+            "\"f10\":\"payload_padding_string_0123456789\","
+            "\"f11\":\"payload_padding_string_0123456789\","
+            "\"f12\":\"payload_padding_string_0123456789\","
+            "\"f13\":\"payload_padding_string_0123456789\","
+            "\"f14\":\"payload_padding_string_0123456789\","
+            "\"f15\":\"payload_padding_string_0123456789\","
+            "\"f16\":\"payload_padding_string_0123456789\",";
+    for (int64_t i = 0; i < num_rows; ++i) {
+        json_wide_file << kWidePrefix << "\"c0_int\":" << i << ",\"c1_str\":\"varchar_str_" << (i % 100)
+                       << "\",\"c2_double\":" << (static_cast<double>(i) * 1.5) << "}\n";
+    }
+    json_wide_file.close();
 }
 
 static DescriptorTbl* create_descriptor_table(RuntimeState* state, ObjectPool* pool) {
-    TDescriptorTable thrift_tbl;
+    TDescriptorTable t_desc_table;
 
-    // Source Tuple (id = 0)
-    TTupleDescriptor src_tuple;
-    src_tuple.id = 0;
-    src_tuple.byteSize = 0;
-    src_tuple.numNullBytes = 0;
-    thrift_tbl.tupleDescriptors.push_back(src_tuple);
+    // Table Descriptor
+    TTableDescriptor t_tab_desc;
+    t_tab_desc.id = 0;
+    t_tab_desc.tableType = TTableType::BROKER_TABLE;
+    t_tab_desc.numClusteringCols = 0;
+    t_desc_table.tableDescriptors.push_back(t_tab_desc);
+    t_desc_table.__isset.tableDescriptors = true;
 
-    // Dest Tuple (id = 1)
-    TTupleDescriptor dest_tuple;
-    dest_tuple.id = 1;
-    dest_tuple.byteSize = 0;
-    dest_tuple.numNullBytes = 0;
-    thrift_tbl.tupleDescriptors.push_back(dest_tuple);
+    // Tuple Descriptor
+    TTupleDescriptor t_tuple_desc;
+    t_tuple_desc.id = 0;
+    t_tuple_desc.byteSize = 32;
+    t_tuple_desc.numNullBytes = 0;
+    t_tuple_desc.tableId = 0;
+    t_desc_table.tupleDescriptors.push_back(t_tuple_desc);
 
-    std::vector<std::pair<std::string, TypeDescriptor>> columns = {
-            {"c0_int", TypeDescriptor::from_logical_type(TYPE_INT)},
-            {"c1_str", TypeDescriptor::from_logical_type(TYPE_VARCHAR)},
-            {"c2_double", TypeDescriptor::from_logical_type(TYPE_DOUBLE)}};
+    // Slot 0: c0_int (INT)
+    TSlotDescriptor slot0;
+    slot0.id = 0;
+    slot0.parent = 0;
+    slot0.slotType = TypeDescriptor(TYPE_INT).to_protobuf();
+    slot0.columnPos = 0;
+    slot0.byteOffset = 0;
+    slot0.nullIndicatorByte = 0;
+    slot0.nullIndicatorBit = -1;
+    slot0.colName = "c0_int";
+    slot0.slotIdx = 0;
+    slot0.isMaterialized = true;
+    t_desc_table.slotDescriptors.push_back(slot0);
 
-    int slot_id = 0;
-    for (int i = 0; i < columns.size(); ++i) {
-        // Source Slot
-        TSlotDescriptor src_slot;
-        src_slot.id = slot_id++;
-        src_slot.parent = 0;
-        src_slot.slotType = columns[i].second.to_thrift();
-        src_slot.columnPos = i;
-        src_slot.byteOffset = 0;
-        src_slot.nullIndicatorByte = 0;
-        src_slot.nullIndicatorBit = 0;
-        src_slot.colName = columns[i].first;
-        src_slot.slotIdx = i;
-        src_slot.isMaterialized = true;
-        thrift_tbl.slotDescriptors.push_back(src_slot);
+    // Slot 1: c1_str (VARCHAR)
+    TSlotDescriptor slot1;
+    slot1.id = 1;
+    slot1.parent = 0;
+    slot1.slotType = TypeDescriptor::create_varchar_type(TypeDescriptor::MAX_VARCHAR_LENGTH).to_protobuf();
+    slot1.columnPos = 1;
+    slot1.byteOffset = 8;
+    slot1.nullIndicatorByte = 0;
+    slot1.nullIndicatorBit = -1;
+    slot1.colName = "c1_str";
+    slot1.slotIdx = 1;
+    slot1.isMaterialized = true;
+    t_desc_table.slotDescriptors.push_back(slot1);
 
-        // Dest Slot
-        TSlotDescriptor dest_slot;
-        dest_slot.id = slot_id++;
-        dest_slot.parent = 1;
-        dest_slot.slotType = columns[i].second.to_thrift();
-        dest_slot.columnPos = i;
-        dest_slot.byteOffset = 0;
-        dest_slot.nullIndicatorByte = 0;
-        dest_slot.nullIndicatorBit = 0;
-        dest_slot.colName = columns[i].first;
-        dest_slot.slotIdx = i;
-        dest_slot.isMaterialized = true;
-        thrift_tbl.slotDescriptors.push_back(dest_slot);
-    }
+    // Slot 2: c2_double (DOUBLE)
+    TSlotDescriptor slot2;
+    slot2.id = 2;
+    slot2.parent = 0;
+    slot2.slotType = TypeDescriptor(TYPE_DOUBLE).to_protobuf();
+    slot2.columnPos = 2;
+    slot2.byteOffset = 24;
+    slot2.nullIndicatorByte = 0;
+    slot2.nullIndicatorBit = -1;
+    slot2.colName = "c2_double";
+    slot2.slotIdx = 2;
+    slot2.isMaterialized = true;
+    t_desc_table.slotDescriptors.push_back(slot2);
 
     DescriptorTbl* desc_tbl = nullptr;
-    Status st = DescriptorTbl::create(state, pool, thrift_tbl, &desc_tbl, 4096);
+    Status st = DescriptorTbl::create(state, pool, t_desc_table, &desc_tbl, config::vector_chunk_size);
     if (!st.ok()) {
-        LOG(FATAL) << "Failed to create DescriptorTable: " << st.to_string();
+        LOG(FATAL) << "Failed to create descriptor table: " << st.to_string();
     }
     return desc_tbl;
 }
 
-static TBrokerScanRange* create_scan_range(ObjectPool* pool, const std::string& path, TFileFormatType::type format_type,
-                                           DescriptorTbl* desc_tbl, TFileType::type file_type = TFileType::FILE_LOCAL) {
-    TBrokerScanRangeParams* params = pool->add(new TBrokerScanRangeParams());
-    params->strict_mode = true;
-    params->src_tuple_id = 0;
-    params->dest_tuple_id = 1;
-    params->json_file_size_limit = 1024 * 1024 * 1024;
+static TBrokerScanRange* create_scan_range(ObjectPool* pool, const std::string& path, TFileFormatType::type format,
+                                          const DescriptorTbl* desc_tbl) {
+    auto* scan_range = pool->add(new TBrokerScanRange());
+    scan_range->params.src_tuple_id = 0;
+    scan_range->params.src_slot_ids = {0, 1, 2};
 
-    const auto* src_tuple = desc_tbl->get_tuple_descriptor(0);
-    const auto* dst_tuple = desc_tbl->get_tuple_descriptor(1);
-
-    for (int i = 0; i < src_tuple->slots().size(); ++i) {
-        auto* src_slot = src_tuple->slots()[i];
-        auto* dst_slot = dst_tuple->slots()[i];
+    for (int i = 0; i < 3; ++i) {
+        TTypeDesc type_desc;
+        TTypeNode node;
+        node.type = TTypeNodeType::SCALAR;
+        TScalarType scalar_type;
+        if (i == 0) {
+            scalar_type.type = TPrimitiveType::INT;
+        } else if (i == 1) {
+            scalar_type.type = TPrimitiveType::VARCHAR;
+            scalar_type.__set_len(100);
+        } else {
+            scalar_type.type = TPrimitiveType::DOUBLE;
+        }
+        node.__set_scalar_type(scalar_type);
+        type_desc.types.push_back(node);
 
         TExpr expr;
-        expr.nodes.emplace_back(TExprNode());
-        expr.nodes[0].__set_type(src_slot->type().to_thrift());
-        expr.nodes[0].__set_node_type(TExprNodeType::SLOT_REF);
-        expr.nodes[0].__set_is_nullable(true);
-        expr.nodes[0].__set_slot_ref(TSlotRef());
-        expr.nodes[0].slot_ref.__set_slot_id(src_slot->id());
+        TExprNode expr_node;
+        expr_node.node_type = TExprNodeType::SLOT_REF;
+        expr_node.type = type_desc;
+        expr_node.num_children = 0;
+        TSlotRef slot_ref;
+        slot_ref.slot_id = i;
+        slot_ref.tuple_id = 0;
+        expr_node.__set_slot_ref(slot_ref);
+        expr.nodes.push_back(expr_node);
 
-        params->expr_of_dest_slot[dst_slot->id()] = expr;
-        params->src_slot_ids.emplace_back(src_slot->id());
+        scan_range->params.expr_of_dest_slot[i] = expr;
     }
 
-    TBrokerRangeDesc range;
-    range.__set_path(path);
-    range.start_offset = 0;
-    range.size = LONG_MAX;
-    range.file_type = file_type;
-    range.__set_format_type(format_type);
-    range.__set_num_of_columns_from_file(src_tuple->slots().size());
+    scan_range->params.dest_tuple_id = 0;
+    scan_range->params.dest_sid_to_src_sid_without_trans = {{0, 0}, {1, 1}, {2, 2}};
 
-    TBrokerScanRange* scan_range = pool->add(new TBrokerScanRange());
-    scan_range->params = *params;
-    scan_range->ranges.push_back(range);
+    TBrokerRangeDesc range_desc;
+    range_desc.path = path;
+    range_desc.start_offset = 0;
+    range_desc.size = -1;
+    range_desc.format_type = format;
+    range_desc.file_type = TFileType::FILE_LOCAL;
+    range_desc.splittable = false;
+    range_desc.__set_strip_outer_array(false);
+    range_desc.__set_jsonpaths("");
+    range_desc.__set_json_root("");
+    scan_range->ranges.push_back(range_desc);
 
     return scan_range;
 }
@@ -225,6 +301,9 @@ static TBrokerScanRange* create_scan_range(ObjectPool* pool, const std::string& 
 static std::string g_arrow_file_path;
 static std::string g_arrow_lz4_file_path;
 static std::string g_json_file_path;
+static std::string g_json_unicode_file_path;
+static std::string g_json_number_file_path;
+static std::string g_json_wide_file_path;
 static constexpr int64_t kNumRows = 100000;
 
 static void setup_global_files() {
@@ -255,7 +334,35 @@ static void setup_global_files() {
         g_json_file_path = "/tmp/json_bench.json";
     }
 
-    generate_test_files(g_arrow_file_path, g_arrow_lz4_file_path, g_json_file_path, kNumRows);
+    char json_unicode_pattern[] = "/tmp/json_unicode_bench_XXXXXX.json";
+    int fd_json_unicode = mkstemps(json_unicode_pattern, 5);
+    if (fd_json_unicode != -1) {
+        close(fd_json_unicode);
+        g_json_unicode_file_path = json_unicode_pattern;
+    } else {
+        g_json_unicode_file_path = "/tmp/json_unicode_bench.json";
+    }
+
+    char json_number_pattern[] = "/tmp/json_number_bench_XXXXXX.json";
+    int fd_json_number = mkstemps(json_number_pattern, 5);
+    if (fd_json_number != -1) {
+        close(fd_json_number);
+        g_json_number_file_path = json_number_pattern;
+    } else {
+        g_json_number_file_path = "/tmp/json_number_bench.json";
+    }
+
+    char json_wide_pattern[] = "/tmp/json_wide_bench_XXXXXX.json";
+    int fd_json_wide = mkstemps(json_wide_pattern, 5);
+    if (fd_json_wide != -1) {
+        close(fd_json_wide);
+        g_json_wide_file_path = json_wide_pattern;
+    } else {
+        g_json_wide_file_path = "/tmp/json_wide_bench.json";
+    }
+
+    generate_test_files(g_arrow_file_path, g_arrow_lz4_file_path, g_json_file_path, g_json_unicode_file_path,
+                        g_json_number_file_path, g_json_wide_file_path, kNumRows);
 }
 
 static void cleanup_global_files() {
@@ -263,6 +370,9 @@ static void cleanup_global_files() {
     std::filesystem::remove(g_arrow_file_path, ec);
     std::filesystem::remove(g_arrow_lz4_file_path, ec);
     std::filesystem::remove(g_json_file_path, ec);
+    std::filesystem::remove(g_json_unicode_file_path, ec);
+    std::filesystem::remove(g_json_number_file_path, ec);
+    std::filesystem::remove(g_json_wide_file_path, ec);
 }
 
 static void BM_ArrowScanner(benchmark::State& state) {
@@ -324,37 +434,76 @@ static void run_arrow_routine_load_pipe_benchmark(benchmark::State& state, const
     }
     std::streamsize file_size = file.tellg();
     file.seekg(0, std::ios::beg);
-    std::string arrow_bytes(file_size, '\0');
+    std::string arrow_bytes(file_size, ' ');
     if (!file.read(&arrow_bytes[0], file_size)) {
         state.SkipWithError("Failed to read Arrow bench stream file");
         return;
     }
 
     LoadStreamMgr load_stream_mgr;
-    RuntimeServices runtime_services;
-    runtime_services.load_stream_mgr = &load_stream_mgr;
-    QueryExecutionServices query_execution_services;
-    query_execution_services.runtime = &runtime_services;
-    ObjectPool pool;
-    TQueryOptions query_options;
-    query_options.query_type = TQueryType::LOAD;
-    TQueryGlobals query_globals;
-    query_globals.time_zone = "UTC";
-    auto* runtime_state =
-            pool.add(new RuntimeState(TUniqueId(), query_options, query_globals, &query_execution_services, nullptr));
-    runtime_state->init_instance_mem_tracker();
-    SCOPED_THREAD_LOCAL_MEM_TRACKER_SETTER(runtime_state->instance_mem_tracker());
-
-    auto* desc_tbl = create_descriptor_table(runtime_state, &pool);
-    runtime_state->set_desc_tbl(desc_tbl);
-
-    const auto pipe_id = UniqueId::gen_uid();
-    auto* scan_range = create_scan_range(&pool, "bench_arrow_routine_load_pipe", TFileFormatType::FORMAT_ARROW,
-                                         desc_tbl, TFileType::FILE_STREAM);
-    scan_range->ranges[0].__set_load_id(pipe_id.to_thrift());
 
     for (auto _ : state) {
-        std::shared_ptr<StreamLoadPipe> pipe =
+        ObjectPool pool;
+        TQueryOptions query_options;
+        TQueryGlobals query_globals;
+        auto* runtime_state = pool.add(new RuntimeState(TUniqueId(), query_options, query_globals, nullptr));
+        runtime_state->init_instance_mem_tracker();
+
+        auto* desc_tbl = create_descriptor_table(runtime_state, &pool);
+        runtime_state->set_desc_tbl(desc_tbl);
+
+        const UniqueId load_id = UniqueId::gen_uid();
+        const TUniqueId pipe_id = load_id.to_thrift();
+
+        auto* scan_range = pool.add(new TBrokerScanRange());
+        scan_range->params.src_tuple_id = 0;
+        scan_range->params.src_slot_ids = {0, 1, 2};
+        for (int i = 0; i < 3; ++i) {
+            TTypeDesc type_desc;
+            TTypeNode node;
+            node.type = TTypeNodeType::SCALAR;
+            TScalarType scalar_type;
+            if (i == 0) {
+                scalar_type.type = TPrimitiveType::INT;
+            } else if (i == 1) {
+                scalar_type.type = TPrimitiveType::VARCHAR;
+                scalar_type.__set_len(100);
+            } else {
+                scalar_type.type = TPrimitiveType::DOUBLE;
+            }
+            node.__set_scalar_type(scalar_type);
+            type_desc.types.push_back(node);
+
+            TExpr expr;
+            TExprNode expr_node;
+            expr_node.node_type = TExprNodeType::SLOT_REF;
+            expr_node.type = type_desc;
+            expr_node.num_children = 0;
+            TSlotRef slot_ref;
+            slot_ref.slot_id = i;
+            slot_ref.tuple_id = 0;
+            expr_node.__set_slot_ref(slot_ref);
+            expr.nodes.push_back(expr_node);
+
+            scan_range->params.expr_of_dest_slot[i] = expr;
+        }
+        scan_range->params.dest_tuple_id = 0;
+        scan_range->params.dest_sid_to_src_sid_without_trans = {{0, 0}, {1, 1}, {2, 2}};
+
+        TBrokerRangeDesc range_desc;
+        range_desc.path = "";
+        range_desc.start_offset = 0;
+        range_desc.size = -1;
+        range_desc.format_type = TFileFormatType::FORMAT_ARROW;
+        range_desc.file_type = TFileType::FILE_STREAM;
+        range_desc.splittable = false;
+        range_desc.__set_strip_outer_array(false);
+        range_desc.__set_jsonpaths("");
+        range_desc.__set_json_root("");
+        range_desc.__set_load_id(pipe_id);
+        scan_range->ranges.push_back(range_desc);
+
+        std::shared_ptr<BenchDiscreteStreamLoadPipe> pipe =
                 std::make_shared<BenchDiscreteStreamLoadPipe>(1024 * 1024, 64 * 1024 * 1024);
         Status st = load_stream_mgr.put(pipe_id, pipe);
         if (!st.ok()) {
@@ -429,7 +578,20 @@ static void BM_ArrowRoutineLoadPipeScannerLz4(benchmark::State& state) {
     run_arrow_routine_load_pipe_benchmark(state, g_arrow_lz4_file_path);
 }
 
-static void BM_JsonScanner(benchmark::State& state) {
+static void run_json_scanner_benchmark(benchmark::State& state, const std::string& json_path,
+                                       const char* requested_impl = nullptr) {
+    const simdjson::implementation* original_impl = simdjson::get_active_implementation();
+    DeferOp restore_impl([original_impl]() { simdjson::get_active_implementation() = original_impl; });
+    if (requested_impl != nullptr) {
+        const simdjson::implementation* target_impl = simdjson::get_available_implementations()[requested_impl];
+        if (target_impl == nullptr || !target_impl->supported_by_runtime_system()) {
+            state.SkipWithError("Requested simdjson implementation is not available on this host");
+            return;
+        }
+        simdjson::get_active_implementation() = target_impl;
+    }
+    state.SetLabel(std::string(SIMDJSON_VERSION) + "/" + simdjson::get_active_implementation()->name());
+
     ObjectPool pool;
     TQueryOptions query_options;
     TQueryGlobals query_globals;
@@ -439,7 +601,7 @@ static void BM_JsonScanner(benchmark::State& state) {
     auto* desc_tbl = create_descriptor_table(runtime_state, &pool);
     runtime_state->set_desc_tbl(desc_tbl);
 
-    auto* scan_range = create_scan_range(&pool, g_json_file_path, TFileFormatType::FORMAT_JSON, desc_tbl);
+    auto* scan_range = create_scan_range(&pool, json_path, TFileFormatType::FORMAT_JSON, desc_tbl);
 
     for (auto _ : state) {
         auto profile = pool.add(new RuntimeProfile("json_bench_prof"));
@@ -474,7 +636,53 @@ static void BM_JsonScanner(benchmark::State& state) {
     state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * kNumRows);
 }
 
-BENCHMARK(BM_JsonScanner)->Unit(benchmark::kMillisecond);
+static void BM_JsonScanner(benchmark::State& state) {
+    run_json_scanner_benchmark(state, g_json_file_path);
+}
+
+static void BM_JsonScanner_UnicodeEscapes(benchmark::State& state) {
+    run_json_scanner_benchmark(state, g_json_unicode_file_path);
+}
+
+static void BM_JsonScanner_NumberHeavy(benchmark::State& state) {
+    run_json_scanner_benchmark(state, g_json_number_file_path);
+}
+
+static void BM_JsonScanner_Icelake(benchmark::State& state) {
+    run_json_scanner_benchmark(state, g_json_file_path, "icelake");
+}
+
+static void BM_JsonScanner_Haswell(benchmark::State& state) {
+    run_json_scanner_benchmark(state, g_json_file_path, "haswell");
+}
+
+static void BM_JsonScanner_Westmere(benchmark::State& state) {
+    run_json_scanner_benchmark(state, g_json_file_path, "westmere");
+}
+
+static void BM_JsonScanner_WideRecord_Icelake(benchmark::State& state) {
+    run_json_scanner_benchmark(state, g_json_wide_file_path, "icelake");
+}
+
+static void BM_JsonScanner_WideRecord_Haswell(benchmark::State& state) {
+    run_json_scanner_benchmark(state, g_json_wide_file_path, "haswell");
+}
+
+static void BM_JsonScanner_WideRecord_Westmere(benchmark::State& state) {
+    run_json_scanner_benchmark(state, g_json_wide_file_path, "westmere");
+}
+
+#define STARROCKS_JSON_BENCH(name)     BENCHMARK(name)->Unit(benchmark::kMillisecond)->Iterations(10)->Repetitions(7)->ReportAggregatesOnly(true)
+STARROCKS_JSON_BENCH(BM_JsonScanner);
+STARROCKS_JSON_BENCH(BM_JsonScanner_UnicodeEscapes);
+STARROCKS_JSON_BENCH(BM_JsonScanner_NumberHeavy);
+STARROCKS_JSON_BENCH(BM_JsonScanner_Icelake);
+STARROCKS_JSON_BENCH(BM_JsonScanner_Haswell);
+STARROCKS_JSON_BENCH(BM_JsonScanner_Westmere);
+STARROCKS_JSON_BENCH(BM_JsonScanner_WideRecord_Icelake);
+STARROCKS_JSON_BENCH(BM_JsonScanner_WideRecord_Haswell);
+STARROCKS_JSON_BENCH(BM_JsonScanner_WideRecord_Westmere);
+#undef STARROCKS_JSON_BENCH
 BENCHMARK(BM_ArrowScanner)->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_ArrowRoutineLoadPipeScanner)->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_ArrowRoutineLoadPipeScannerLz4)->Unit(benchmark::kMillisecond);
