@@ -36,6 +36,7 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdio>
 #include <vector>
 
@@ -567,6 +568,219 @@ TEST_F(BinaryPlainPageTest, test_max_value_length_is_cached_and_correct) {
         EXPECT_EQ(0U, decoder.max_value_length());
         EXPECT_EQ(0U, decoder.max_value_length());
     }
+}
+
+// NOLINTNEXTLINE
+TEST_F(BinaryPlainPageTest, TestOffsetOnlyDecodeAndPredicates) {
+    constexpr size_t kTotalRows = 1024;
+    std::vector<std::string> raw_strings(kTotalRows);
+    std::vector<Slice> slices(kTotalRows);
+
+    for (size_t i = 0; i < kTotalRows; ++i) {
+        if (i % 10 == 0) {
+            raw_strings[i] = ""; // empty URL
+        } else {
+            raw_strings[i] =
+                    "https://example.com/clickbench/q27/path/" + std::to_string(i) + "/" + std::string(i % 64, 'q');
+        }
+        slices[i] = Slice(raw_strings[i]);
+    }
+
+    for (bool delta : {false, true}) {
+        PageBuilderOptions options;
+        options.data_page_size = 2 * 1024 * 1024;
+        BinaryPlainPageBuilder builder(options, delta);
+        ASSERT_EQ(kTotalRows, builder.add(reinterpret_cast<const uint8_t*>(slices.data()), kTotalRows));
+        OwnedSlice owned = builder.finish()->build();
+
+        // 1. Offset-only next_batch over SparseRange (simulating multi-range page reads)
+        {
+            BinaryPlainPageDecoder<TYPE_VARCHAR> decoder(owned.slice(), delta);
+            ASSERT_OK(decoder.init());
+            decoder.set_offset_only(true);
+            ASSERT_TRUE(decoder.is_offset_only());
+
+            auto col = BinaryColumn::create();
+            SparseRange<> range;
+            range.add(Range<>(0, 128));
+            range.add(Range<>(256, 512));
+            range.add(Range<>(700, 1024));
+            ASSERT_OK(decoder.next_batch(range, col.get()));
+            ASSERT_TRUE(col->is_offset_only());
+            ASSERT_EQ(0u, col->get_immutable_bytes().size());
+            ASSERT_EQ(range.span_size(), col->size());
+            col->check_or_die();
+
+            const auto& offsets = col->get_offset();
+            size_t out_idx = 0;
+            for (size_t r = 0; r < range.size(); ++r) {
+                for (uint32_t row = range[r].begin(); row < range[r].end(); ++row, ++out_idx) {
+                    ASSERT_EQ(raw_strings[row].size(), offsets[out_idx + 1] - offsets[out_idx]) << "row=" << row;
+                }
+            }
+
+            // Evaluate BinaryColumnNePredicate(URL <> '') and BinaryColumnEqPredicate(URL = '') directly on col
+            std::unique_ptr<ColumnPredicate> ne_empty_pred(new_column_ne_predicate(get_type_info(TYPE_VARCHAR), 0, ""));
+            std::unique_ptr<ColumnPredicate> eq_empty_pred(new_column_eq_predicate(get_type_info(TYPE_VARCHAR), 0, ""));
+
+            std::vector<uint8_t> ne_sel(col->size(), 0);
+            std::vector<uint8_t> eq_sel(col->size(), 0);
+            ASSERT_OK(ne_empty_pred->evaluate(col.get(), ne_sel.data(), 0, col->size()));
+            ASSERT_OK(eq_empty_pred->evaluate(col.get(), eq_sel.data(), 0, col->size()));
+            for (size_t i = 0; i < col->size(); ++i) {
+                const bool is_non_empty = (offsets[i + 1] > offsets[i]);
+                ASSERT_EQ(is_non_empty ? 1 : 0, ne_sel[i]) << "i=" << i;
+                ASSERT_EQ(is_non_empty ? 0 : 1, eq_sel[i]) << "i=" << i;
+            }
+        }
+
+        // 2. Offset-only next_batch_with_filter with URL <> '' predicate
+        {
+            BinaryPlainPageDecoder<TYPE_VARCHAR> eager_decoder(owned.slice(), delta);
+            ASSERT_OK(eager_decoder.init());
+            BinaryPlainPageDecoder<TYPE_VARCHAR> offset_decoder(owned.slice(), delta);
+            ASSERT_OK(offset_decoder.init());
+            offset_decoder.set_offset_only(true);
+
+            std::unique_ptr<ColumnPredicate> ne_empty_pred(new_column_ne_predicate(get_type_info(TYPE_VARCHAR), 0, ""));
+            std::vector<const ColumnPredicate*> preds = {ne_empty_pred.get()};
+
+            SparseRange<> range(0, kTotalRows);
+            std::vector<uint8_t> eager_sel(kTotalRows, 1);
+            std::vector<uint16_t> eager_idx(kTotalRows);
+            auto eager_col = BinaryColumn::create();
+            ASSERT_OK(eager_decoder.next_batch_with_filter(eager_col.get(), range, preds, nullptr, eager_sel.data(),
+                                                           eager_idx.data()));
+
+            std::vector<uint8_t> offset_sel(kTotalRows, 1);
+            std::vector<uint16_t> offset_idx(kTotalRows);
+            auto offset_col = BinaryColumn::create();
+            ASSERT_OK(offset_decoder.next_batch_with_filter(offset_col.get(), range, preds, nullptr, offset_sel.data(),
+                                                            offset_idx.data()));
+
+            ASSERT_TRUE(offset_col->is_offset_only());
+            ASSERT_EQ(0u, offset_col->get_immutable_bytes().size());
+            ASSERT_GT(eager_col->get_immutable_bytes().size(), 0u);
+            ASSERT_EQ(eager_col->size(), offset_col->size());
+            ASSERT_EQ(eager_sel, offset_sel);
+            for (size_t i = 0; i < offset_col->size(); ++i) {
+                ASSERT_EQ(eager_col->get_offset()[i + 1] - eager_col->get_offset()[i],
+                          offset_col->get_offset()[i + 1] - offset_col->get_offset()[i]);
+            }
+        }
+
+        // 3. Offset-only read_by_rowids (late materialization path)
+        {
+            BinaryPlainPageDecoder<TYPE_VARCHAR> decoder(owned.slice(), delta);
+            ASSERT_OK(decoder.init());
+            decoder.set_offset_only(true);
+
+            auto col = BinaryColumn::create();
+            std::vector<rowid_t> rowids = {0, 3, 10, 11, 255, 512, 1023};
+            size_t num_read = rowids.size();
+            ASSERT_OK(decoder.read_by_rowids(0, rowids.data(), &num_read, col.get()));
+            ASSERT_EQ(rowids.size(), num_read);
+            ASSERT_TRUE(col->is_offset_only());
+            ASSERT_EQ(0u, col->get_immutable_bytes().size());
+            col->check_or_die();
+            for (size_t i = 0; i < rowids.size(); ++i) {
+                ASSERT_EQ(raw_strings[rowids[i]].size(), col->get_offset()[i + 1] - col->get_offset()[i]);
+            }
+        }
+    }
+}
+
+// NOLINTNEXTLINE
+TEST_F(BinaryPlainPageTest, TestOffsetOnlyColdScanBenchmark) {
+    // Simulate ClickBench Q27 cold storage scan:
+    // SELECT CounterID, AVG(length(URL)), COUNT(*) FROM hits WHERE URL <> '' GROUP BY CounterID;
+    constexpr size_t kRowsPerPage = 4096;
+    constexpr size_t kNumPages = 32; // 131,072 rows per pass (~14 MB URL payload per pass)
+    constexpr size_t kPasses = 8;    // ~1.05M rows, ~112 MB URL payload scanned
+
+    std::vector<std::string> page_strings(kRowsPerPage);
+    std::vector<Slice> page_slices(kRowsPerPage);
+    for (size_t i = 0; i < kRowsPerPage; ++i) {
+        if (i % 10 == 0) {
+            page_strings[i] = "";
+        } else {
+            page_strings[i] =
+                    "https://yandex.ru/clck/jsredir?from=yandex.ru%3Bsearch%3Bweb%3B%3B&text=clickbench_q27_" +
+                    std::to_string(i) + "_" + std::string(24 + (i % 48), 'a');
+        }
+        page_slices[i] = Slice(page_strings[i]);
+    }
+
+    std::vector<OwnedSlice> pages(kNumPages);
+    for (size_t p = 0; p < kNumPages; ++p) {
+        PageBuilderOptions options;
+        options.data_page_size = 2 * 1024 * 1024;
+        BinaryPlainPageBuilder builder(options);
+        ASSERT_EQ(kRowsPerPage, builder.add(reinterpret_cast<const uint8_t*>(page_slices.data()), kRowsPerPage));
+        pages[p] = builder.finish()->build();
+    }
+
+    std::unique_ptr<ColumnPredicate> ne_empty_pred(new_column_ne_predicate(get_type_info(TYPE_VARCHAR), 0, ""));
+    std::vector<const ColumnPredicate*> preds = {ne_empty_pred.get()};
+
+    auto run_scan = [&](bool offset_only, uint64_t* out_rows, uint64_t* out_sum_len, uint64_t* out_bytes_copied,
+                        double* out_ms) {
+        uint64_t total_rows = 0;
+        uint64_t sum_len = 0;
+        uint64_t bytes_copied = 0;
+        std::vector<uint8_t> selection(kRowsPerPage);
+        std::vector<uint16_t> selected_idx(kRowsPerPage);
+        auto col = BinaryColumn::create();
+        col->set_offset_only(offset_only);
+
+        auto t0 = std::chrono::steady_clock::now();
+        for (size_t pass = 0; pass < kPasses; ++pass) {
+            for (size_t p = 0; p < kNumPages; ++p) {
+                BinaryPlainPageDecoder<TYPE_VARCHAR> decoder(pages[p].slice());
+                ASSERT_OK(decoder.init());
+                decoder.set_offset_only(offset_only);
+
+                col->reset_column();
+                col->set_offset_only(offset_only);
+                std::fill(selection.begin(), selection.end(), 1);
+                SparseRange<> range(0, kRowsPerPage);
+                ASSERT_OK(decoder.next_batch_with_filter(col.get(), range, preds, nullptr, selection.data(),
+                                                         selected_idx.data()));
+                bytes_copied += col->get_immutable_bytes().size();
+
+                const size_t nrows = col->size();
+                total_rows += nrows;
+                const auto* off_ptr = col->get_offset().small_storage().data();
+                for (size_t i = 0; i < nrows; ++i) {
+                    sum_len += (off_ptr[i + 1] - off_ptr[i]);
+                }
+            }
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        *out_rows = total_rows;
+        *out_sum_len = sum_len;
+        *out_bytes_copied = bytes_copied;
+        *out_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    };
+
+    uint64_t eager_rows = 0, eager_sum_len = 0, eager_bytes = 0;
+    double eager_ms = 0.0;
+    run_scan(false, &eager_rows, &eager_sum_len, &eager_bytes, &eager_ms);
+
+    uint64_t offset_rows = 0, offset_sum_len = 0, offset_bytes = 0;
+    double offset_ms = 0.0;
+    run_scan(true, &offset_rows, &offset_sum_len, &offset_bytes, &offset_ms);
+
+    ASSERT_EQ(eager_rows, offset_rows);
+    ASSERT_EQ(eager_sum_len, offset_sum_len);
+    ASSERT_GT(eager_bytes, 100ULL * 1024 * 1024);
+    ASSERT_EQ(0u, offset_bytes);
+
+    fprintf(stderr,
+            "[Track 10A Benchmark] Eager: %.2f ms (payload copied: %.2f MB) | Offset-Only: %.2f ms (payload copied: "
+            "%.2f MB) | Speedup: %.2fx\n",
+            eager_ms, static_cast<double>(eager_bytes) / (1024.0 * 1024.0), offset_ms,
+            static_cast<double>(offset_bytes) / (1024.0 * 1024.0), offset_ms > 0.0 ? (eager_ms / offset_ms) : 0.0);
 }
 
 } // namespace starrocks
