@@ -128,6 +128,13 @@ public:
         }
     }
 
+    void set_offset_only(bool v) override {
+        ColumnIterator::set_offset_only(v);
+        if (_page != nullptr && _page->data_decoder() != nullptr) {
+            _page->data_decoder()->set_offset_only(v);
+        }
+    }
+
     bool support_push_down_predicate(const std::vector<const ColumnPredicate*>& compound_and_predicates) override;
 
 private:

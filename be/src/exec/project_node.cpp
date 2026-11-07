@@ -17,6 +17,8 @@
 #include <cstring>
 #include <memory>
 #include <set>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "column/binary_column.h"
@@ -28,6 +30,7 @@
 #include "common/global_types.h"
 #include "common/status.h"
 #include "compute_env/global_dict/parser.h"
+#include "exec/olap_scan_node.h"
 #include "exec/pipeline/exec_node_pipeline_adapter.h"
 #include "exec/pipeline/limit_operator.h"
 #include "exec/pipeline/pipeline_builder.h"
@@ -44,6 +47,46 @@
 #include "types/logical_type.h"
 
 namespace starrocks {
+
+namespace {
+
+bool is_offset_only_compatible_parent_expr(const Expr* parent) {
+    if (parent == nullptr || parent->get_num_children() != 1) {
+        return false;
+    }
+    const auto node_type = parent->node_type();
+    if (node_type != TExprNodeType::FUNCTION_CALL && node_type != TExprNodeType::COMPUTE_FUNCTION_CALL) {
+        return false;
+    }
+    const auto& fn = parent->fn();
+    if (fn.fid == 30120) {
+        return true;
+    }
+    const std::string& fn_name = fn.name.function_name;
+    return fn_name == "length" || fn_name == "octet_length" || fn_name == "is_null_pred" ||
+           fn_name == "is_not_null_pred";
+}
+
+void collect_slot_ref_counts(const Expr* expr, const Expr* parent, std::unordered_map<SlotId, size_t>* total_refs,
+                             std::unordered_map<SlotId, size_t>* offset_only_refs) {
+    if (expr == nullptr) {
+        return;
+    }
+    if (expr->is_slotref()) {
+        const auto* ref = down_cast<const ColumnRef*>(expr);
+        const SlotId slot_id = ref->slot_id();
+        (*total_refs)[slot_id]++;
+        if (ref->type().type == TYPE_VARCHAR && is_offset_only_compatible_parent_expr(parent)) {
+            (*offset_only_refs)[slot_id]++;
+        }
+        return;
+    }
+    for (const Expr* child : expr->children()) {
+        collect_slot_ref_counts(child, expr, total_refs, offset_only_refs);
+    }
+}
+
+} // namespace
 
 ProjectNode::ProjectNode(starrocks::ObjectPool* pool, const starrocks::TPlanNode& node,
                          const starrocks::DescriptorTbl& desc)
@@ -91,6 +134,7 @@ Status ProjectNode::init(const TPlanNode& tnode, RuntimeState* state) {
 
 Status ProjectNode::prepare(RuntimeState* state) {
     SCOPED_TIMER(_runtime_profile->total_time_counter());
+    _push_down_offset_only_slots();
     RETURN_IF_ERROR(ExecNode::prepare(state));
 
     RETURN_IF_ERROR(ExprExecutor::prepare(_expr_ctxs, state));
@@ -196,8 +240,64 @@ void ProjectNode::close(RuntimeState* state) {
     ExecNode::close(state);
 }
 
+void ProjectNode::_push_down_offset_only_slots() {
+    if (_children.size() != 1 || _children[0]->type() != TPlanNodeType::OLAP_SCAN_NODE) {
+        return;
+    }
+    if (_expr_ctxs.empty() && _common_sub_expr_ctxs.empty()) {
+        return;
+    }
+
+    std::unordered_map<SlotId, size_t> total_refs;
+    std::unordered_map<SlotId, size_t> offset_only_refs;
+
+    for (auto* ctx : _common_sub_expr_ctxs) {
+        if (ctx != nullptr) {
+            collect_slot_ref_counts(ctx->root(), nullptr, &total_refs, &offset_only_refs);
+        }
+    }
+    for (auto* ctx : _expr_ctxs) {
+        if (ctx != nullptr) {
+            collect_slot_ref_counts(ctx->root(), nullptr, &total_refs, &offset_only_refs);
+        }
+    }
+    for (auto* ctx : _conjunct_ctxs) {
+        if (ctx != nullptr) {
+            collect_slot_ref_counts(ctx->root(), nullptr, &total_refs, &offset_only_refs);
+        }
+    }
+    for (const auto& [rf_id, rf_desc] : _runtime_filter_collector.descriptors()) {
+        if (rf_desc == nullptr) {
+            continue;
+        }
+        if (rf_desc->probe_expr_ctx() != nullptr && rf_desc->probe_expr_ctx()->root() != nullptr) {
+            rf_desc->probe_expr_ctx()->root()->for_each_slot_id([&total_refs](SlotId id) { total_refs[id]++; });
+        }
+        if (rf_desc->partition_by_expr_contexts() != nullptr) {
+            for (auto* part_ctx : *rf_desc->partition_by_expr_contexts()) {
+                if (part_ctx != nullptr && part_ctx->root() != nullptr) {
+                    part_ctx->root()->for_each_slot_id([&total_refs](SlotId id) { total_refs[id]++; });
+                }
+            }
+        }
+    }
+
+    std::unordered_set<SlotId> offset_only_slots;
+    for (const auto& [slot_id, count] : total_refs) {
+        if (count > 0 && offset_only_refs[slot_id] == count) {
+            offset_only_slots.insert(slot_id);
+        }
+    }
+
+    if (!offset_only_slots.empty()) {
+        auto* scan_node = down_cast<OlapScanNode*>(_children[0]);
+        scan_node->set_offset_only_slots(std::move(offset_only_slots));
+    }
+}
+
 void ProjectNode::push_down_tuple_slot_mappings(RuntimeState* state,
                                                 const std::vector<TupleSlotMapping>& parent_mappings) {
+    _push_down_offset_only_slots();
     _tuple_slot_mappings = parent_mappings;
 
     DCHECK(_tuple_ids.size() == 1);
@@ -216,6 +316,7 @@ void ProjectNode::push_down_tuple_slot_mappings(RuntimeState* state,
 
 StatusOr<pipeline::OpFactories> ProjectNode::decompose_to_pipeline(pipeline::PipelineBuilderContext* context) {
     using namespace pipeline;
+    _push_down_offset_only_slots();
     ASSIGN_OR_RETURN(auto operators, _children[0]->decompose_to_pipeline(context));
     // Create a shared RefCountedRuntimeFilterCollector
     auto&& rc_rf_probe_collector = std::make_shared<RcRfProbeCollector>(1, std::move(this->runtime_filter_collector()));

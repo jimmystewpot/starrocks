@@ -100,6 +100,7 @@ private:
     std::shared_ptr<ChunkIterator> _prj_iter;
 
     std::unordered_set<uint32_t> _unused_output_column_ids;
+    std::unordered_set<uint32_t> _offset_only_column_ids;
 
     // slot descriptors for each one of |output_columns|.
     std::vector<SlotDescriptor*> _query_slots;

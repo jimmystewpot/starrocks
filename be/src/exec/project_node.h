@@ -39,6 +39,8 @@ public:
     StatusOr<pipeline::OpFactories> decompose_to_pipeline(pipeline::PipelineBuilderContext* context) override;
 
 private:
+    void _push_down_offset_only_slots();
+
     std::vector<SlotId> _slot_ids;
     std::vector<ExprContext*> _expr_ctxs;
     std::vector<bool> _type_is_nullable;
