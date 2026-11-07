@@ -59,6 +59,9 @@ bool is_offset_only_compatible_parent_expr(const Expr* parent) {
         return false;
     }
     const auto& fn = parent->fn();
+    if (fn.binary_type != TFunctionBinaryType::BUILTIN) {
+        return false;
+    }
     if (fn.fid == 30120) {
         return true;
     }
