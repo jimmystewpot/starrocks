@@ -561,5 +561,29 @@ TEST_F(AIProjectNodeTest, ProjectNodeRejectsNonBuiltinUdfNamedLengthForOffsetOnl
     }
 }
 
+TEST_F(AIProjectNodeTest, ProjectNodeDisqualifiesScanHeavyExprSlotsFromOffsetOnly) {
+    ObjectPool plan_pool;
+    TPlanNode project_tnode = make_base_node(TPlanNodeType::PROJECT_NODE, _tuple_id, 30, 1);
+    TPlanNode scan_tnode = make_base_node(TPlanNodeType::OLAP_SCAN_NODE, _tuple_id, 31, 0);
+    TOlapScanNode olap_scan_tnode;
+    olap_scan_tnode.__set_tuple_id(_tuple_id);
+    scan_tnode.__set_olap_scan_node(olap_scan_tnode);
+
+    ProjectNode project(&plan_pool, project_tnode, *_descriptors);
+    auto* scan_node = plan_pool.add(new OlapScanNode(&plan_pool, scan_tnode, *_descriptors));
+    project._children.push_back(scan_node);
+    project._slot_ids.push_back(kAnswerSlotId);
+    project._expr_ctxs.push_back(
+            make_length_call_expr_ctx(&plan_pool, TFunctionBinaryType::BUILTIN, 30120, kPromptSlotId));
+
+    std::vector<ExprContext*> heavy_expr_ctxs{
+            make_length_call_expr_ctx(&plan_pool, TFunctionBinaryType::SRJAR, 0, kPromptSlotId)};
+    scan_node->set_heavy_expr_ctxs(heavy_expr_ctxs);
+
+    project._push_down_offset_only_slots();
+    EXPECT_TRUE(scan_node->offset_only_slots().empty());
+    project.close(&_runtime_state);
+}
+
 } // namespace
 } // namespace starrocks
