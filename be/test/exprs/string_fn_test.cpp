@@ -1236,6 +1236,44 @@ PARALLEL_TEST(VecStringFunctionsTest, splitPartEdgeCasesAndColumnModesTest) {
         EXPECT_EQ("a", v->get_slice(2).to_string());
         EXPECT_EQ("b", v->get_slice(3).to_string());
     }
+
+    // 5. Bounded output reservation when extracting tiny/empty fields from large rows & long repetitive delimiters
+    {
+        constexpr size_t kRows = 256;
+        const std::string large_row = "a," + std::string(65534, 'x');
+        auto str_col = BinaryColumn::create();
+        for (size_t i = 0; i < kRows; ++i) {
+            str_col->append(large_row);
+        }
+        ColumnPtr delim_col = ColumnHelper::create_const_column<TYPE_VARCHAR>(",", kRows);
+        ColumnPtr part1_col = ColumnHelper::create_const_column<TYPE_INT>(1, kRows);
+        ColumnPtr part_missing_col = ColumnHelper::create_const_column<TYPE_INT>(10, kRows);
+
+        ColumnPtr res1 = StringFunctions::split_part(ctx.get(), {str_col, delim_col, part1_col}).value();
+        EXPECT_LT(res1->container_memory_usage(), 64 * 1024U);
+        auto v1 = ColumnHelper::as_column<BinaryColumn>(res1);
+        for (size_t i = 0; i < kRows; ++i) {
+            EXPECT_EQ("a", v1->get_slice(i).to_string());
+        }
+
+        ColumnPtr res_empty = StringFunctions::split_part(ctx.get(), {str_col, delim_col, part_missing_col}).value();
+        EXPECT_LT(res_empty->container_memory_usage(), 64 * 1024U);
+
+        // Long repetitive delimiter ("aaaa...ba") in both forward and reverse scan
+        std::string long_delim(8192, 'a');
+        long_delim[long_delim.size() - 2] = 'b';
+        const std::string hay_str = std::string(16384, 'a') + long_delim + "target_token" + long_delim + "tail";
+        auto rep_str_col = BinaryColumn::create();
+        rep_str_col->append(hay_str);
+        ColumnPtr rep_delim_col = ColumnHelper::create_const_column<TYPE_VARCHAR>(long_delim, 1);
+        ColumnPtr pos_part = ColumnHelper::create_const_column<TYPE_INT>(2, 1);
+        ColumnPtr neg_part = ColumnHelper::create_const_column<TYPE_INT>(-2, 1);
+
+        ColumnPtr rep_pos = StringFunctions::split_part(ctx.get(), {rep_str_col, rep_delim_col, pos_part}).value();
+        EXPECT_EQ("target_token", ColumnHelper::as_column<BinaryColumn>(rep_pos)->get_slice(0).to_string());
+        ColumnPtr rep_neg = StringFunctions::split_part(ctx.get(), {rep_str_col, rep_delim_col, neg_part}).value();
+        EXPECT_EQ("target_token", ColumnHelper::as_column<BinaryColumn>(rep_neg)->get_slice(0).to_string());
+    }
 }
 
 PARALLEL_TEST(VecStringFunctionsTest, substringIndexTest) {
@@ -1495,6 +1533,40 @@ PARALLEL_TEST(VecStringFunctionsTest, substringIndexTest) {
         EXPECT_EQ("c", v->get_slice(1).to_string());
         EXPECT_EQ("a", v->get_slice(2).to_string());
         EXPECT_EQ("a.b", v->get_slice(3).to_string());
+    }
+
+    // 7. Bounded output reservation when extracting tiny prefix from large rows & long repetitive delimiters
+    {
+        constexpr size_t kRows = 256;
+        const std::string large_row = "a," + std::string(65534, 'x');
+        auto str_col = BinaryColumn::create();
+        for (size_t i = 0; i < kRows; ++i) {
+            str_col->append(large_row);
+        }
+        ColumnPtr delim_col = ColumnHelper::create_const_column<TYPE_VARCHAR>(",", kRows);
+        ColumnPtr part1_col = ColumnHelper::create_const_column<TYPE_INT>(1, kRows);
+
+        ColumnPtr res1 = StringFunctions::substring_index(ctx.get(), {str_col, delim_col, part1_col}).value();
+        EXPECT_LT(res1->container_memory_usage(), 64 * 1024U);
+        auto v1 = ColumnHelper::as_column<BinaryColumn>(res1);
+        for (size_t i = 0; i < kRows; ++i) {
+            EXPECT_EQ("a", v1->get_slice(i).to_string());
+        }
+
+        // Long repetitive delimiter ("aaaa...ba") in both forward and reverse scan
+        std::string long_delim(8192, 'a');
+        long_delim[long_delim.size() - 2] = 'b';
+        const std::string hay_str = "head" + long_delim + std::string(16384, 'a') + long_delim + "tail";
+        auto rep_str_col = BinaryColumn::create();
+        rep_str_col->append(hay_str);
+        ColumnPtr rep_delim_col = ColumnHelper::create_const_column<TYPE_VARCHAR>(long_delim, 1);
+        ColumnPtr pos_part = ColumnHelper::create_const_column<TYPE_INT>(1, 1);
+        ColumnPtr neg_part = ColumnHelper::create_const_column<TYPE_INT>(-1, 1);
+
+        ColumnPtr rep_pos = StringFunctions::substring_index(ctx.get(), {rep_str_col, rep_delim_col, pos_part}).value();
+        EXPECT_EQ("head", ColumnHelper::as_column<BinaryColumn>(rep_pos)->get_slice(0).to_string());
+        ColumnPtr rep_neg = StringFunctions::substring_index(ctx.get(), {rep_str_col, rep_delim_col, neg_part}).value();
+        EXPECT_EQ("tail", ColumnHelper::as_column<BinaryColumn>(rep_neg)->get_slice(0).to_string());
     }
 }
 
@@ -2035,11 +2107,11 @@ PARALLEL_TEST(VecStringFunctionsTest, Utf8LengthAsciiFastPathTest) {
         };
         std::vector<TestCase> test_cases = {
                 {"", 0},
-                {"Привет", 6},             // Cyrillic (2-byte each, 12 bytes total)
-                {"αβγδε", 5},              // Greek (2-byte each, 10 bytes total)
-                {"你好世界", 4},           // Chinese (3-byte each, 12 bytes total)
-                {"こんにちは", 5},         // Japanese (3-byte each, 15 bytes total)
-                {"🚀🎉🦀💻", 4},   // Emojis (4-byte each, 16 bytes total)
+                {"Привет", 6},              // Cyrillic (2-byte each, 12 bytes total)
+                {"αβγδε", 5},               // Greek (2-byte each, 10 bytes total)
+                {"你好世界", 4},            // Chinese (3-byte each, 12 bytes total)
+                {"こんにちは", 5},          // Japanese (3-byte each, 15 bytes total)
+                {"🚀🎉🦀💻", 4},            // Emojis (4-byte each, 16 bytes total)
                 {"StarRocks 🚀 数据库", 15} // Mixed: 10 ascii + 1 emoji + 1 space + 3 cjk = 15
         };
         auto str = BinaryColumn::create();
@@ -2118,7 +2190,7 @@ PARALLEL_TEST(VecStringFunctionsTest, Utf8LengthAsciiFastPathTest) {
     // 6. Large buffer (> 4096 bytes) probing: all-ASCII, midpoint non-ASCII, tail non-ASCII, and interior non-ASCII
     {
         constexpr size_t kNumRows = 100;
-        const std::string ascii_row(64, 'x');                          // 6400 bytes total (> 4096)
+        const std::string ascii_row(64, 'x');                           // 6400 bytes total (> 4096)
         const std::string utf8_row = std::string(60, 'x') + "é" + "🚀"; // 60 + 2 + 4 = 66 bytes, 62 chars
 
         for (size_t non_ascii_idx : {size_t(0), kNumRows / 2, kNumRows - 1, size_t(10), kNumRows}) {

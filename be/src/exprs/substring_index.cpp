@@ -40,11 +40,11 @@ static inline Slice substring_index_slice(const Slice& haystack, const Slice& de
         }
         const char* cur = begin;
         for (int32_t num = 0; num < part_number; ++num) {
-            const char* pos = (delimiter.size == 1)
-                                      ? static_cast<const char*>(std::memchr(
-                                                cur, static_cast<uint8_t>(delimiter.data[0]),
-                                                static_cast<size_t>(end - cur)))
-                                      : searcher.search(cur, end);
+            const char* pos =
+                    (delimiter.size == 1)
+                            ? static_cast<const char*>(std::memchr(cur, static_cast<uint8_t>(delimiter.data[0]),
+                                                                   static_cast<size_t>(end - cur)))
+                            : searcher.search(cur, end);
             if (pos != nullptr && pos != end) {
                 if (num + 1 == part_number) {
                     return Slice(begin, static_cast<size_t>(pos - begin));
@@ -121,7 +121,6 @@ StatusOr<ColumnPtr> StringFunctions::substring_index(FunctionContext* /*context*
             BinaryColumn::Offsets& dst_offsets = dst->get_offset();
             dst_offsets.make_room(size + 1, max_bytes);
             dst_offsets.set(0, 0);
-            dst_bytes.reserve(std::min<size_t>(max_bytes, 1ULL << 32));
 
             const uint8_t* str_nulls =
                     columns[0]->has_null() ? ColumnHelper::get_null_data_ptr(columns[0].get()) : nullptr;

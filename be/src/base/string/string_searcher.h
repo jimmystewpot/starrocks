@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <type_traits>
 
@@ -38,8 +39,10 @@ private:
     uint8_t first{};
     uint8_t last{};
     uint8_t mid{};
-    uint16_t mid_off{};
-    uint16_t alt_off{};
+    size_t mid_off{};
+    size_t alt_off{};
+
+    static constexpr size_t kMaxAnchorScan = 64;
 
     inline bool _verify_interior(const uint8_t* pos) const {
         if (needle_size <= 2) {
@@ -49,6 +52,95 @@ private:
             return false;
         }
         return std::memcmp(pos + 1, needle + 1, needle_size - 2) == 0;
+    }
+
+    inline const uint8_t* _search_memmem_from(const uint8_t* from, const uint8_t* haystack_end) const {
+        if (from >= haystack_end || static_cast<size_t>(haystack_end - from) < needle_size) {
+            return haystack_end;
+        }
+        const void* res = memmem(from, static_cast<size_t>(haystack_end - from), needle, needle_size);
+        return res != nullptr ? static_cast<const uint8_t*>(res) : haystack_end;
+    }
+
+    // Crochemore-Perrin Two-Way algorithm run on the virtual reversed sequence to find the
+    // rightmost match starting strictly before `cand` in O(N + M) worst-case time and O(1) space.
+    const uint8_t* _rsearch_two_way_upto(const uint8_t* haystack, const uint8_t* cand,
+                                         const uint8_t* haystack_end) const {
+        if (cand <= haystack) {
+            return haystack_end;
+        }
+        const size_t M = needle_size;
+        const uint8_t* const rev_end = cand - 1 + M;
+        const size_t N = static_cast<size_t>(rev_end - haystack);
+        auto n_at = [&](size_t i) -> uint8_t { return needle[M - 1 - i]; };
+        auto h_at = [&](size_t idx) -> uint8_t { return *(rev_end - 1 - idx); };
+
+        auto max_suffix_rev = [&](bool less_order, size_t* period_out) -> size_t {
+            size_t ms = std::numeric_limits<size_t>::max();
+            size_t j = 0;
+            size_t k = 1;
+            size_t p = 1;
+            while (j + k < M) {
+                const uint8_t a = n_at(j + k);
+                const uint8_t b = n_at(static_cast<size_t>(ms + k));
+                if (less_order ? (a < b) : (a > b)) {
+                    j += k;
+                    k = 1;
+                    p = j - ms;
+                } else if (a == b) {
+                    if (k != p) {
+                        ++k;
+                    } else {
+                        j += p;
+                        k = 1;
+                    }
+                } else {
+                    ms = j;
+                    j = ms + 1;
+                    k = 1;
+                    p = 1;
+                }
+            }
+            *period_out = p;
+            return ms + 1;
+        };
+
+        size_t p1 = 1;
+        size_t p2 = 1;
+        const size_t ms1 = max_suffix_rev(true, &p1);
+        const size_t ms2 = max_suffix_rev(false, &p2);
+        const size_t crit_pos = (ms1 > ms2) ? ms1 : ms2;
+        size_t period = (ms1 > ms2) ? p1 : p2;
+
+        const bool periodic =
+                (crit_pos == 0) || (std::memcmp(needle + M - crit_pos, needle + M - period - crit_pos, crit_pos) == 0);
+        if (!periodic) {
+            period = std::max(crit_pos, M - crit_pos) + 1;
+        }
+
+        size_t j = 0;
+        size_t memory = 0;
+        while (j <= N - M) {
+            size_t i = std::max(crit_pos, memory);
+            while (i < M && n_at(i) == h_at(j + i)) {
+                ++i;
+            }
+            if (i < M) {
+                j += i - crit_pos + 1;
+                memory = 0;
+                continue;
+            }
+            i = crit_pos;
+            while (i > memory && n_at(i - 1) == h_at(j + i - 1)) {
+                --i;
+            }
+            if (i <= memory) {
+                return (cand - 1) - j;
+            }
+            j += period;
+            memory = periodic ? (M - period) : 0;
+        }
+        return haystack_end;
     }
 
 #if defined(__x86_64__)
@@ -74,6 +166,9 @@ private:
                 if (_verify_interior(p + bit)) {
                     return p + bit;
                 }
+                if (needle_size > kMaxAnchorScan) {
+                    return _search_memmem_from(p + bit + 1, haystack_end);
+                }
                 mask &= (mask - 1);
             }
             p += 16;
@@ -95,6 +190,9 @@ private:
                 const uint32_t bit = static_cast<uint32_t>(__builtin_ctz(mask));
                 if (_verify_interior(tail_p + bit)) {
                     return tail_p + bit;
+                }
+                if (needle_size > kMaxAnchorScan) {
+                    return _search_memmem_from(tail_p + bit + 1, haystack_end);
                 }
                 mask &= (mask - 1);
             }
@@ -126,6 +224,9 @@ private:
                 if (_verify_interior(p + bit)) {
                     return p + bit;
                 }
+                if (needle_size > kMaxAnchorScan) {
+                    return _rsearch_two_way_upto(haystack, p + bit, haystack_end);
+                }
                 mask ^= (1U << bit);
             }
         }
@@ -147,6 +248,9 @@ private:
                 if (_verify_interior(haystack + bit)) {
                     return haystack + bit;
                 }
+                if (needle_size > kMaxAnchorScan) {
+                    return _rsearch_two_way_upto(haystack, haystack + bit, haystack_end);
+                }
                 mask ^= (1U << bit);
             }
         }
@@ -166,35 +270,61 @@ public:
         first = *needle;
         last = needle[needle_size - 1];
         if (needle_size > 2) {
-            static constexpr size_t kMaxAnchorScan = 64;
             const size_t max_interior = std::min<size_t>(needle_size - 2, kMaxAnchorScan);
             const size_t center = (1 + max_interior) / 2;
             size_t chosen_mid = center;
+            bool found_mid = false;
             for (size_t delta = 0; delta <= max_interior; ++delta) {
                 const size_t right = center + delta;
                 if (right <= max_interior && needle[right] != first && needle[right] != last) {
                     chosen_mid = right;
+                    found_mid = true;
                     break;
                 }
                 if (delta <= center - 1) {
                     const size_t left = center - delta;
                     if (left >= 1 && needle[left] != first && needle[left] != last) {
                         chosen_mid = left;
+                        found_mid = true;
                         break;
                     }
                 }
             }
-            mid_off = static_cast<uint16_t>(chosen_mid);
+            // If the head window is homogeneous, also inspect up to kMaxAnchorScan bytes at the tail
+            // (which resides in the same trailing page already touched by `last = needle[needle_size - 1]`).
+            const size_t tail_min = (needle_size - 2 > kMaxAnchorScan)
+                                            ? std::max<size_t>(max_interior + 1, (needle_size - 1) - kMaxAnchorScan)
+                                            : max_interior + 1;
+            if (!found_mid && needle_size - 2 >= tail_min) {
+                for (size_t i = needle_size - 2; i >= tail_min; --i) {
+                    if (needle[i] != first && needle[i] != last) {
+                        chosen_mid = i;
+                        found_mid = true;
+                        break;
+                    }
+                }
+            }
+            mid_off = chosen_mid;
             mid = needle[mid_off];
 
-            size_t chosen_alt = (chosen_mid > 1) ? 1 : max_interior;
+            size_t chosen_alt = (chosen_mid != 1) ? 1 : max_interior;
+            bool found_alt = false;
             for (size_t i = max_interior; i >= 1; --i) {
                 if (i != chosen_mid && needle[i] != first && needle[i] != last && needle[i] != mid) {
                     chosen_alt = i;
+                    found_alt = true;
                     break;
                 }
             }
-            alt_off = static_cast<uint16_t>(chosen_alt);
+            if (!found_alt && needle_size - 2 >= tail_min) {
+                for (size_t i = needle_size - 2; i >= tail_min; --i) {
+                    if (i != chosen_mid && needle[i] != first && needle[i] != last && needle[i] != mid) {
+                        chosen_alt = i;
+                        break;
+                    }
+                }
+            }
+            alt_off = chosen_alt;
         }
     }
 
@@ -240,8 +370,13 @@ public:
         const size_t last_off = needle_size - 1;
         const uint8_t* p = haystack;
         while (static_cast<size_t>(haystack_end - p) >= needle_size) {
-            if (p[0] == first && p[last_off] == last && _verify_interior(p)) {
-                return p;
+            if (p[0] == first && p[last_off] == last) {
+                if (_verify_interior(p)) {
+                    return p;
+                }
+                if (needle_size > kMaxAnchorScan) {
+                    return _search_memmem_from(p + 1, haystack_end);
+                }
             }
             ++p;
         }
@@ -286,6 +421,9 @@ public:
                 if (_verify_interior(p + bit)) {
                     return p + bit;
                 }
+                if (needle_size > kMaxAnchorScan) {
+                    return _search_memmem_from(p + bit + 1, haystack_end);
+                }
                 mask &= (mask - 1);
             }
             p += 32;
@@ -328,6 +466,9 @@ public:
                     if (_verify_interior(p + bit)) {
                         return p + bit;
                     }
+                    if (needle_size > kMaxAnchorScan) {
+                        return _search_memmem_from(p + bit + 1, haystack_end);
+                    }
                     mask0 &= ~(0xFULL << (bit << 2));
                 }
                 uint64_t mask1 = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(eq1), 4)), 0);
@@ -335,6 +476,9 @@ public:
                     const uint32_t bit = static_cast<uint32_t>(__builtin_ctzll(mask1) >> 2);
                     if (_verify_interior(p + 16 + bit)) {
                         return p + 16 + bit;
+                    }
+                    if (needle_size > kMaxAnchorScan) {
+                        return _search_memmem_from(p + 16 + bit + 1, haystack_end);
                     }
                     mask1 &= ~(0xFULL << (bit << 2));
                 }
@@ -356,6 +500,9 @@ public:
                     const uint32_t bit = static_cast<uint32_t>(__builtin_ctzll(mask0) >> 2);
                     if (_verify_interior(p + bit)) {
                         return p + bit;
+                    }
+                    if (needle_size > kMaxAnchorScan) {
+                        return _search_memmem_from(p + bit + 1, haystack_end);
                     }
                     mask0 &= ~(0xFULL << (bit << 2));
                 }
@@ -380,6 +527,9 @@ public:
                     const uint32_t bit = static_cast<uint32_t>(__builtin_ctzll(mask64) >> 2);
                     if (_verify_interior(tail_p + bit)) {
                         return tail_p + bit;
+                    }
+                    if (needle_size > kMaxAnchorScan) {
+                        return _search_memmem_from(tail_p + bit + 1, haystack_end);
                     }
                     mask64 &= ~(0xFULL << (bit << 2));
                 }
@@ -434,8 +584,13 @@ public:
         const size_t last_off = needle_size - 1;
         const uint8_t* p = haystack_end - needle_size;
         while (true) {
-            if (p[0] == first && p[last_off] == last && _verify_interior(p)) {
-                return p;
+            if (p[0] == first && p[last_off] == last) {
+                if (_verify_interior(p)) {
+                    return p;
+                }
+                if (needle_size > kMaxAnchorScan) {
+                    return _rsearch_two_way_upto(haystack, p, haystack_end);
+                }
             }
             if (p == haystack) {
                 break;
@@ -485,6 +640,9 @@ public:
                 if (_verify_interior(p + bit)) {
                     return p + bit;
                 }
+                if (needle_size > kMaxAnchorScan) {
+                    return _rsearch_two_way_upto(haystack, p + bit, haystack_end);
+                }
                 mask ^= (1U << bit);
             }
         }
@@ -527,6 +685,9 @@ public:
                     if (_verify_interior(p + 16 + bit)) {
                         return p + 16 + bit;
                     }
+                    if (needle_size > kMaxAnchorScan) {
+                        return _rsearch_two_way_upto(haystack, p + 16 + bit, haystack_end);
+                    }
                     mask1 &= ~(0xFULL << (bit << 2));
                 }
                 uint64_t mask0 = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(eq0), 4)), 0);
@@ -534,6 +695,9 @@ public:
                     const uint32_t bit = static_cast<uint32_t>((63 - __builtin_clzll(mask0)) >> 2);
                     if (_verify_interior(p + bit)) {
                         return p + bit;
+                    }
+                    if (needle_size > kMaxAnchorScan) {
+                        return _rsearch_two_way_upto(haystack, p + bit, haystack_end);
                     }
                     mask0 &= ~(0xFULL << (bit << 2));
                 }
@@ -556,6 +720,9 @@ public:
                     if (_verify_interior(p + bit)) {
                         return p + bit;
                     }
+                    if (needle_size > kMaxAnchorScan) {
+                        return _rsearch_two_way_upto(haystack, p + bit, haystack_end);
+                    }
                     mask0 &= ~(0xFULL << (bit << 2));
                 }
             }
@@ -577,6 +744,9 @@ public:
                     const uint32_t bit = static_cast<uint32_t>((63 - __builtin_clzll(mask64)) >> 2);
                     if (_verify_interior(haystack + bit)) {
                         return haystack + bit;
+                    }
+                    if (needle_size > kMaxAnchorScan) {
+                        return _rsearch_two_way_upto(haystack, haystack + bit, haystack_end);
                     }
                     mask64 &= ~(0xFULL << (bit << 2));
                 }

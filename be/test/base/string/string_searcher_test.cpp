@@ -18,6 +18,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <random>
 #include <string>
 #include <string_view>
@@ -298,7 +299,7 @@ TEST_F(StringSearcherTest, LongHomogeneousNeedleCapsAnchorSelection) {
 }
 
 static std::vector<const uint8_t*> run_all_rkernels(const StringSearcher& s, const uint8_t* b, const uint8_t* e,
-                                                     size_t needle_len) {
+                                                    size_t needle_len) {
     std::vector<const uint8_t*> r{s.rsearch(b, e), s.rsearch_scalar(b, e)};
     if (needle_len >= 2) {
 #if defined(__x86_64__)
@@ -449,6 +450,75 @@ TEST_F(StringSearcherTest, RSearchRandomisedDifferentialFuzz) {
             ASSERT_EQ(expected, r) << "seed=" << kSeed << " iter=" << iter << " needle=" << needle << " hay=" << hay;
         }
     }
+}
+
+TEST_F(StringSearcherTest, LongRepetitiveNeedleForwardAndReverseBoundedTime) {
+    // Pathological cases where a long repetitive needle shares first/last/prefix/suffix bytes with an all-'a' haystack:
+    // 1. 16 KiB needle of 'a' with 'b' at needle_size - 2 (tail anchor outside the first 64B window).
+    // 2. 16 KiB needle of 'a' with 'b' at needle_size / 2 (outside both 64B head and tail anchor windows).
+    // 3. 8 KiB periodic needle of all 'a' against a haystack of ("aaa...ab") blocks.
+    constexpr size_t kNeedleLen = 16 * 1024;
+    constexpr size_t kHayLen = 256 * 1024;
+
+    std::string needle_tail_b(kNeedleLen, 'a');
+    needle_tail_b[kNeedleLen - 2] = 'b';
+
+    std::string needle_mid_b(kNeedleLen, 'a');
+    needle_mid_b[kNeedleLen / 2] = 'b';
+
+    const std::string all_a_haystack(kHayLen, 'a');
+    const auto* miss_b = reinterpret_cast<const uint8_t*>(all_a_haystack.data());
+    const auto* miss_e = miss_b + all_a_haystack.size();
+
+    const auto start_tp = std::chrono::steady_clock::now();
+
+    for (const std::string& needle : {needle_tail_b, needle_mid_b}) {
+        StringSearcher searcher(needle.data(), needle.size());
+        for (const auto* r : run_all_kernels(searcher, miss_b, miss_e, needle.size())) {
+            EXPECT_EQ(miss_e, r);
+        }
+        for (const auto* r : run_all_rkernels(searcher, miss_b, miss_e, needle.size())) {
+            EXPECT_EQ(miss_e, r);
+        }
+
+        std::string hit_haystack = all_a_haystack;
+        const size_t hit1 = 12345;
+        const size_t hit2 = kHayLen - kNeedleLen - 777;
+        hit_haystack.replace(hit1, needle.size(), needle);
+        hit_haystack.replace(hit2, needle.size(), needle);
+        const auto* hit_b = reinterpret_cast<const uint8_t*>(hit_haystack.data());
+        const auto* hit_e = hit_b + hit_haystack.size();
+
+        for (const auto* r : run_all_kernels(searcher, hit_b, hit_e, needle.size())) {
+            EXPECT_EQ(hit_b + hit1, r);
+        }
+        for (const auto* r : run_all_rkernels(searcher, hit_b, hit_e, needle.size())) {
+            EXPECT_EQ(hit_b + hit2, r);
+        }
+    }
+
+    // Homogeneous 8 KiB all-'a' needle searched against blocks of 4095 'a's + 'b' (no match)
+    const std::string hom_needle(8 * 1024, 'a');
+    StringSearcher hom_searcher(hom_needle.data(), hom_needle.size());
+    std::string periodic_hay;
+    periodic_hay.reserve(kHayLen);
+    const std::string block = std::string(4095, 'a') + "b";
+    while (periodic_hay.size() < kHayLen) {
+        periodic_hay.append(block);
+    }
+    const auto* per_b = reinterpret_cast<const uint8_t*>(periodic_hay.data());
+    const auto* per_e = per_b + periodic_hay.size();
+    for (const auto* r : run_all_kernels(hom_searcher, per_b, per_e, hom_needle.size())) {
+        EXPECT_EQ(per_e, r);
+    }
+    for (const auto* r : run_all_rkernels(hom_searcher, per_b, per_e, hom_needle.size())) {
+        EXPECT_EQ(per_e, r);
+    }
+
+    const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_tp).count();
+    EXPECT_LT(elapsed_ms, 500) << "Long repetitive needle search degraded to quadratic complexity: " << elapsed_ms
+                               << " ms";
 }
 
 } // namespace starrocks
