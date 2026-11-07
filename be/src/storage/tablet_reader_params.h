@@ -96,6 +96,7 @@ struct TabletReaderParams {
 
     ColumnIdToGlobalDictMap* global_dictmaps = &EMPTY_GLOBAL_DICTMAPS;
     const std::unordered_set<uint32_t>* unused_output_column_ids = &EMPTY_FILTERED_COLUMN_IDS;
+    const std::unordered_set<uint32_t>* offset_only_column_ids = &EMPTY_FILTERED_COLUMN_IDS;
     RowsetIdToDRSSId* rowset_id_to_drssid = nullptr;
 
     RowidRangeOptionPtr rowid_range_option = nullptr;

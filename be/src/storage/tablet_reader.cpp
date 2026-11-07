@@ -313,6 +313,7 @@ Status TabletReader::_init_collector_for_pk_index_read() {
     rs_opts.tablet_schema = _tablet_schema;
     rs_opts.global_dictmaps = _reader_params->global_dictmaps;
     rs_opts.unused_output_column_ids = _reader_params->unused_output_column_ids;
+    rs_opts.offset_only_column_ids = _reader_params->offset_only_column_ids;
     rs_opts.runtime_range_pruner = _reader_params->runtime_range_pruner;
     // single row fetch, no need to use delvec
     rs_opts.is_primary_keys = false;
@@ -390,6 +391,7 @@ Status TabletReader::get_segment_iterators(const TabletReaderParams& params, std
     rs_opts.tablet_schema = _tablet_schema;
     rs_opts.global_dictmaps = params.global_dictmaps;
     rs_opts.unused_output_column_ids = params.unused_output_column_ids;
+    rs_opts.offset_only_column_ids = params.offset_only_column_ids;
     rs_opts.runtime_range_pruner = params.runtime_range_pruner;
     rs_opts.column_access_paths = params.column_access_paths;
     rs_opts.use_vector_index = params.use_vector_index;
