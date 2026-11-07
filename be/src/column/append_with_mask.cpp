@@ -173,8 +173,17 @@ Status AppendWithMaskVisitor<PositiveSelect>::append_binary(BinaryColumn* column
         }
     });
 
-    if (column->is_offset_only() || src_column->is_offset_only()) {
-        column->set_offset_only(true);
+    if (src_column->is_offset_only() && !column->is_offset_only()) {
+        if (column->empty()) {
+            column->set_offset_only(true);
+        } else {
+            return Status::InternalError(
+                    "Cannot append offset-only BinaryColumn into non-empty materialized BinaryColumn in "
+                    "append_with_mask");
+        }
+    }
+
+    if (column->is_offset_only()) {
         auto& offsets = column->get_offset();
         size_t old_rows = offsets.size() - 1;
         uint64_t old_offset = offsets.back();
