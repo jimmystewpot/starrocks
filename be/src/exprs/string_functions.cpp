@@ -5358,17 +5358,21 @@ Status StringFunctions::replace_close(FunctionContext* context, FunctionContext:
     return Status::OK();
 }
 
-static ColumnPtr merge_null_with_src_column(const ColumnPtr& src_col, const ColumnPtr& extra_null_col,
-                                            size_t num_rows) {
+static ColumnPtr merge_null_with_src_column(const ColumnPtr& src_col, const ColumnPtr& extra_null_col, size_t num_rows,
+                                            bool all_const) {
+    if (all_const) {
+        return src_col->is_constant() ? src_col : ConstColumn::create(src_col, num_rows);
+    }
+
+    ColumnPtr unpacked_src =
+            src_col->is_constant() ? ColumnHelper::unpack_and_duplicate_const_column(num_rows, src_col) : src_col;
     if (extra_null_col == nullptr || !extra_null_col->is_nullable() || !extra_null_col->has_null()) {
-        return src_col;
+        return unpacked_src;
     }
     if (extra_null_col->only_null()) {
         return ColumnHelper::create_const_null_column(num_rows);
     }
 
-    ColumnPtr unpacked_src =
-            src_col->is_constant() ? ColumnHelper::unpack_and_duplicate_const_column(num_rows, src_col) : src_col;
     ColumnPtr unpacked_extra = extra_null_col->is_constant()
                                        ? ColumnHelper::unpack_and_duplicate_const_column(num_rows, extra_null_col)
                                        : extra_null_col;
@@ -5386,6 +5390,348 @@ static ColumnPtr merge_null_with_src_column(const ColumnPtr& src_col, const Colu
     }
     return NullableColumn::create(unpacked_src,
                                   NullColumn::static_pointer_cast(std::move(*extra_nullable->null_column()).mutate()));
+}
+
+static inline void replace_1byte_simd(uint8_t* dst, const uint8_t* src, size_t len, uint8_t ptn_byte,
+                                      uint8_t rpl_byte) {
+    size_t i = 0;
+#if defined(__AVX2__)
+    if (len >= 32) {
+        const __m256i v_ptn = _mm256_set1_epi8(static_cast<char>(ptn_byte));
+        const __m256i v_rpl = _mm256_set1_epi8(static_cast<char>(rpl_byte));
+        for (; i + 32 <= len; i += 32) {
+            const __m256i v_src = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i));
+            const __m256i eq = _mm256_cmpeq_epi8(v_src, v_ptn);
+            const __m256i out = _mm256_blendv_epi8(v_src, v_rpl, eq);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), out);
+        }
+    }
+#elif defined(__SSE4_1__)
+    if (len >= 16) {
+        const __m128i v_ptn = _mm_set1_epi8(static_cast<char>(ptn_byte));
+        const __m128i v_rpl = _mm_set1_epi8(static_cast<char>(rpl_byte));
+        for (; i + 16 <= len; i += 16) {
+            const __m128i v_src = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i));
+            const __m128i eq = _mm_cmpeq_epi8(v_src, v_ptn);
+            const __m128i out = _mm_blendv_epi8(v_src, v_rpl, eq);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i), out);
+        }
+    }
+#elif defined(__ARM_NEON)
+    if (len >= 16) {
+        const uint8x16_t v_ptn = vdupq_n_u8(ptn_byte);
+        const uint8x16_t v_rpl = vdupq_n_u8(rpl_byte);
+        for (; i + 16 <= len; i += 16) {
+            const uint8x16_t v_src = vld1q_u8(src + i);
+            const uint8x16_t eq = vceqq_u8(v_src, v_ptn);
+            const uint8x16_t out = vbslq_u8(eq, v_rpl, v_src);
+            vst1q_u8(dst + i, out);
+        }
+    }
+#endif
+    for (; i < len; ++i) {
+        const uint8_t b = src[i];
+        dst[i] = (b == ptn_byte) ? rpl_byte : b;
+    }
+}
+
+template <typename OffsetsContainer>
+static ALWAYS_INLINE size_t advance_row_to_offset(const OffsetsContainer& src_offsets, size_t cur_row, size_t eval_rows,
+                                                  size_t target_offset) {
+    size_t r = cur_row;
+    for (size_t step = 0; step < 8 && r < eval_rows; ++step, ++r) {
+        if (target_offset < static_cast<size_t>(src_offsets[r + 1])) {
+            return r;
+        }
+    }
+    if (r >= eval_rows) {
+        return eval_rows;
+    }
+    using OffsetT = typename std::decay_t<OffsetsContainer>::value_type;
+    auto it = std::upper_bound(src_offsets.begin() + r + 1, src_offsets.begin() + eval_rows + 1,
+                               static_cast<OffsetT>(target_offset));
+    return static_cast<size_t>(std::distance(src_offsets.begin(), it)) - 1;
+}
+
+template <typename OffsetsContainer>
+static ALWAYS_INLINE void append_unmatched_row_range(BinaryColumn* dst, const char* src_base,
+                                                     const OffsetsContainer& src_offsets, const uint8_t* null_data,
+                                                     size_t from_row, size_t to_row) {
+    if (from_row >= to_row) {
+        return;
+    }
+    auto& dst_bytes = dst->get_bytes();
+    auto& dst_offsets = dst->get_offset();
+    if (null_data == nullptr) {
+        const size_t start_byte = static_cast<size_t>(src_offsets[from_row]);
+        const size_t end_byte = static_cast<size_t>(src_offsets[to_row]);
+        const size_t dst_base_byte = dst_bytes.size();
+        append_bytes(dst_bytes, src_base + start_byte, end_byte - start_byte);
+        const ptrdiff_t delta = static_cast<ptrdiff_t>(dst_base_byte) - static_cast<ptrdiff_t>(start_byte);
+        using OffsetT = typename std::decay_t<OffsetsContainer>::value_type;
+        for (size_t r = from_row; r < to_row; ++r) {
+            dst_offsets.push_back(static_cast<OffsetT>(static_cast<ptrdiff_t>(src_offsets[r + 1]) + delta));
+        }
+    } else {
+        for (size_t r = from_row; r < to_row; ++r) {
+            if (!null_data[r]) {
+                const size_t r_start = static_cast<size_t>(src_offsets[r]);
+                const size_t r_size = static_cast<size_t>(src_offsets[r + 1]) - r_start;
+                append_bytes(dst_bytes, src_base + r_start, r_size);
+            }
+            dst_offsets.push_back(dst_bytes.size());
+        }
+    }
+}
+
+static StatusOr<ColumnPtr> replace_const_pattern_and_rpl(const ReplaceState* state, const Columns& columns) {
+    const size_t num_rows = columns[0]->size();
+    const bool is_src_const = columns[0]->is_constant();
+    DCHECK(!is_src_const || ColumnHelper::is_all_const(columns));
+    const size_t eval_rows = is_src_const ? 1 : num_rows;
+
+    const BinaryColumn* src_binary = ColumnHelper::get_binary_column(columns[0].get());
+    const uint8_t* null_data =
+            (!is_src_const && columns[0]->is_nullable() && columns[0]->has_null())
+                    ? down_cast<const NullableColumn*>(columns[0].get())->immutable_null_column_data().data()
+                    : nullptr;
+
+    const char* const src_base = src_binary->get_string_begin();
+    const char* const ptn_data = state->pattern.data();
+    const size_t ptn_len = state->pattern.size();
+    const char* const rpl_data = state->repl.data();
+    const size_t rpl_len = state->repl.size();
+
+    bool any_match = false;
+    BinaryColumn::MutablePtr dst;
+
+    src_binary->get_offset().visit_storage([&](const auto& src_offsets) {
+        const size_t src_total_bytes = static_cast<size_t>(src_offsets[eval_rows]);
+        const char* const src_end = src_base + src_total_bytes;
+        if (src_total_bytes < ptn_len) {
+            return;
+        }
+
+        // Case 1A: 1-byte -> 1-byte SIMD replacement over flat buffer.
+        if (ptn_len == 1 && rpl_len == 1) {
+            const auto ptn_byte = static_cast<uint8_t>(ptn_data[0]);
+            const auto rpl_byte = static_cast<uint8_t>(rpl_data[0]);
+            size_t row = 0;
+            const char* scan_ptr = src_base;
+            const char* first_hit = nullptr;
+
+            while (scan_ptr < src_end) {
+                const void* p = std::memchr(scan_ptr, ptn_byte, static_cast<size_t>(src_end - scan_ptr));
+                if (p == nullptr) {
+                    break;
+                }
+                const auto* hit = static_cast<const char*>(p);
+                if (null_data != nullptr) {
+                    row = advance_row_to_offset(src_offsets, row, eval_rows, static_cast<size_t>(hit - src_base));
+                    if (null_data[row]) {
+                        ++row;
+                        scan_ptr = src_base + src_offsets[row];
+                        continue;
+                    }
+                }
+                first_hit = hit;
+                break;
+            }
+
+            if (first_hit != nullptr) {
+                const size_t first_off = static_cast<size_t>(first_hit - src_base);
+                dst = RunTimeColumnType<TYPE_VARCHAR>::create();
+                dst->get_offset() = src_binary->get_offset();
+                dst->get_offset().resize(eval_rows + 1);
+                auto& dst_bytes = dst->get_bytes();
+                dst_bytes.resize(src_total_bytes);
+                if (first_off > 0) {
+                    strings::memcpy_inlined(dst_bytes.data(), src_base, first_off);
+                }
+                replace_1byte_simd(dst_bytes.data() + first_off, reinterpret_cast<const uint8_t*>(src_base + first_off),
+                                   src_total_bytes - first_off, ptn_byte, rpl_byte);
+                any_match = true;
+            }
+            return;
+        }
+
+        // Case 1B: Equal-length multi-byte replacement (ptn_len == rpl_len > 1) in-place over cloned buffer.
+        if (ptn_len == rpl_len) {
+            size_t row = 0;
+            while (row < eval_rows) {
+                if (null_data != nullptr && null_data[row]) {
+                    ++row;
+                    continue;
+                }
+                const char* scan_ptr = src_base + src_offsets[row];
+                if (static_cast<size_t>(src_end - scan_ptr) < ptn_len) {
+                    break;
+                }
+                const char* hit = state->search(scan_ptr, static_cast<size_t>(src_end - scan_ptr));
+                if (hit == src_end) {
+                    break;
+                }
+                row = advance_row_to_offset(src_offsets, row, eval_rows, static_cast<size_t>(hit - src_base));
+                if (null_data != nullptr && null_data[row]) {
+                    ++row;
+                    continue;
+                }
+                const char* const row_end = src_base + src_offsets[row + 1];
+                if (static_cast<size_t>(row_end - hit) < ptn_len) {
+                    // Boundary straddle across row and row + 1; advance to row + 1.
+                    ++row;
+                    continue;
+                }
+                if (!any_match) {
+                    dst = RunTimeColumnType<TYPE_VARCHAR>::create();
+                    dst->get_offset() = src_binary->get_offset();
+                    dst->get_offset().resize(eval_rows + 1);
+                    auto& dst_bytes = dst->get_bytes();
+                    dst_bytes.resize(src_total_bytes);
+                    strings::memcpy_inlined(dst_bytes.data(), src_base, src_total_bytes);
+                    any_match = true;
+                }
+                uint8_t* const dst_raw = dst->get_bytes().data();
+                while (true) {
+                    strings::memcpy_inlined(dst_raw + (hit - src_base), rpl_data, rpl_len);
+                    const char* cur = hit + ptn_len;
+                    if (static_cast<size_t>(row_end - cur) < ptn_len) {
+                        break;
+                    }
+                    hit = state->search(cur, static_cast<size_t>(row_end - cur));
+                    if (hit == row_end) {
+                        break;
+                    }
+                }
+                ++row;
+            }
+            return;
+        }
+
+        // Case 1C: Variable-length replacement (ptn_len != rpl_len) via flat-buffer SIMD scan + lazy streaming.
+        size_t row = 0;
+        while (row < eval_rows) {
+            if (null_data != nullptr && null_data[row]) {
+                if (any_match) {
+                    dst->get_offset().push_back(dst->get_bytes().size());
+                }
+                ++row;
+                continue;
+            }
+            const char* const scan_ptr = src_base + src_offsets[row];
+            if (static_cast<size_t>(src_end - scan_ptr) < ptn_len) {
+                if (any_match) {
+                    append_unmatched_row_range(dst.get(), src_base, src_offsets, null_data, row, eval_rows);
+                }
+                break;
+            }
+            const char* hit = state->search(scan_ptr, static_cast<size_t>(src_end - scan_ptr));
+            if (hit == src_end) {
+                if (any_match) {
+                    append_unmatched_row_range(dst.get(), src_base, src_offsets, null_data, row, eval_rows);
+                }
+                break;
+            }
+            const size_t hit_row =
+                    advance_row_to_offset(src_offsets, row, eval_rows, static_cast<size_t>(hit - src_base));
+            if (hit_row > row) {
+                if (any_match) {
+                    append_unmatched_row_range(dst.get(), src_base, src_offsets, null_data, row, hit_row);
+                }
+                row = hit_row;
+            }
+            if (null_data != nullptr && null_data[row]) {
+                if (any_match) {
+                    dst->get_offset().push_back(dst->get_bytes().size());
+                }
+                ++row;
+                continue;
+            }
+
+            const size_t row_start = static_cast<size_t>(src_offsets[row]);
+            const size_t row_end_off = static_cast<size_t>(src_offsets[row + 1]);
+            const size_t row_size = row_end_off - row_start;
+            const char* const row_data = src_base + row_start;
+            const char* const row_end = src_base + row_end_off;
+
+            if (static_cast<size_t>(row_end - hit) < ptn_len) {
+                // Boundary straddle across row and row + 1; row has no valid intra-row match.
+                if (any_match) {
+                    append_bytes(dst->get_bytes(), row_data, row_size);
+                    dst->get_offset().push_back(dst->get_bytes().size());
+                }
+                ++row;
+                continue;
+            }
+
+            if (!any_match) {
+                size_t prefix_bytes = row_start;
+                if (null_data != nullptr) {
+                    prefix_bytes = 0;
+                    for (size_t prev = 0; prev < row; ++prev) {
+                        if (!null_data[prev]) {
+                            prefix_bytes +=
+                                    static_cast<size_t>(src_offsets[prev + 1]) - static_cast<size_t>(src_offsets[prev]);
+                        }
+                    }
+                }
+                dst = RunTimeColumnType<TYPE_VARCHAR>::create();
+                const size_t remaining_src_bytes = src_total_bytes - row_start;
+                const size_t first_out_row_hint = (row_size - ptn_len) + rpl_len;
+                const size_t reserve_bytes = regexp_replace_initial_reserve(prefix_bytes, remaining_src_bytes, row_size,
+                                                                            first_out_row_hint, eval_rows - row);
+                dst->reserve(eval_rows, reserve_bytes);
+                if (row > 0) {
+                    if (null_data == nullptr) {
+                        dst->append(*src_binary, 0, row);
+                    } else {
+                        append_unmatched_row_range(dst.get(), src_base, src_offsets, null_data, 0, row);
+                    }
+                }
+                any_match = true;
+            }
+
+            auto& dst_bytes = dst->get_bytes();
+            const char* cur = row_data;
+            while (true) {
+                if (hit > cur) {
+                    append_bytes(dst_bytes, cur, static_cast<size_t>(hit - cur));
+                }
+                append_bytes(dst_bytes, rpl_data, rpl_len);
+                cur = hit + ptn_len;
+                if (static_cast<size_t>(row_end - cur) < ptn_len) {
+                    break;
+                }
+                hit = state->search(cur, static_cast<size_t>(row_end - cur));
+                if (hit == row_end) {
+                    break;
+                }
+            }
+            if (cur < row_end) {
+                append_bytes(dst_bytes, cur, static_cast<size_t>(row_end - cur));
+            }
+            dst->get_offset().push_back(dst_bytes.size());
+            ++row;
+        }
+    });
+
+    if (!any_match) {
+        return columns[0];
+    }
+
+    dst->invalidate_slice_cache();
+    THROW_RUNTIME_ERROR_IF_EXCEED_LIMIT(dst, replace);
+
+    if (is_src_const) {
+        return ConstColumn::create(std::move(dst), num_rows);
+    }
+
+    if (null_data != nullptr) {
+        const auto* src_nullable = down_cast<const NullableColumn*>(columns[0].get());
+        return NullableColumn::create(
+                std::move(dst), NullColumn::static_pointer_cast(std::move(*src_nullable->null_column()).mutate()));
+    }
+    return dst;
 }
 
 template <typename SearchFn, typename EnsureDstFn>
@@ -5506,10 +5852,7 @@ static StatusOr<ColumnPtr> replace_const_pattern(const ReplaceState* state, cons
     }
 
     if (!any_match) {
-        if (all_const) {
-            return columns[0]->is_constant() ? columns[0] : ConstColumn::create(columns[0], num_rows);
-        }
-        return merge_null_with_src_column(columns[0], columns[2], num_rows);
+        return merge_null_with_src_column(columns[0], columns[2], num_rows, all_const);
     }
 
     dst->invalidate_slice_cache();
@@ -5622,11 +5965,13 @@ StatusOr<ColumnPtr> StringFunctions::replace(FunctionContext* context, const Col
                                                                                  columns[2]->is_nullable());
     }
 
+    const bool all_const = ColumnHelper::is_all_const(columns);
     if (state->const_pattern && (state->pattern.empty() || state->same_pattern_and_repl)) {
-        if (ColumnHelper::is_all_const(columns)) {
-            return arg0->is_constant() ? arg0 : ConstColumn::create(arg0, num_rows);
-        }
-        return merge_null_with_src_column(arg0, columns[2], num_rows);
+        return merge_null_with_src_column(arg0, columns[2], num_rows, all_const);
+    }
+
+    if (state->const_pattern && state->const_repl && (!arg0->is_constant() || all_const)) {
+        return replace_const_pattern_and_rpl(state, columns);
     }
 
     if (state->const_pattern) {
