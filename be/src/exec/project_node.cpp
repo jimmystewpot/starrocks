@@ -251,6 +251,7 @@ void ProjectNode::_push_down_offset_only_slots() {
         return;
     }
 
+    auto* scan_node = down_cast<OlapScanNode*>(_children[0]);
     std::unordered_map<SlotId, size_t> total_refs;
     std::unordered_map<SlotId, size_t> offset_only_refs;
 
@@ -267,6 +268,11 @@ void ProjectNode::_push_down_offset_only_slots() {
     for (auto* ctx : _conjunct_ctxs) {
         if (ctx != nullptr) {
             collect_slot_ref_counts(ctx->root(), nullptr, &total_refs, &offset_only_refs);
+        }
+    }
+    for (auto* ctx : scan_node->get_heavy_expr_ctxs()) {
+        if (ctx != nullptr && ctx->root() != nullptr) {
+            ctx->root()->for_each_slot_id([&total_refs](SlotId id) { total_refs[id]++; });
         }
     }
     for (const auto& [rf_id, rf_desc] : _runtime_filter_collector.descriptors()) {
@@ -293,7 +299,6 @@ void ProjectNode::_push_down_offset_only_slots() {
     }
 
     if (!offset_only_slots.empty()) {
-        auto* scan_node = down_cast<OlapScanNode*>(_children[0]);
         scan_node->set_offset_only_slots(std::move(offset_only_slots));
     }
 }

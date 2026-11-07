@@ -410,6 +410,11 @@ Status OlapChunkSource::_init_reader_params(const std::vector<std::unique_ptr<Ol
     const bool reader_supports_offset_only = tablet_reader_supports_offset_only(
             _tablet->keys_type(), _params.skip_aggregation, _params.sorted_by_keys_per_tablet);
     if (reader_supports_offset_only) {
+        for (auto* expr : _scan_node->get_heavy_expr_ctxs()) {
+            if (expr != nullptr && expr->root() != nullptr) {
+                expr->root()->for_each_slot_id([&conjuncts_slot_ids](SlotId id) { conjuncts_slot_ids.insert(id); });
+            }
+        }
         const auto& offset_only_slots = _scan_node->offset_only_slots();
         const auto& non_pushdown_cids = _non_pushdown_pred_tree.column_ids();
         for (auto* slot : *_slots) {
