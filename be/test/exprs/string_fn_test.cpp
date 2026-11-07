@@ -1606,11 +1606,11 @@ PARALLEL_TEST(VecStringFunctionsTest, Utf8LengthAsciiFastPathTest) {
         };
         std::vector<TestCase> test_cases = {
                 {"", 0},
-                {"Привет", 6},             // Cyrillic (2-byte each, 12 bytes total)
-                {"αβγδε", 5},              // Greek (2-byte each, 10 bytes total)
-                {"你好世界", 4},           // Chinese (3-byte each, 12 bytes total)
-                {"こんにちは", 5},         // Japanese (3-byte each, 15 bytes total)
-                {"🚀🎉🦀💻", 4},   // Emojis (4-byte each, 16 bytes total)
+                {"Привет", 6},              // Cyrillic (2-byte each, 12 bytes total)
+                {"αβγδε", 5},               // Greek (2-byte each, 10 bytes total)
+                {"你好世界", 4},            // Chinese (3-byte each, 12 bytes total)
+                {"こんにちは", 5},          // Japanese (3-byte each, 15 bytes total)
+                {"🚀🎉🦀💻", 4},            // Emojis (4-byte each, 16 bytes total)
                 {"StarRocks 🚀 数据库", 15} // Mixed: 10 ascii + 1 emoji + 1 space + 3 cjk = 15
         };
         auto str = BinaryColumn::create();
@@ -1689,7 +1689,7 @@ PARALLEL_TEST(VecStringFunctionsTest, Utf8LengthAsciiFastPathTest) {
     // 6. Large buffer (> 4096 bytes) probing: all-ASCII, midpoint non-ASCII, tail non-ASCII, and interior non-ASCII
     {
         constexpr size_t kNumRows = 100;
-        const std::string ascii_row(64, 'x');                          // 6400 bytes total (> 4096)
+        const std::string ascii_row(64, 'x');                           // 6400 bytes total (> 4096)
         const std::string utf8_row = std::string(60, 'x') + "é" + "🚀"; // 60 + 2 + 4 = 66 bytes, 62 chars
 
         for (size_t non_ascii_idx : {size_t(0), kNumRows / 2, kNumRows - 1, size_t(10), kNumRows}) {
@@ -2863,6 +2863,191 @@ PARALLEL_TEST(VecStringFunctionsTest, replaceWithEmptyPattern) {
     ASSERT_TRUE(StringFunctions::replace_close(context,
                                                FunctionContext::FunctionContext::FunctionStateScope::FRAGMENT_LOCAL)
                         .ok());
+}
+
+PARALLEL_TEST(VecStringFunctionsTest, replaceEmptyAndNoMatchPatternWithNullableRepl) {
+    // Case 1: Constant empty pattern "" with a NullableColumn repl containing NULLs.
+    {
+        std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+        auto* context = ctx.get();
+
+        auto str = BinaryColumn::create();
+        str->append("yyyy-mm-dd");
+        str->append("*starrocks.");
+
+        auto ptn = ColumnHelper::create_const_column<TYPE_VARCHAR>("", 2);
+
+        auto rpl_data = BinaryColumn::create();
+        rpl_data->append("CHINA");
+        rpl_data->append("IGNORED");
+        auto rpl_null = NullColumn::create();
+        rpl_null->append(0);
+        rpl_null->append(1);
+        auto rpl = NullableColumn::create(std::move(rpl_data), std::move(rpl_null));
+
+        Columns columns{str, ptn, rpl};
+        context->set_constant_columns(columns);
+        ASSERT_TRUE(
+                StringFunctions::replace_prepare(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+
+        const auto result = StringFunctions::replace(context, columns).value();
+        ASSERT_EQ(result->size(), 2);
+        EXPECT_FALSE(result->is_null(0));
+        EXPECT_EQ("yyyy-mm-dd", result->get(0).get_slice().to_string());
+        EXPECT_TRUE(result->is_null(1));
+
+        ASSERT_TRUE(StringFunctions::replace_close(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+    }
+
+    // Case 2: Constant non-empty pattern that matches no row, with a NullableColumn repl containing NULLs.
+    {
+        std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+        auto* context = ctx.get();
+
+        auto str = BinaryColumn::create();
+        str->append("hello world");
+        str->append("starrocks db");
+
+        auto ptn = ColumnHelper::create_const_column<TYPE_VARCHAR>("MISSING_NEEDLE", 2);
+
+        auto rpl_data = BinaryColumn::create();
+        rpl_data->append("X");
+        rpl_data->append("Y");
+        auto rpl_null = NullColumn::create();
+        rpl_null->append(1);
+        rpl_null->append(0);
+        auto rpl = NullableColumn::create(std::move(rpl_data), std::move(rpl_null));
+
+        Columns columns{str, ptn, rpl};
+        context->set_constant_columns(columns);
+        ASSERT_TRUE(
+                StringFunctions::replace_prepare(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+
+        const auto result = StringFunctions::replace(context, columns).value();
+        ASSERT_EQ(result->size(), 2);
+        EXPECT_TRUE(result->is_null(0));
+        EXPECT_FALSE(result->is_null(1));
+        EXPECT_EQ("starrocks db", result->get(1).get_slice().to_string());
+
+        ASSERT_TRUE(StringFunctions::replace_close(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+    }
+}
+
+PARALLEL_TEST(VecStringFunctionsTest, replaceVarPatternConstNullAndConstRepl) {
+    // Subcase A: Variable pattern + constant only_null repl -> must return const null column.
+    {
+        std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+        auto* context = ctx.get();
+
+        auto str = BinaryColumn::create();
+        str->append("alpha beta");
+        str->append("gamma delta");
+
+        auto ptn = BinaryColumn::create();
+        ptn->append("alpha");
+        ptn->append("gamma");
+
+        ColumnPtr rpl = ColumnHelper::create_const_null_column(2);
+
+        Columns columns{str, ptn, rpl};
+        context->set_constant_columns(columns);
+        ASSERT_TRUE(
+                StringFunctions::replace_prepare(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+
+        const auto result = StringFunctions::replace(context, columns).value();
+        EXPECT_EQ(result->size(), 2);
+        EXPECT_TRUE(result->only_null());
+        EXPECT_TRUE(result->is_constant());
+
+        ASSERT_TRUE(StringFunctions::replace_close(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+    }
+
+    // Subcase B: Variable pattern + constant non-null repl (including empty pattern, same pattern==repl, and empty str).
+    {
+        std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+        auto* context = ctx.get();
+
+        auto str = BinaryColumn::create();
+        str->append("foo bar foo");
+        str->append("keep_unchanged");
+        str->append("same_token");
+        str->append("");
+
+        auto ptn = BinaryColumn::create();
+        ptn->append("foo");
+        ptn->append("");
+        ptn->append("X");
+        ptn->append("foo");
+
+        auto rpl = ColumnHelper::create_const_column<TYPE_VARCHAR>("X", 4);
+
+        Columns columns{str, ptn, rpl};
+        context->set_constant_columns(columns);
+        ASSERT_TRUE(
+                StringFunctions::replace_prepare(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+
+        const auto result = StringFunctions::replace(context, columns).value();
+        ASSERT_EQ(result->size(), 4);
+        EXPECT_EQ("X bar X", result->get(0).get_slice().to_string());
+        EXPECT_EQ("keep_unchanged", result->get(1).get_slice().to_string());
+        EXPECT_EQ("same_token", result->get(2).get_slice().to_string());
+        EXPECT_EQ("", result->get(3).get_slice().to_string());
+
+        ASSERT_TRUE(StringFunctions::replace_close(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+    }
+}
+
+PARALLEL_TEST(VecStringFunctionsTest, replaceEmbeddedNullBytes) {
+    const std::string raw_str("a\0b\0c\0b", 7);
+    const std::string raw_ptn("\0b", 2);
+    const std::string raw_rpl("\0X\0", 3);
+    const std::string expected("a\0X\0\0c\0X\0", 9);
+
+    // Const pattern and const repl
+    {
+        std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+        auto* context = ctx.get();
+
+        auto str = BinaryColumn::create();
+        str->append(Slice(raw_str));
+        auto ptn = ColumnHelper::create_const_column<TYPE_VARCHAR>(Slice(raw_ptn), 1);
+        auto rpl = ColumnHelper::create_const_column<TYPE_VARCHAR>(Slice(raw_rpl), 1);
+
+        Columns columns{str, ptn, rpl};
+        context->set_constant_columns(columns);
+        ASSERT_TRUE(
+                StringFunctions::replace_prepare(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+
+        const auto result = StringFunctions::replace(context, columns).value();
+        ASSERT_EQ(result->size(), 1);
+        EXPECT_EQ(expected, result->get(0).get_slice().to_string());
+
+        ASSERT_TRUE(StringFunctions::replace_close(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+    }
+
+    // Non-const pattern and non-const repl
+    {
+        std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+        auto* context = ctx.get();
+
+        auto str = BinaryColumn::create();
+        str->append(Slice(raw_str));
+        auto ptn = BinaryColumn::create();
+        ptn->append(Slice(raw_ptn));
+        auto rpl = BinaryColumn::create();
+        rpl->append(Slice(raw_rpl));
+
+        Columns columns{str, ptn, rpl};
+        context->set_constant_columns(columns);
+        ASSERT_TRUE(
+                StringFunctions::replace_prepare(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+
+        const auto result = StringFunctions::replace(context, columns).value();
+        ASSERT_EQ(result->size(), 1);
+        EXPECT_EQ(expected, result->get(0).get_slice().to_string());
+
+        ASSERT_TRUE(StringFunctions::replace_close(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+    }
 }
 
 PARALLEL_TEST(VecStringFunctionsTest, moneyFormatDouble) {
