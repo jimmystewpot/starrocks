@@ -3339,6 +3339,14 @@ public class Config extends ConfigBase {
             "<= 0 disables the cleanup.")
     public static long connector_table_analyze_dropped_partition_stats_grace_second = 86400; // default 1 day
 
+    // The cleanup above only runs at the end of a collection, so a partition dropped after the table's last
+    // collection (or still inside the grace at it) keeps its statistics until the next one. The leader also runs
+    // the same cleanup periodically, at most once per this interval, over a bounded number of tables per round.
+    @ConfField(mutable = true, comment = "Interval at which the leader FE periodically deletes the column " +
+            "statistics of dropped partitions of external tables, independent of collections; <= 0 disables " +
+            "the periodic cleanup.")
+    public static long connector_table_analyze_dropped_partition_stats_cleanup_interval_second = 3600;
+
     /**
      * If set to true, Planner will try to select replica of tablet on same host as this Frontend.
      * This may reduce network transmission in following case:
@@ -4192,6 +4200,14 @@ public class Config extends ConfigBase {
     @ConfField(mutable = true, comment = "disable table or partition compaction, format:'id1;id2'",
             aliases = {"lake_compaction_disable_tables"})
     public static String lake_compaction_disable_ids = "";
+
+    @ConfField(mutable = true, acceptEmpty = true, comment = "Compaction admission mode: NORMAL ignores the allowlist; " +
+            "ALLOWLIST only allows tables in lake_compaction_allow_table_ids.")
+    public static String lake_compaction_admission_mode = "NORMAL";
+
+    @ConfField(mutable = true, comment = "Table IDs allowed to compact in ALLOWLIST mode, format:'id1;id2'. " +
+            "An empty string allows no tables. lake_compaction_disable_ids takes precedence.")
+    public static String lake_compaction_allow_table_ids = "";
 
     @ConfField(mutable = true, comment = "partitions which can be vacuumed immediately, test only, format:'id1;id2'")
     public static String lake_vacuum_immediately_partition_ids = "";
