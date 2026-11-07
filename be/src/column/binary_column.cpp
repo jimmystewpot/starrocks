@@ -18,6 +18,7 @@
 
 #include "base/container/raw_container.h"
 #include "base/hash/hash_util.hpp"
+#include "base/simd/simd.h"
 #include "column/bytes.h"
 #include "column/mysql_row_buffer.h"
 #include "column/vectorized_fwd.h"
