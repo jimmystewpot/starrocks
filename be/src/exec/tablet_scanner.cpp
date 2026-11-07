@@ -183,9 +183,8 @@ Status TabletScanner::_init_reader_params(const std::vector<OlapScanRange*>* key
     GlobalDictPredicatesRewriter not_pushdown_predicate_rewriter(*_params.global_dictmaps);
     RETURN_IF_ERROR(not_pushdown_predicate_rewriter.rewrite_predicate(&_pool, _pred_tree));
 
-    const bool reader_supports_offset_only =
-            (_tablet->keys_type() == DUP_KEYS || _tablet->keys_type() == PRIMARY_KEYS || _params.skip_aggregation) &&
-            !_params.sorted_by_keys_per_tablet;
+    const bool reader_supports_offset_only = tablet_reader_supports_offset_only(
+            _tablet->keys_type(), _params.skip_aggregation, _params.sorted_by_keys_per_tablet);
     if (reader_supports_offset_only && _parent != nullptr && _parent->_tuple_desc != nullptr) {
         std::unordered_set<SlotId> conjuncts_slot_ids;
         for (auto* expr : _conjunct_ctxs) {

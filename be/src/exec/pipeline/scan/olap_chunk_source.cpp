@@ -407,9 +407,8 @@ Status OlapChunkSource::_init_reader_params(const std::vector<std::unique_ptr<Ol
         RETURN_IF_ERROR(not_pushdown_predicate_rewriter.rewrite_predicate(&_obj_pool, _non_pushdown_pred_tree));
     }
 
-    const bool reader_supports_offset_only =
-            (_tablet->keys_type() == DUP_KEYS || _tablet->keys_type() == PRIMARY_KEYS || _params.skip_aggregation) &&
-            !_params.sorted_by_keys_per_tablet;
+    const bool reader_supports_offset_only = tablet_reader_supports_offset_only(
+            _tablet->keys_type(), _params.skip_aggregation, _params.sorted_by_keys_per_tablet);
     if (reader_supports_offset_only) {
         const auto& offset_only_slots = _scan_node->offset_only_slots();
         const auto& non_pushdown_cids = _non_pushdown_pred_tree.column_ids();
