@@ -242,6 +242,182 @@ inline const char* skip_trailing_char(const char* begin, const char* end, char c
     return p;
 }
 
+template <bool Simd = true>
+inline const char* skip_leading_byteset(const char* begin, const char* end, const ByteSet& set) noexcept {
+    if (begin == nullptr || begin >= end) {
+        return begin;
+    }
+    const char* p = begin;
+    if constexpr (Simd) {
+        if (set.exact_nibble_lut) {
+#if defined(__AVX2__)
+            if (static_cast<size_t>(end - p) >= 16) {
+                const __m128i low128 = _mm_load_si128(reinterpret_cast<const __m128i*>(set.low_nibble_lut));
+                const __m128i high128 = _mm_load_si128(reinterpret_cast<const __m128i*>(set.high_nibble_lut));
+                if (static_cast<size_t>(end - p) >= 32) {
+                    const __m256i low_lut = _mm256_broadcastsi128_si256(low128);
+                    const __m256i high_lut = _mm256_broadcastsi128_si256(high128);
+                    const __m256i mask_0f = _mm256_set1_epi8(0x0F);
+                    const __m256i zero = _mm256_setzero_si256();
+                    do {
+                        const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+                        const __m256i lo = _mm256_and_si256(v, mask_0f);
+                        const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), mask_0f);
+                        const __m256i match =
+                                _mm256_and_si256(_mm256_shuffle_epi8(low_lut, lo), _mm256_shuffle_epi8(high_lut, hi));
+                        const uint32_t keep_mask =
+                                static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(match, zero)));
+                        if (keep_mask != 0) {
+                            return p + __builtin_ctz(keep_mask);
+                        }
+                        p += 32;
+                    } while (static_cast<size_t>(end - p) >= 32);
+                }
+                if (static_cast<size_t>(end - p) >= 16) {
+                    const __m128i mask_0f = _mm_set1_epi8(0x0F);
+                    const __m128i zero128 = _mm_setzero_si128();
+                    const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
+                    const __m128i lo = _mm_and_si128(v, mask_0f);
+                    const __m128i hi = _mm_and_si128(_mm_srli_epi16(v, 4), mask_0f);
+                    const __m128i match = _mm_and_si128(_mm_shuffle_epi8(low128, lo), _mm_shuffle_epi8(high128, hi));
+                    const uint32_t keep_mask = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(match, zero128)));
+                    if (keep_mask != 0) {
+                        return p + __builtin_ctz(keep_mask);
+                    }
+                    p += 16;
+                }
+            }
+#elif defined(__SSSE3__)
+            if (static_cast<size_t>(end - p) >= 16) {
+                const __m128i low128 = _mm_load_si128(reinterpret_cast<const __m128i*>(set.low_nibble_lut));
+                const __m128i high128 = _mm_load_si128(reinterpret_cast<const __m128i*>(set.high_nibble_lut));
+                const __m128i mask_0f = _mm_set1_epi8(0x0F);
+                const __m128i zero128 = _mm_setzero_si128();
+                do {
+                    const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
+                    const __m128i lo = _mm_and_si128(v, mask_0f);
+                    const __m128i hi = _mm_and_si128(_mm_srli_epi16(v, 4), mask_0f);
+                    const __m128i match = _mm_and_si128(_mm_shuffle_epi8(low128, lo), _mm_shuffle_epi8(high128, hi));
+                    const uint32_t keep_mask = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(match, zero128)));
+                    if (keep_mask != 0) {
+                        return p + __builtin_ctz(keep_mask);
+                    }
+                    p += 16;
+                } while (static_cast<size_t>(end - p) >= 16);
+            }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+            if (static_cast<size_t>(end - p) >= 16) {
+                const uint8x16_t low_lut = vld1q_u8(set.low_nibble_lut);
+                const uint8x16_t high_lut = vld1q_u8(set.high_nibble_lut);
+                const uint8x16_t mask_0f = vdupq_n_u8(0x0F);
+                do {
+                    const uint8x16_t v = vld1q_u8(reinterpret_cast<const uint8_t*>(p));
+                    const uint8x16_t lo = vandq_u8(v, mask_0f);
+                    const uint8x16_t hi = vshrq_n_u8(v, 4);
+                    const uint8x16_t in_set = vtstq_u8(vqtbl1q_u8(low_lut, lo), vqtbl1q_u8(high_lut, hi));
+                    const uint64_t keep_mask = ~SIMD::get_nibble_mask(in_set);
+                    if (keep_mask != 0) {
+                        return p + (__builtin_ctzll(keep_mask) >> 2);
+                    }
+                    p += 16;
+                } while (static_cast<size_t>(end - p) >= 16);
+            }
+#endif
+        }
+    }
+    for (; p < end && set.contains(static_cast<uint8_t>(*p)); ++p) {
+    }
+    return p;
+}
+
+template <bool Simd = true>
+inline const char* skip_trailing_byteset(const char* begin, const char* end, const ByteSet& set) noexcept {
+    if (begin == nullptr || begin >= end) {
+        return end;
+    }
+    const char* p = end;
+    if constexpr (Simd) {
+        if (set.exact_nibble_lut) {
+#if defined(__AVX2__)
+            if (static_cast<size_t>(p - begin) >= 16) {
+                const __m128i low128 = _mm_load_si128(reinterpret_cast<const __m128i*>(set.low_nibble_lut));
+                const __m128i high128 = _mm_load_si128(reinterpret_cast<const __m128i*>(set.high_nibble_lut));
+                if (static_cast<size_t>(p - begin) >= 32) {
+                    const __m256i low_lut = _mm256_broadcastsi128_si256(low128);
+                    const __m256i high_lut = _mm256_broadcastsi128_si256(high128);
+                    const __m256i mask_0f = _mm256_set1_epi8(0x0F);
+                    const __m256i zero = _mm256_setzero_si256();
+                    do {
+                        const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p - 32));
+                        const __m256i lo = _mm256_and_si256(v, mask_0f);
+                        const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), mask_0f);
+                        const __m256i match =
+                                _mm256_and_si256(_mm256_shuffle_epi8(low_lut, lo), _mm256_shuffle_epi8(high_lut, hi));
+                        const uint32_t keep_mask =
+                                static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(match, zero)));
+                        if (keep_mask != 0) {
+                            return p - __builtin_clz(keep_mask);
+                        }
+                        p -= 32;
+                    } while (static_cast<size_t>(p - begin) >= 32);
+                }
+                if (static_cast<size_t>(p - begin) >= 16) {
+                    const __m128i mask_0f = _mm_set1_epi8(0x0F);
+                    const __m128i zero128 = _mm_setzero_si128();
+                    const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p - 16));
+                    const __m128i lo = _mm_and_si128(v, mask_0f);
+                    const __m128i hi = _mm_and_si128(_mm_srli_epi16(v, 4), mask_0f);
+                    const __m128i match = _mm_and_si128(_mm_shuffle_epi8(low128, lo), _mm_shuffle_epi8(high128, hi));
+                    const uint32_t keep_mask = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(match, zero128)));
+                    if (keep_mask != 0) {
+                        return (p - 16) + (32 - __builtin_clz(keep_mask));
+                    }
+                    p -= 16;
+                }
+            }
+#elif defined(__SSSE3__)
+            if (static_cast<size_t>(p - begin) >= 16) {
+                const __m128i low128 = _mm_load_si128(reinterpret_cast<const __m128i*>(set.low_nibble_lut));
+                const __m128i high128 = _mm_load_si128(reinterpret_cast<const __m128i*>(set.high_nibble_lut));
+                const __m128i mask_0f = _mm_set1_epi8(0x0F);
+                const __m128i zero128 = _mm_setzero_si128();
+                do {
+                    const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p - 16));
+                    const __m128i lo = _mm_and_si128(v, mask_0f);
+                    const __m128i hi = _mm_and_si128(_mm_srli_epi16(v, 4), mask_0f);
+                    const __m128i match = _mm_and_si128(_mm_shuffle_epi8(low128, lo), _mm_shuffle_epi8(high128, hi));
+                    const uint32_t keep_mask = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(match, zero128)));
+                    if (keep_mask != 0) {
+                        return (p - 16) + (32 - __builtin_clz(keep_mask));
+                    }
+                    p -= 16;
+                } while (static_cast<size_t>(p - begin) >= 16);
+            }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+            if (static_cast<size_t>(p - begin) >= 16) {
+                const uint8x16_t low_lut = vld1q_u8(set.low_nibble_lut);
+                const uint8x16_t high_lut = vld1q_u8(set.high_nibble_lut);
+                const uint8x16_t mask_0f = vdupq_n_u8(0x0F);
+                do {
+                    const uint8x16_t v = vld1q_u8(reinterpret_cast<const uint8_t*>(p - 16));
+                    const uint8x16_t lo = vandq_u8(v, mask_0f);
+                    const uint8x16_t hi = vshrq_n_u8(v, 4);
+                    const uint8x16_t in_set = vtstq_u8(vqtbl1q_u8(low_lut, lo), vqtbl1q_u8(high_lut, hi));
+                    const uint64_t keep_mask = ~SIMD::get_nibble_mask(in_set);
+                    if (keep_mask != 0) {
+                        return p - (__builtin_clzll(keep_mask) >> 2);
+                    }
+                    p -= 16;
+                } while (static_cast<size_t>(p - begin) >= 16);
+            }
+#endif
+        }
+    }
+    for (; p > begin && set.contains(static_cast<uint8_t>(*(p - 1))); --p) {
+    }
+    return p;
+}
+
 // Removes the leading and trailing ASCII spaces (0x20) of `str` and returns the remaining
 // substring, which still points into the buffer owned by the caller.
 //
