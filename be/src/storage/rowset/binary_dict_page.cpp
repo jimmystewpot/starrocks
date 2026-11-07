@@ -204,6 +204,7 @@ Status BinaryDictPageDecoder<Type>::init() {
     } else if (_encoding_type == PLAIN_ENCODING) {
         DCHECK_EQ(_encoding_type, PLAIN_ENCODING);
         _data_page_decoder.reset(new BinaryPlainPageDecoder<Type>(_data));
+        _data_page_decoder->set_offset_only(_offset_only);
     } else {
         LOG(WARNING) << "invalid encoding type:" << _encoding_type;
         return Status::Corruption(strings::Substitute("invalid encoding type:$0", _encoding_type));
@@ -256,6 +257,36 @@ Status BinaryDictPageDecoder<Type>::next_batch(const SparseRange<>& range, Colum
     RETURN_IF_ERROR(_vec_code_buf->accept(&visitor));
     const auto* codewords = reinterpret_cast<const cast_type*>(visitor.result());
 
+    if constexpr (Type == TYPE_VARCHAR) {
+        auto* data_col = ColumnHelper::get_data_column(dst);
+        auto* binary_col = down_cast<BinaryColumn*>(data_col);
+        if (_offset_only || binary_col->is_offset_only()) {
+            binary_col->set_offset_only(true);
+            auto& offsets = binary_col->get_offset();
+            const size_t prev_num_offsets = offsets.size();
+            const uint64_t dst_begin = offsets.back();
+            uint64_t cur_offset = dst_begin;
+            for (size_t i = 0; i < nread; ++i) {
+                cur_offset += _dict_decoder->string_length_at_index(codewords[i]);
+            }
+            offsets.resize_uninitialized(prev_num_offsets + nread, cur_offset);
+            offsets.visit_storage([&](auto& dst_buf) {
+                using DstValue = typename std::decay_t<decltype(dst_buf)>::value_type;
+                auto* __restrict dst_offsets = dst_buf.data() + prev_num_offsets;
+                uint64_t running = dst_begin;
+                for (size_t i = 0; i < nread; ++i) {
+                    running += _dict_decoder->string_length_at_index(codewords[i]);
+                    dst_offsets[i] = static_cast<DstValue>(running);
+                }
+            });
+            if (dst->is_nullable()) {
+                auto& null_data = down_cast<NullableColumn*>(dst)->null_column_data();
+                null_data.resize(null_data.size() + nread, 0);
+            }
+            return Status::OK();
+        }
+    }
+
     static_assert(sizeof(Slice) == sizeof(int128_t));
     auto slices_data = std::make_unique_for_overwrite<uint8_t[]>(nread * sizeof(Slice));
     Slice* slices = reinterpret_cast<Slice*>(slices_data.get());
@@ -291,6 +322,13 @@ Status BinaryDictPageDecoder<Type>::next_batch_with_filter(
     DCHECK(_parsed);
     DCHECK(_dict_decoder != nullptr) << "dict decoder pointer is nullptr";
     DCHECK(null_data == nullptr || column->is_nullable());
+    if constexpr (Type == TYPE_VARCHAR) {
+        auto* data_col = ColumnHelper::get_data_column(column);
+        auto* binary_col = down_cast<BinaryColumn*>(data_col);
+        if (_offset_only || binary_col->is_offset_only()) {
+            binary_col->set_offset_only(true);
+        }
+    }
 
     // caller must make sure SparseRange's ranges are all in the same page
     size_t num_rows = range.span_size();
@@ -436,6 +474,36 @@ Status BinaryDictPageDecoder<Type>::read_by_rowids(const ordinal_t first_ordinal
     RawDataVisitor visitor;
     RETURN_IF_ERROR(_vec_code_buf->accept(&visitor));
     const auto* codewords = reinterpret_cast<const cast_type*>(visitor.result());
+    if constexpr (Type == TYPE_VARCHAR) {
+        auto* data_col = ColumnHelper::get_data_column(column);
+        auto* binary_col = down_cast<BinaryColumn*>(data_col);
+        if (_offset_only || binary_col->is_offset_only()) {
+            binary_col->set_offset_only(true);
+            auto& offsets = binary_col->get_offset();
+            const size_t prev_num_offsets = offsets.size();
+            const uint64_t dst_begin = offsets.back();
+            uint64_t cur_offset = dst_begin;
+            for (size_t i = 0; i < read_count; ++i) {
+                cur_offset += _dict_decoder->string_length_at_index(codewords[i]);
+            }
+            offsets.resize_uninitialized(prev_num_offsets + read_count, cur_offset);
+            offsets.visit_storage([&](auto& dst_buf) {
+                using DstValue = typename std::decay_t<decltype(dst_buf)>::value_type;
+                auto* __restrict dst_offsets = dst_buf.data() + prev_num_offsets;
+                uint64_t running = dst_begin;
+                for (size_t i = 0; i < read_count; ++i) {
+                    running += _dict_decoder->string_length_at_index(codewords[i]);
+                    dst_offsets[i] = static_cast<DstValue>(running);
+                }
+            });
+            if (column->is_nullable()) {
+                auto& null_data = down_cast<NullableColumn*>(column)->null_column_data();
+                null_data.resize(null_data.size() + read_count, 0);
+            }
+            *count = read_count;
+            return Status::OK();
+        }
+    }
     auto slices_data = std::make_unique_for_overwrite<uint8_t[]>(read_count * sizeof(Slice));
     Slice* slices = reinterpret_cast<Slice*>(slices_data.get());
     if constexpr (Type == TYPE_CHAR) {
@@ -500,7 +568,12 @@ void BinaryDictPageDecoder<Type>::reserve_col(size_t n, Column* column) {
 
     if (data_col->is_binary()) {
         BinaryColumn* binary_col = down_cast<BinaryColumn*>(data_col);
-        binary_col->reserve(n, estimated_row_size * n);
+        if (_offset_only || binary_col->is_offset_only()) {
+            binary_col->set_offset_only(true);
+            binary_col->reserve(n);
+        } else {
+            binary_col->reserve(n, estimated_row_size * n);
+        }
     }
 }
 
