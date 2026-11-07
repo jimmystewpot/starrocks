@@ -28,6 +28,9 @@ namespace starrocks {
 
 static inline Slice substring_index_slice(const Slice& haystack, const Slice& delimiter, const StringSearcher& searcher,
                                           int32_t part_number) {
+    DCHECK_GT(delimiter.size, 0);
+    DCHECK_NE(part_number, 0);
+
     const char* const begin = haystack.data;
     const char* const end = begin + haystack.size;
 
@@ -79,7 +82,7 @@ static inline Slice substring_index_slice(const Slice& haystack, const Slice& de
  * @paramType: [BinaryColumn, BinaryColumn, IntColumn]
  * @return: BinaryColumn
  */
-StatusOr<ColumnPtr> StringFunctions::substring_index(FunctionContext* context, const starrocks::Columns& columns) {
+StatusOr<ColumnPtr> StringFunctions::substring_index(FunctionContext* /*context*/, const starrocks::Columns& columns) {
     DCHECK_EQ(columns.size(), 3);
     RETURN_IF_COLUMNS_ONLY_NULL(columns);
 

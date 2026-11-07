@@ -1217,6 +1217,25 @@ PARALLEL_TEST(VecStringFunctionsTest, splitPartEdgeCasesAndColumnModesTest) {
         EXPECT_EQ("", v->get_slice(1).to_string());
         EXPECT_EQ("h", v->get_slice(2).to_string());
     }
+
+    // 4. Constant haystack + constant delimiter + vector part_number (ColumnViewer fallback with hoisted searcher)
+    {
+        ColumnPtr str_col = ColumnHelper::create_const_column<TYPE_VARCHAR>("a.b.c", 4);
+        ColumnPtr delim_col = ColumnHelper::create_const_column<TYPE_VARCHAR>(".", 4);
+        auto field_col = Int32Column::create();
+        field_col->append(-2);
+        field_col->append(-1);
+        field_col->append(1);
+        field_col->append(2);
+
+        ColumnPtr res = StringFunctions::split_part(ctx.get(), {str_col, delim_col, field_col}).value();
+        ASSERT_FALSE(res->is_nullable());
+        auto v = ColumnHelper::as_column<BinaryColumn>(res);
+        EXPECT_EQ("b", v->get_slice(0).to_string());
+        EXPECT_EQ("c", v->get_slice(1).to_string());
+        EXPECT_EQ("a", v->get_slice(2).to_string());
+        EXPECT_EQ("b", v->get_slice(3).to_string());
+    }
 }
 
 PARALLEL_TEST(VecStringFunctionsTest, substringIndexTest) {
@@ -1361,6 +1380,121 @@ PARALLEL_TEST(VecStringFunctionsTest, substringIndexTest) {
         EXPECT_TRUE(res1->only_null());
         ColumnPtr res2 = StringFunctions::substring_index(ctx.get(), {str, valid_delim, zero_field}).value();
         EXPECT_TRUE(res2->only_null());
+    }
+
+    // 4. NullableColumn haystack with constant delimiter and constant part_number (positive & negative)
+    for (int32_t part : {2, -2}) {
+        auto str_data = BinaryColumn::create();
+        auto str_null = NullColumn::create();
+        str_data->append("com.mysql.com");
+        str_null->append(0);
+        str_data->append("ignored.null.row");
+        str_null->append(1);
+        str_data->append("a.b.c");
+        str_null->append(0);
+
+        ColumnPtr str_col = NullableColumn::create(str_data, str_null);
+        ColumnPtr delim_col = ColumnHelper::create_const_column<TYPE_VARCHAR>(".", 3);
+        ColumnPtr field_col = ColumnHelper::create_const_column<TYPE_INT>(part, 3);
+
+        ColumnPtr res = StringFunctions::substring_index(ctx.get(), {str_col, delim_col, field_col}).value();
+        ASSERT_TRUE(res->is_nullable());
+        EXPECT_FALSE(res->is_null(0));
+        EXPECT_TRUE(res->is_null(1));
+        EXPECT_FALSE(res->is_null(2));
+        if (part == 2) {
+            EXPECT_EQ("com.mysql", res->get(0).get<Slice>().to_string());
+            EXPECT_EQ("a.b", res->get(2).get<Slice>().to_string());
+        } else {
+            EXPECT_EQ("mysql.com", res->get(0).get<Slice>().to_string());
+            EXPECT_EQ("b.c", res->get(2).get<Slice>().to_string());
+        }
+    }
+
+    // 5. NullableColumn inputs with non-constant part_number (both constant delimiter and non-constant delimiter)
+    {
+        auto str_data = BinaryColumn::create();
+        auto str_null = NullColumn::create();
+        auto delim_data = BinaryColumn::create();
+        auto delim_null = NullColumn::create();
+        auto field_data = Int32Column::create();
+        auto field_null = NullColumn::create();
+
+        // Row 0: valid
+        str_data->append("com.mysql.com");
+        str_null->append(0);
+        delim_data->append(".");
+        delim_null->append(0);
+        field_data->append(-2);
+        field_null->append(0);
+
+        // Row 1: str is NULL
+        str_data->append("com.mysql.com");
+        str_null->append(1);
+        delim_data->append(".");
+        delim_null->append(0);
+        field_data->append(2);
+        field_null->append(0);
+
+        // Row 2: delim is NULL
+        str_data->append("com.mysql.com");
+        str_null->append(0);
+        delim_data->append(".");
+        delim_null->append(1);
+        field_data->append(2);
+        field_null->append(0);
+
+        // Row 3: field is NULL
+        str_data->append("com.mysql.com");
+        str_null->append(0);
+        delim_data->append(".");
+        delim_null->append(0);
+        field_data->append(2);
+        field_null->append(1);
+
+        ColumnPtr str_col = NullableColumn::create(str_data, str_null);
+        ColumnPtr delim_col = NullableColumn::create(delim_data, delim_null);
+        ColumnPtr field_col = NullableColumn::create(field_data, field_null);
+
+        // 5a: Direct BinaryColumn path with constant delimiter and nullable str + nullable non-constant field
+        ColumnPtr const_delim = ColumnHelper::create_const_column<TYPE_VARCHAR>(".", 4);
+        ColumnPtr res_const_delim =
+                StringFunctions::substring_index(ctx.get(), {str_col, const_delim, field_col}).value();
+        ASSERT_TRUE(res_const_delim->is_nullable());
+        EXPECT_FALSE(res_const_delim->is_null(0));
+        EXPECT_EQ("mysql.com", res_const_delim->get(0).get<Slice>().to_string());
+        EXPECT_TRUE(res_const_delim->is_null(1));
+        EXPECT_FALSE(res_const_delim->is_null(2));
+        EXPECT_EQ("com.mysql", res_const_delim->get(2).get<Slice>().to_string());
+        EXPECT_TRUE(res_const_delim->is_null(3));
+
+        // 5b: General ColumnViewer fallback path with nullable str, nullable delim, and nullable field
+        ColumnPtr res_var_delim = StringFunctions::substring_index(ctx.get(), {str_col, delim_col, field_col}).value();
+        ASSERT_TRUE(res_var_delim->is_nullable());
+        EXPECT_FALSE(res_var_delim->is_null(0));
+        EXPECT_EQ("mysql.com", res_var_delim->get(0).get<Slice>().to_string());
+        EXPECT_TRUE(res_var_delim->is_null(1));
+        EXPECT_TRUE(res_var_delim->is_null(2));
+        EXPECT_TRUE(res_var_delim->is_null(3));
+    }
+
+    // 6. Constant haystack + constant delimiter + vector part_number (ColumnViewer fallback with hoisted searcher)
+    {
+        ColumnPtr str_col = ColumnHelper::create_const_column<TYPE_VARCHAR>("a.b.c", 4);
+        ColumnPtr delim_col = ColumnHelper::create_const_column<TYPE_VARCHAR>(".", 4);
+        auto field_col = Int32Column::create();
+        field_col->append(-2);
+        field_col->append(-1);
+        field_col->append(1);
+        field_col->append(2);
+
+        ColumnPtr res = StringFunctions::substring_index(ctx.get(), {str_col, delim_col, field_col}).value();
+        ASSERT_FALSE(res->is_nullable());
+        auto v = ColumnHelper::as_column<BinaryColumn>(res);
+        EXPECT_EQ("b.c", v->get_slice(0).to_string());
+        EXPECT_EQ("c", v->get_slice(1).to_string());
+        EXPECT_EQ("a", v->get_slice(2).to_string());
+        EXPECT_EQ("a.b", v->get_slice(3).to_string());
     }
 }
 

@@ -106,7 +106,7 @@ static inline Slice split_part_slice(const Slice& haystack, const Slice& delimit
  * @paramType: [BinaryColumn, BinaryColumn, IntColumn]
  * @return: BinaryColumn
  */
-StatusOr<ColumnPtr> StringFunctions::split_part(FunctionContext* context, const starrocks::Columns& columns) {
+StatusOr<ColumnPtr> StringFunctions::split_part(FunctionContext* /*context*/, const starrocks::Columns& columns) {
     DCHECK_EQ(columns.size(), 3);
 
     const size_t size = columns[0]->size();
