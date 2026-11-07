@@ -90,6 +90,15 @@ TEST(ByteSetTest, EmptyAndSingleByte) {
         EXPECT_EQ(expected, nul.contains(byte)) << "b=" << b;
         EXPECT_EQ(expected, nul.nibble_matches(byte)) << "b=" << b;
     }
+
+    ByteSet cleared = space;
+    cleared.clear();
+    EXPECT_TRUE(cleared.exact_nibble_lut);
+    for (int b = 0; b < 256; ++b) {
+        const auto byte = static_cast<uint8_t>(b);
+        EXPECT_FALSE(cleared.contains(byte)) << "b=" << b;
+        EXPECT_FALSE(cleared.nibble_matches(byte)) << "b=" << b;
+    }
 }
 
 TEST(ByteSetTest, AsciiSubsetsHaveZeroFalsePositives) {
