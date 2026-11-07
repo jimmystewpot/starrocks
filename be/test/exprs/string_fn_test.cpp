@@ -1069,6 +1069,156 @@ PARALLEL_TEST(VecStringFunctionsTest, splitPart) {
     ASSERT_EQ("8日", v->get(28).get<Slice>().to_string());
 }
 
+PARALLEL_TEST(VecStringFunctionsTest, splitPartEdgeCasesAndColumnModesTest) {
+    std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+
+    // 1. Non-constant part_number with empty delimiter "" (including part_number == 0, < 0, INT32_MIN, > 0)
+    {
+        auto str = BinaryColumn::create();
+        auto delim = BinaryColumn::create();
+        auto field = Int32Column::create();
+
+        // part_number == 0 with empty delimiter must return "" (not first char!)
+        str->append("abc");
+        delim->append("");
+        field->append(0);
+
+        // part_number < 0 with empty delimiter returns ""
+        str->append("abc");
+        delim->append("");
+        field->append(-1);
+
+        // INT32_MIN with non-empty and empty delimiter must not UB and must return ""
+        str->append("a,b,c");
+        delim->append(",");
+        field->append(std::numeric_limits<int32_t>::min());
+
+        // Overlapping multi-byte delimiter "##" on "abc###123###234" for negative part_number
+        // Forward parts of "abc###123###234" by "##": ["abc", "#123", "#234"]
+        // Reverse parts of "abc###123###234" by "##":
+        // -1 -> "234" (after last "##" at index 10)
+        // -2 -> "123#" (between "##" at index 4 and "##" at index 10)
+        // -3 -> "abc#" (before "##" at index 4)
+        // -4 -> "" (only 3 parts exist)
+        str->append("abc###123###234");
+        delim->append("##");
+        field->append(-1);
+
+        str->append("abc###123###234");
+        delim->append("##");
+        field->append(-2);
+
+        str->append("abc###123###234");
+        delim->append("##");
+        field->append(-3);
+
+        str->append("abc###123###234");
+        delim->append("##");
+        field->append(-4);
+
+        // Embedded NUL bytes with multi-byte delimiter in forward and reverse scan
+        str->append(Slice("a\0b::c\0d::e\0f", 13));
+        delim->append("::");
+        field->append(2);
+
+        str->append(Slice("a\0b::c\0d::e\0f", 13));
+        delim->append("::");
+        field->append(-2);
+
+        // No delimiter match with part_number == 1 and -1 returns full string; other parts return ""
+        str->append("nodelim");
+        delim->append("::");
+        field->append(-1);
+
+        str->append("nodelim");
+        delim->append("::");
+        field->append(-2);
+
+        Columns cols{str, delim, field};
+        ColumnPtr res = StringFunctions::split_part(ctx.get(), cols).value();
+        ASSERT_FALSE(res->is_nullable());
+        auto v = ColumnHelper::as_column<BinaryColumn>(res);
+        EXPECT_EQ("", v->get_slice(0).to_string());
+        EXPECT_EQ("", v->get_slice(1).to_string());
+        EXPECT_EQ("", v->get_slice(2).to_string());
+        EXPECT_EQ("234", v->get_slice(3).to_string());
+        EXPECT_EQ("123#", v->get_slice(4).to_string());
+        EXPECT_EQ("abc#", v->get_slice(5).to_string());
+        EXPECT_EQ("", v->get_slice(6).to_string());
+        EXPECT_EQ(std::string("c\0d", 3), v->get_slice(7).to_string());
+        EXPECT_EQ(std::string("c\0d", 3), v->get_slice(8).to_string());
+        EXPECT_EQ("nodelim", v->get_slice(9).to_string());
+        EXPECT_EQ("", v->get_slice(10).to_string());
+    }
+
+    // 2. Direct BinaryColumn fast path with constant multi-byte delimiter (long strings > 32B for SIMD)
+    for (int32_t part : {1, 2, 3, 4, -1, -2, -3, -4}) {
+        auto str = BinaryColumn::create();
+        str->append("prefix_0123456789abcdef<==>middle_0123456789abcdef<==>suffix_0123456789abcdef");
+        str->append("short<==>two");
+        str->append("no_match_at_all_0123456789abcdefghijklmnopqrstuvwxyz");
+        ColumnPtr delim = ColumnHelper::create_const_column<TYPE_VARCHAR>("<==>", 3);
+        ColumnPtr field = ColumnHelper::create_const_column<TYPE_INT>(part, 3);
+
+        ColumnPtr res = StringFunctions::split_part(ctx.get(), {str, delim, field}).value();
+        ASSERT_FALSE(res->is_nullable());
+        auto v = ColumnHelper::as_column<BinaryColumn>(res);
+        if (part == 1) {
+            EXPECT_EQ("prefix_0123456789abcdef", v->get_slice(0).to_string());
+            EXPECT_EQ("short", v->get_slice(1).to_string());
+            EXPECT_EQ("no_match_at_all_0123456789abcdefghijklmnopqrstuvwxyz", v->get_slice(2).to_string());
+        } else if (part == 2) {
+            EXPECT_EQ("middle_0123456789abcdef", v->get_slice(0).to_string());
+            EXPECT_EQ("two", v->get_slice(1).to_string());
+            EXPECT_EQ("", v->get_slice(2).to_string());
+        } else if (part == 3) {
+            EXPECT_EQ("suffix_0123456789abcdef", v->get_slice(0).to_string());
+            EXPECT_EQ("", v->get_slice(1).to_string());
+            EXPECT_EQ("", v->get_slice(2).to_string());
+        } else if (part == 4 || part == -4) {
+            EXPECT_EQ("", v->get_slice(0).to_string());
+            EXPECT_EQ("", v->get_slice(1).to_string());
+            EXPECT_EQ("", v->get_slice(2).to_string());
+        } else if (part == -1) {
+            EXPECT_EQ("suffix_0123456789abcdef", v->get_slice(0).to_string());
+            EXPECT_EQ("two", v->get_slice(1).to_string());
+            EXPECT_EQ("no_match_at_all_0123456789abcdefghijklmnopqrstuvwxyz", v->get_slice(2).to_string());
+        } else if (part == -2) {
+            EXPECT_EQ("middle_0123456789abcdef", v->get_slice(0).to_string());
+            EXPECT_EQ("short", v->get_slice(1).to_string());
+            EXPECT_EQ("", v->get_slice(2).to_string());
+        } else if (part == -3) {
+            EXPECT_EQ("prefix_0123456789abcdef", v->get_slice(0).to_string());
+            EXPECT_EQ("", v->get_slice(1).to_string());
+            EXPECT_EQ("", v->get_slice(2).to_string());
+        }
+    }
+
+    // 3. Nullable input columns: split_part is in alwaysReturnNonNullableFunctions and must return
+    // non-nullable BinaryColumn with "" for null rows.
+    {
+        auto str_data = BinaryColumn::create();
+        auto str_null = NullColumn::create();
+        str_data->append("a,b,c");
+        str_null->append(0);
+        str_data->append("d,e,f");
+        str_null->append(1); // null row
+        str_data->append("g,h,i");
+        str_null->append(0);
+
+        ColumnPtr str_col = NullableColumn::create(str_data, str_null);
+        ColumnPtr delim_col = ColumnHelper::create_const_column<TYPE_VARCHAR>(",", 3);
+        ColumnPtr field_col = ColumnHelper::create_const_column<TYPE_INT>(-2, 3);
+
+        ColumnPtr res = StringFunctions::split_part(ctx.get(), {str_col, delim_col, field_col}).value();
+        ASSERT_FALSE(res->is_nullable());
+        auto v = ColumnHelper::as_column<BinaryColumn>(res);
+        EXPECT_EQ("b", v->get_slice(0).to_string());
+        EXPECT_EQ("", v->get_slice(1).to_string());
+        EXPECT_EQ("h", v->get_slice(2).to_string());
+    }
+}
+
 PARALLEL_TEST(VecStringFunctionsTest, leftTest) {
     std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
     Columns columns;
