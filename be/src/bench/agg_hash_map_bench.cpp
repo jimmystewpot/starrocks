@@ -44,15 +44,18 @@
 #include <benchmark/benchmark.h>
 
 #include <cmath>
+#include <cstring>
 #include <memory>
 #include <random>
 #include <vector>
 
 #include "base/phmap/phmap.h"
+#include "base/utility/defer_op.h"
 #include "column/column_helper.h"
 #include "column/fixed_length_column.h"
 #include "column/nullable_column.h"
 #include "column/vectorized_fwd.h"
+#include "common/config_exec_flow_fwd.h"
 #include "common/config_exec_fwd.h"
 #include "common/runtime_profile.h"
 #include "exec/aggregate/agg_hash_map.h"
@@ -244,6 +247,7 @@ private:
 class BenchSuite {
 public:
     void SetUp() {
+        CpuInfo::init();
         config::vector_chunk_size = kBenchChunkSize;
         TUniqueId fragment_id;
         TQueryOptions query_options;
@@ -724,6 +728,858 @@ BENCHMARK_TEMPLATE(BM_Int16NullableBuildOnly, ArrayInt16NullableWrapper)->Apply(
 
 BENCHMARK_TEMPLATE(BM_Int16BuildOnly, ArrayInt16Wrapper)->Apply(RegisterArgs_SectionE);
 BENCHMARK_TEMPLATE(BM_Int16Cx1BuildOnly, SliceCx1Wrapper)->Apply(RegisterArgs_SectionE);
+
+// ============================================================================
+// Section F -- Fixed-Size Serialized Key (SliceKey4 / SliceKey8 / SliceKey16 /
+// SliceKey32): upstream/main Mixed-Stride vs AoS CacheEntry (32B / 24B / 16B /
+// 40B) vs Proposed SoA (Buffer<FixedSizeSliceKey> keys + Buffer<size_t> hashes)
+// ============================================================================
+
+// 1. AoS CacheEntry wrapper: both noprefetch and prefetch serialize into
+// std::vector<CacheEntry> at stride max_fixed_size = sizeof(CacheEntry)
+// (16B for SliceKey4/SliceKey8, 32B for SliceKey16, 40B for SliceKey32).
+template <typename HashMap>
+struct AoSCacheEntryFixedSizeWrapper : public AggHashMapWithKey<HashMap, AoSCacheEntryFixedSizeWrapper<HashMap>> {
+    using Self = AoSCacheEntryFixedSizeWrapper<HashMap>;
+    using Base = AggHashMapWithKey<HashMap, AoSCacheEntryFixedSizeWrapper<HashMap>>;
+    using KeyType = typename HashMap::key_type;
+    using Iterator = typename HashMap::iterator;
+    using FixedSizeSliceKey = typename HashMap::key_type;
+    using ResultVector = typename std::vector<FixedSizeSliceKey>;
+
+    bool has_null_column = false;
+    int fixed_byte_size = -1;
+    struct CacheEntry {
+        FixedSizeSliceKey key;
+        size_t hashval;
+    };
+
+    static constexpr size_t max_fixed_size = sizeof(CacheEntry);
+
+    std::vector<CacheEntry> caches;
+
+    template <class... Args>
+    AoSCacheEntryFixedSizeWrapper(int chunk_size, Args&&... args)
+            : Base(chunk_size, std::forward<Args>(args)...), _chunk_size(chunk_size) {
+        caches.resize(chunk_size);
+        auto* buffer = reinterpret_cast<uint8_t*>(caches.data());
+        memset(buffer, 0x0, max_fixed_size * _chunk_size);
+    }
+
+    AggDataPtr get_null_key_data() { return nullptr; }
+    void set_null_key_data(AggDataPtr /*data*/) {}
+
+    template <AllocFunc<Self> Func, typename HTBuildOp>
+    ALWAYS_NOINLINE void compute_agg_prefetch(size_t chunk_size, const Columns& key_columns,
+                                              Buffer<AggDataPtr>* agg_states, Func&& allocate_func,
+                                              ExtraAggParam* extra) {
+        [[maybe_unused]] size_t hash_table_size = this->hash_map.size();
+        auto* __restrict not_founds = extra->not_founds;
+        auto* buffer = reinterpret_cast<uint8_t*>(caches.data());
+        for (const auto& key_column : key_columns) {
+            key_column->serialize_batch(buffer, slice_sizes, chunk_size, max_fixed_size);
+        }
+        if (has_null_column) {
+            for (size_t i = 0; i < chunk_size; ++i) {
+                caches[i].key.u.size = slice_sizes[i];
+            }
+        }
+        for (size_t i = 0; i < chunk_size; i++) {
+            caches[i].hashval = this->hash_map.hash_function()(caches[i].key);
+        }
+
+        const size_t __prefetch_dist = agg_hash_map_default_prefetch_dist();
+        size_t __prefetch_index = __prefetch_dist;
+
+        for (size_t i = 0; i < chunk_size; ++i) {
+            if (__prefetch_dist != 0 && __prefetch_index < chunk_size) {
+                this->hash_map.prefetch_hash(caches[__prefetch_index++].hashval);
+            }
+            FixedSizeSliceKey& key = caches[i].key;
+            if constexpr (HTBuildOp::process_limit) {
+                if (hash_table_size < extra->limits) {
+                    _emplace_key_with_hash(key, caches[i].hashval, (*agg_states)[i], allocate_func,
+                                           [&]() { hash_table_size++; });
+                } else {
+                    _find_key((*agg_states)[i], (*not_founds)[i], key, caches[i].hashval);
+                }
+            } else if constexpr (HTBuildOp::allocate) {
+                _emplace_key_with_hash(key, caches[i].hashval, (*agg_states)[i], allocate_func,
+                                       FillNotFounds<HTBuildOp::fill_not_found>(not_founds, i));
+            } else if constexpr (HTBuildOp::fill_not_found) {
+                _find_key((*agg_states)[i], (*not_founds)[i], key, caches[i].hashval);
+            }
+        }
+    }
+
+    template <AllocFunc<Self> Func, typename HTBuildOp>
+    ALWAYS_NOINLINE void compute_agg_noprefetch(size_t chunk_size, const Columns& key_columns,
+                                                Buffer<AggDataPtr>* agg_states, Func&& allocate_func,
+                                                ExtraAggParam* extra) {
+        [[maybe_unused]] size_t hash_table_size = this->hash_map.size();
+        auto* __restrict not_founds = extra->not_founds;
+        auto* buffer = reinterpret_cast<uint8_t*>(caches.data());
+        for (const auto& key_column : key_columns) {
+            key_column->serialize_batch(buffer, slice_sizes, chunk_size, max_fixed_size);
+        }
+        if (has_null_column) {
+            for (size_t i = 0; i < chunk_size; ++i) {
+                caches[i].key.u.size = slice_sizes[i];
+            }
+        }
+        for (size_t i = 0; i < chunk_size; ++i) {
+            FixedSizeSliceKey& key = caches[i].key;
+            if constexpr (HTBuildOp::process_limit) {
+                if (hash_table_size < extra->limits) {
+                    _emplace_key(key, (*agg_states)[i], allocate_func, [&] { hash_table_size++; });
+                } else {
+                    _find_key((*agg_states)[i], (*not_founds)[i], key);
+                }
+            } else if constexpr (HTBuildOp::allocate) {
+                _emplace_key(key, (*agg_states)[i], allocate_func,
+                             FillNotFounds<HTBuildOp::fill_not_found>(not_founds, i));
+            } else if constexpr (HTBuildOp::fill_not_found) {
+                _find_key((*agg_states)[i], (*not_founds)[i], key);
+            }
+        }
+    }
+
+    template <AllocFunc<Self> Func, typename HTBuildOp>
+    void compute_agg_states(size_t chunk_size, const Columns& key_columns, MemPool* /*pool*/, Func&& allocate_func,
+                            Buffer<AggDataPtr>* agg_states, ExtraAggParam* extra) {
+        DCHECK(has_null_column || fixed_byte_size != -1);
+        DCHECK_LE(chunk_size, caches.size());
+        slice_sizes.assign(chunk_size, 0);
+
+        auto* buffer = reinterpret_cast<uint8_t*>(caches.data());
+        if (has_null_column) {
+            memset(buffer, 0x0, max_fixed_size * chunk_size);
+        }
+
+        if (!agg_should_prefetch_table(this->hash_map)) {
+            this->template compute_agg_noprefetch<Func, HTBuildOp>(chunk_size, key_columns, agg_states,
+                                                                   std::forward<Func>(allocate_func), extra);
+        } else {
+            this->template compute_agg_prefetch<Func, HTBuildOp>(chunk_size, key_columns, agg_states,
+                                                                 std::forward<Func>(allocate_func), extra);
+        }
+    }
+
+    template <AllocFunc<Self> Func, typename EmplaceCallBack>
+    ALWAYS_INLINE void _emplace_key(KeyType key, AggDataPtr& target_state, Func&& allocate_func,
+                                    EmplaceCallBack&& callback) {
+        auto iter = this->hash_map.lazy_emplace(key, [&](const auto& ctor) {
+            callback();
+            AggDataPtr pv = allocate_func(key);
+            ctor(key, pv);
+        });
+        target_state = iter->second;
+    }
+
+    template <AllocFunc<Self> Func, typename EmplaceCallBack>
+    ALWAYS_INLINE void _emplace_key_with_hash(KeyType key, size_t hash, AggDataPtr& target_state, Func&& allocate_func,
+                                              EmplaceCallBack&& callback) {
+        auto iter = this->hash_map.lazy_emplace_with_hash(key, hash, [&](const auto& ctor) {
+            callback();
+            AggDataPtr pv = allocate_func(key);
+            ctor(key, pv);
+        });
+        target_state = iter->second;
+    }
+
+    template <typename... Args>
+    ALWAYS_INLINE void _find_key(AggDataPtr& target_state, uint8_t& not_found, Args&&... args) {
+        if (auto iter = this->hash_map.find(std::forward<Args>(args)...); iter != this->hash_map.end()) {
+            target_state = iter->second;
+        } else {
+            not_found = 1;
+        }
+    }
+
+    static constexpr bool has_single_null_key = false;
+
+    Buffer<uint32_t> slice_sizes;
+    ResultVector results;
+    Buffer<Slice> tmp_slices;
+    int32_t _chunk_size;
+};
+
+// 2. AoS 24B packed/unaligned CacheEntry24 wrapper for SliceKey16:
+// sizeof(CacheEntry24) == 24 (alignas(8)), so every odd 16B key is at byte
+// offset 24 * (2k + 1) (8-byte misaligned for 16B loads) and every 3rd entry
+// crosses a 64B cache-line boundary.
+template <typename HashMap>
+struct AoS24BCacheEntryFixedSizeWrapper : public AggHashMapWithKey<HashMap, AoS24BCacheEntryFixedSizeWrapper<HashMap>> {
+    using Self = AoS24BCacheEntryFixedSizeWrapper<HashMap>;
+    using Base = AggHashMapWithKey<HashMap, AoS24BCacheEntryFixedSizeWrapper<HashMap>>;
+    using KeyType = typename HashMap::key_type;
+    using Iterator = typename HashMap::iterator;
+    using FixedSizeSliceKey = typename HashMap::key_type;
+    using ResultVector = typename std::vector<FixedSizeSliceKey>;
+
+    static_assert(sizeof(FixedSizeSliceKey) == 16);
+
+    bool has_null_column = false;
+    int fixed_byte_size = -1;
+    // Note: SliceKey16 has a user-defined copy constructor and int128_t member
+    // (alignof == 16), so GCC ignores __attribute__((packed)) on a struct
+    // containing a SliceKey16 field directly and pads it to 32B. Using an
+    // alignas(8) 16B key_bytes + 8B hashval struct models the exact 24B AoS
+    // stride where every odd 16B key is at offset 24 * (2k + 1) (8B misaligned).
+    struct alignas(8) CacheEntry24 {
+        uint8_t key_bytes[sizeof(FixedSizeSliceKey)];
+        size_t hashval;
+    };
+    static_assert(sizeof(CacheEntry24) == 24);
+    static_assert(alignof(CacheEntry24) == 8);
+
+    static constexpr size_t max_fixed_size = sizeof(CacheEntry24);
+
+    std::vector<CacheEntry24> caches;
+
+    template <class... Args>
+    AoS24BCacheEntryFixedSizeWrapper(int chunk_size, Args&&... args)
+            : Base(chunk_size, std::forward<Args>(args)...), _chunk_size(chunk_size) {
+        caches.resize(chunk_size);
+        auto* buffer = reinterpret_cast<uint8_t*>(caches.data());
+        memset(buffer, 0x0, max_fixed_size * _chunk_size);
+    }
+
+    AggDataPtr get_null_key_data() { return nullptr; }
+    void set_null_key_data(AggDataPtr /*data*/) {}
+
+    ALWAYS_INLINE FixedSizeSliceKey _load_unaligned_key(size_t i) const {
+        FixedSizeSliceKey k;
+        std::memcpy(&k.u, caches[i].key_bytes, sizeof(FixedSizeSliceKey));
+        return k;
+    }
+
+    template <AllocFunc<Self> Func, typename HTBuildOp>
+    ALWAYS_NOINLINE void compute_agg_prefetch(size_t chunk_size, const Columns& key_columns,
+                                              Buffer<AggDataPtr>* agg_states, Func&& allocate_func,
+                                              ExtraAggParam* extra) {
+        [[maybe_unused]] size_t hash_table_size = this->hash_map.size();
+        auto* __restrict not_founds = extra->not_founds;
+        auto* buffer = reinterpret_cast<uint8_t*>(caches.data());
+        for (const auto& key_column : key_columns) {
+            key_column->serialize_batch(buffer, slice_sizes, chunk_size, max_fixed_size);
+        }
+        if (has_null_column) {
+            for (size_t i = 0; i < chunk_size; ++i) {
+                buffer[i * max_fixed_size + sizeof(FixedSizeSliceKey) - 1] = static_cast<uint8_t>(slice_sizes[i]);
+            }
+        }
+        for (size_t i = 0; i < chunk_size; i++) {
+            caches[i].hashval = this->hash_map.hash_function()(_load_unaligned_key(i));
+        }
+
+        const size_t __prefetch_dist = agg_hash_map_default_prefetch_dist();
+        size_t __prefetch_index = __prefetch_dist;
+
+        for (size_t i = 0; i < chunk_size; ++i) {
+            if (__prefetch_dist != 0 && __prefetch_index < chunk_size) {
+                this->hash_map.prefetch_hash(caches[__prefetch_index++].hashval);
+            }
+            const FixedSizeSliceKey key = _load_unaligned_key(i);
+            const size_t hashval = caches[i].hashval;
+            if constexpr (HTBuildOp::process_limit) {
+                if (hash_table_size < extra->limits) {
+                    _emplace_key_with_hash(key, hashval, (*agg_states)[i], allocate_func, [&]() { hash_table_size++; });
+                } else {
+                    _find_key((*agg_states)[i], (*not_founds)[i], key, hashval);
+                }
+            } else if constexpr (HTBuildOp::allocate) {
+                _emplace_key_with_hash(key, hashval, (*agg_states)[i], allocate_func,
+                                       FillNotFounds<HTBuildOp::fill_not_found>(not_founds, i));
+            } else if constexpr (HTBuildOp::fill_not_found) {
+                _find_key((*agg_states)[i], (*not_founds)[i], key, hashval);
+            }
+        }
+    }
+
+    template <AllocFunc<Self> Func, typename HTBuildOp>
+    ALWAYS_NOINLINE void compute_agg_noprefetch(size_t chunk_size, const Columns& key_columns,
+                                                Buffer<AggDataPtr>* agg_states, Func&& allocate_func,
+                                                ExtraAggParam* extra) {
+        [[maybe_unused]] size_t hash_table_size = this->hash_map.size();
+        auto* __restrict not_founds = extra->not_founds;
+        auto* buffer = reinterpret_cast<uint8_t*>(caches.data());
+        for (const auto& key_column : key_columns) {
+            key_column->serialize_batch(buffer, slice_sizes, chunk_size, max_fixed_size);
+        }
+        if (has_null_column) {
+            for (size_t i = 0; i < chunk_size; ++i) {
+                buffer[i * max_fixed_size + sizeof(FixedSizeSliceKey) - 1] = static_cast<uint8_t>(slice_sizes[i]);
+            }
+        }
+        for (size_t i = 0; i < chunk_size; ++i) {
+            const FixedSizeSliceKey key = _load_unaligned_key(i);
+            if constexpr (HTBuildOp::process_limit) {
+                if (hash_table_size < extra->limits) {
+                    _emplace_key(key, (*agg_states)[i], allocate_func, [&] { hash_table_size++; });
+                } else {
+                    _find_key((*agg_states)[i], (*not_founds)[i], key);
+                }
+            } else if constexpr (HTBuildOp::allocate) {
+                _emplace_key(key, (*agg_states)[i], allocate_func,
+                             FillNotFounds<HTBuildOp::fill_not_found>(not_founds, i));
+            } else if constexpr (HTBuildOp::fill_not_found) {
+                _find_key((*agg_states)[i], (*not_founds)[i], key);
+            }
+        }
+    }
+
+    template <AllocFunc<Self> Func, typename HTBuildOp>
+    void compute_agg_states(size_t chunk_size, const Columns& key_columns, MemPool* /*pool*/, Func&& allocate_func,
+                            Buffer<AggDataPtr>* agg_states, ExtraAggParam* extra) {
+        DCHECK(has_null_column || fixed_byte_size != -1);
+        DCHECK_LE(chunk_size, caches.size());
+        slice_sizes.assign(chunk_size, 0);
+
+        auto* buffer = reinterpret_cast<uint8_t*>(caches.data());
+        if (has_null_column) {
+            memset(buffer, 0x0, max_fixed_size * chunk_size);
+        }
+
+        if (!agg_should_prefetch_table(this->hash_map)) {
+            this->template compute_agg_noprefetch<Func, HTBuildOp>(chunk_size, key_columns, agg_states,
+                                                                   std::forward<Func>(allocate_func), extra);
+        } else {
+            this->template compute_agg_prefetch<Func, HTBuildOp>(chunk_size, key_columns, agg_states,
+                                                                 std::forward<Func>(allocate_func), extra);
+        }
+    }
+
+    template <AllocFunc<Self> Func, typename EmplaceCallBack>
+    ALWAYS_INLINE void _emplace_key(KeyType key, AggDataPtr& target_state, Func&& allocate_func,
+                                    EmplaceCallBack&& callback) {
+        auto iter = this->hash_map.lazy_emplace(key, [&](const auto& ctor) {
+            callback();
+            AggDataPtr pv = allocate_func(key);
+            ctor(key, pv);
+        });
+        target_state = iter->second;
+    }
+
+    template <AllocFunc<Self> Func, typename EmplaceCallBack>
+    ALWAYS_INLINE void _emplace_key_with_hash(KeyType key, size_t hash, AggDataPtr& target_state, Func&& allocate_func,
+                                              EmplaceCallBack&& callback) {
+        auto iter = this->hash_map.lazy_emplace_with_hash(key, hash, [&](const auto& ctor) {
+            callback();
+            AggDataPtr pv = allocate_func(key);
+            ctor(key, pv);
+        });
+        target_state = iter->second;
+    }
+
+    template <typename... Args>
+    ALWAYS_INLINE void _find_key(AggDataPtr& target_state, uint8_t& not_found, Args&&... args) {
+        if (auto iter = this->hash_map.find(std::forward<Args>(args)...); iter != this->hash_map.end()) {
+            target_state = iter->second;
+        } else {
+            not_found = 1;
+        }
+    }
+
+    static constexpr bool has_single_null_key = false;
+
+    Buffer<uint32_t> slice_sizes;
+    ResultVector results;
+    Buffer<Slice> tmp_slices;
+    int32_t _chunk_size;
+};
+
+// 3. upstream/main Mixed-Stride wrapper:
+// compute_agg_noprefetch serializes at key_size = sizeof(FixedSizeSliceKey) into
+// caches.data(), while compute_agg_prefetch serializes at max_fixed_size =
+// sizeof(CacheEntry) into caches.data().
+template <typename HashMap>
+struct MainMixedStrideFixedSizeWrapper : public AggHashMapWithKey<HashMap, MainMixedStrideFixedSizeWrapper<HashMap>> {
+    using Self = MainMixedStrideFixedSizeWrapper<HashMap>;
+    using Base = AggHashMapWithKey<HashMap, MainMixedStrideFixedSizeWrapper<HashMap>>;
+    using KeyType = typename HashMap::key_type;
+    using Iterator = typename HashMap::iterator;
+    using FixedSizeSliceKey = typename HashMap::key_type;
+    using ResultVector = typename std::vector<FixedSizeSliceKey>;
+
+    bool has_null_column = false;
+    int fixed_byte_size = -1;
+    struct CacheEntry {
+        FixedSizeSliceKey key;
+        size_t hashval;
+    };
+
+    static constexpr size_t max_fixed_size = sizeof(CacheEntry);
+
+    std::vector<CacheEntry> caches;
+
+    template <class... Args>
+    MainMixedStrideFixedSizeWrapper(int chunk_size, Args&&... args)
+            : Base(chunk_size, std::forward<Args>(args)...), _chunk_size(chunk_size) {
+        caches.resize(chunk_size);
+        auto* buffer = reinterpret_cast<uint8_t*>(caches.data());
+        memset(buffer, 0x0, max_fixed_size * _chunk_size);
+    }
+
+    AggDataPtr get_null_key_data() { return nullptr; }
+    void set_null_key_data(AggDataPtr /*data*/) {}
+
+    template <AllocFunc<Self> Func, typename HTBuildOp>
+    ALWAYS_NOINLINE void compute_agg_prefetch(size_t chunk_size, const Columns& key_columns,
+                                              Buffer<AggDataPtr>* agg_states, Func&& allocate_func,
+                                              ExtraAggParam* extra) {
+        [[maybe_unused]] size_t hash_table_size = this->hash_map.size();
+        auto* __restrict not_founds = extra->not_founds;
+        auto* buffer = reinterpret_cast<uint8_t*>(caches.data());
+        for (const auto& key_column : key_columns) {
+            key_column->serialize_batch(buffer, slice_sizes, chunk_size, max_fixed_size);
+        }
+        if (has_null_column) {
+            for (size_t i = 0; i < chunk_size; ++i) {
+                caches[i].key.u.size = slice_sizes[i];
+            }
+        }
+        for (size_t i = 0; i < chunk_size; i++) {
+            caches[i].hashval = this->hash_map.hash_function()(caches[i].key);
+        }
+
+        const size_t __prefetch_dist = agg_hash_map_default_prefetch_dist();
+        size_t __prefetch_index = __prefetch_dist;
+
+        for (size_t i = 0; i < chunk_size; ++i) {
+            if (__prefetch_dist != 0 && __prefetch_index < chunk_size) {
+                this->hash_map.prefetch_hash(caches[__prefetch_index++].hashval);
+            }
+            FixedSizeSliceKey& key = caches[i].key;
+            if constexpr (HTBuildOp::process_limit) {
+                if (hash_table_size < extra->limits) {
+                    _emplace_key_with_hash(key, caches[i].hashval, (*agg_states)[i], allocate_func,
+                                           [&]() { hash_table_size++; });
+                } else {
+                    _find_key((*agg_states)[i], (*not_founds)[i], key, caches[i].hashval);
+                }
+            } else if constexpr (HTBuildOp::allocate) {
+                _emplace_key_with_hash(key, caches[i].hashval, (*agg_states)[i], allocate_func,
+                                       FillNotFounds<HTBuildOp::fill_not_found>(not_founds, i));
+            } else if constexpr (HTBuildOp::fill_not_found) {
+                _find_key((*agg_states)[i], (*not_founds)[i], key, caches[i].hashval);
+            }
+        }
+    }
+
+    template <AllocFunc<Self> Func, typename HTBuildOp>
+    ALWAYS_NOINLINE void compute_agg_noprefetch(size_t chunk_size, const Columns& key_columns,
+                                                Buffer<AggDataPtr>* agg_states, Func&& allocate_func,
+                                                ExtraAggParam* extra) {
+        [[maybe_unused]] size_t hash_table_size = this->hash_map.size();
+        auto* __restrict not_founds = extra->not_founds;
+        constexpr int key_size = sizeof(FixedSizeSliceKey);
+        auto* buffer = reinterpret_cast<uint8_t*>(caches.data());
+        for (const auto& key_column : key_columns) {
+            key_column->serialize_batch(buffer, slice_sizes, chunk_size, key_size);
+        }
+        auto* key = reinterpret_cast<FixedSizeSliceKey*>(caches.data());
+        if (has_null_column) {
+            for (size_t i = 0; i < chunk_size; ++i) {
+                key[i].u.size = slice_sizes[i];
+            }
+        }
+        for (size_t i = 0; i < chunk_size; ++i) {
+            if constexpr (HTBuildOp::process_limit) {
+                if (hash_table_size < extra->limits) {
+                    _emplace_key(key[i], (*agg_states)[i], allocate_func, [&] { hash_table_size++; });
+                } else {
+                    _find_key((*agg_states)[i], (*not_founds)[i], key[i]);
+                }
+            } else if constexpr (HTBuildOp::allocate) {
+                _emplace_key(key[i], (*agg_states)[i], allocate_func,
+                             FillNotFounds<HTBuildOp::fill_not_found>(not_founds, i));
+            } else if constexpr (HTBuildOp::fill_not_found) {
+                _find_key((*agg_states)[i], (*not_founds)[i], key[i]);
+            }
+        }
+    }
+
+    template <AllocFunc<Self> Func, typename HTBuildOp>
+    void compute_agg_states(size_t chunk_size, const Columns& key_columns, MemPool* /*pool*/, Func&& allocate_func,
+                            Buffer<AggDataPtr>* agg_states, ExtraAggParam* extra) {
+        DCHECK(has_null_column || fixed_byte_size != -1);
+        DCHECK_LE(chunk_size, caches.size());
+        slice_sizes.assign(chunk_size, 0);
+
+        auto* buffer = reinterpret_cast<uint8_t*>(caches.data());
+        if (has_null_column) {
+            memset(buffer, 0x0, max_fixed_size * chunk_size);
+        }
+
+        if (!agg_should_prefetch_table(this->hash_map)) {
+            this->template compute_agg_noprefetch<Func, HTBuildOp>(chunk_size, key_columns, agg_states,
+                                                                   std::forward<Func>(allocate_func), extra);
+        } else {
+            this->template compute_agg_prefetch<Func, HTBuildOp>(chunk_size, key_columns, agg_states,
+                                                                 std::forward<Func>(allocate_func), extra);
+        }
+    }
+
+    template <AllocFunc<Self> Func, typename EmplaceCallBack>
+    ALWAYS_INLINE void _emplace_key(KeyType key, AggDataPtr& target_state, Func&& allocate_func,
+                                    EmplaceCallBack&& callback) {
+        auto iter = this->hash_map.lazy_emplace(key, [&](const auto& ctor) {
+            callback();
+            AggDataPtr pv = allocate_func(key);
+            ctor(key, pv);
+        });
+        target_state = iter->second;
+    }
+
+    template <AllocFunc<Self> Func, typename EmplaceCallBack>
+    ALWAYS_INLINE void _emplace_key_with_hash(KeyType key, size_t hash, AggDataPtr& target_state, Func&& allocate_func,
+                                              EmplaceCallBack&& callback) {
+        auto iter = this->hash_map.lazy_emplace_with_hash(key, hash, [&](const auto& ctor) {
+            callback();
+            AggDataPtr pv = allocate_func(key);
+            ctor(key, pv);
+        });
+        target_state = iter->second;
+    }
+
+    template <typename... Args>
+    ALWAYS_INLINE void _find_key(AggDataPtr& target_state, uint8_t& not_found, Args&&... args) {
+        if (auto iter = this->hash_map.find(std::forward<Args>(args)...); iter != this->hash_map.end()) {
+            target_state = iter->second;
+        } else {
+            not_found = 1;
+        }
+    }
+
+    static constexpr bool has_single_null_key = false;
+
+    Buffer<uint32_t> slice_sizes;
+    ResultVector results;
+    Buffer<Slice> tmp_slices;
+    int32_t _chunk_size;
+};
+
+using FixedSize16SoAWrapper = AggHashMapWithSerializedKeyFixedSize<FixedSize16SliceAggHashMap<PhmapSeed1>>;
+using FixedSize16AoS32BWrapper = AoSCacheEntryFixedSizeWrapper<FixedSize16SliceAggHashMap<PhmapSeed1>>;
+using FixedSize16AoS24BWrapper = AoS24BCacheEntryFixedSizeWrapper<FixedSize16SliceAggHashMap<PhmapSeed1>>;
+using FixedSize16MainMixedStrideWrapper = MainMixedStrideFixedSizeWrapper<FixedSize16SliceAggHashMap<PhmapSeed1>>;
+
+using FixedSize8SoAWrapper = AggHashMapWithSerializedKeyFixedSize<FixedSize8SliceAggHashMap<PhmapSeed1>>;
+using FixedSize8AoS16BWrapper = AoSCacheEntryFixedSizeWrapper<FixedSize8SliceAggHashMap<PhmapSeed1>>;
+using FixedSize8MainMixedStrideWrapper = MainMixedStrideFixedSizeWrapper<FixedSize8SliceAggHashMap<PhmapSeed1>>;
+
+using FixedSize4SoAWrapper = AggHashMapWithSerializedKeyFixedSize<FixedSize4SliceAggHashMap<PhmapSeed1>>;
+using FixedSize4AoS16BWrapper = AoSCacheEntryFixedSizeWrapper<FixedSize4SliceAggHashMap<PhmapSeed1>>;
+using FixedSize4MainMixedStrideWrapper = MainMixedStrideFixedSizeWrapper<FixedSize4SliceAggHashMap<PhmapSeed1>>;
+
+using FixedSize32SoAWrapper = AggHashMapWithSerializedKeyFixedSize<FixedSize32SliceAggHashMap<PhmapSeed1>>;
+using FixedSize32AoS40BWrapper = AoSCacheEntryFixedSizeWrapper<FixedSize32SliceAggHashMap<PhmapSeed1>>;
+using FixedSize32MainMixedStrideWrapper = MainMixedStrideFixedSizeWrapper<FixedSize32SliceAggHashMap<PhmapSeed1>>;
+
+static_assert(FixedSize4SoAWrapper::max_fixed_size == 4);
+static_assert(FixedSize8SoAWrapper::max_fixed_size == 8);
+static_assert(FixedSize16SoAWrapper::max_fixed_size == 16);
+static_assert(FixedSize32SoAWrapper::max_fixed_size == 32);
+
+static_assert(FixedSize4AoS16BWrapper::max_fixed_size == 16);
+static_assert(FixedSize8AoS16BWrapper::max_fixed_size == 16);
+static_assert(FixedSize16AoS32BWrapper::max_fixed_size == 32);
+static_assert(FixedSize16AoS24BWrapper::max_fixed_size == 24);
+static_assert(FixedSize32AoS40BWrapper::max_fixed_size == 40);
+
+inline constexpr int64_t kFixedSizeBenchRows = 2'048'000; // 500 chunks of 4096 rows
+
+enum class FixedKeyBenchShape {
+    Q35_4xInt32_16B,
+    Q8_Int64Int32_12B,
+    Nullable_Int64Int32_16B,
+    SubWidth_Int32Int16_6B,
+    SubWidth_Int16Int8_3B,
+    FullWidth_4xInt64_32B,
+};
+
+class FixedSizeKeyChunkStream {
+public:
+    FixedSizeKeyChunkStream(int64_t num_rows, int distinct_count, FixedKeyBenchShape shape) {
+        std::mt19937 rng(0xC0FFEE);
+        std::uniform_int_distribution<int> uni(0, distinct_count > 0 ? distinct_count - 1 : 0);
+        const int64_t num_chunks = (num_rows + kBenchChunkSize - 1) / kBenchChunkSize;
+        _chunks.reserve(num_chunks);
+
+        for (int64_t c = 0; c < num_chunks; ++c) {
+            Columns cols;
+            switch (shape) {
+            case FixedKeyBenchShape::Q35_4xInt32_16B: {
+                auto c0 = Int32Column::create();
+                auto c1 = Int32Column::create();
+                auto c2 = Int32Column::create();
+                auto c3 = Int32Column::create();
+                c0->get_data().resize(kBenchChunkSize);
+                c1->get_data().resize(kBenchChunkSize);
+                c2->get_data().resize(kBenchChunkSize);
+                c3->get_data().resize(kBenchChunkSize);
+                for (int i = 0; i < kBenchChunkSize; ++i) {
+                    const uint32_t g = static_cast<uint32_t>(uni(rng));
+                    c0->get_data()[i] = static_cast<int32_t>(g);
+                    c1->get_data()[i] = static_cast<int32_t>(g * 0x9E3779B1U + 0x11223344U);
+                    c2->get_data()[i] = static_cast<int32_t>(g * 0x85EBCA6BU + 0x55667788U);
+                    c3->get_data()[i] = static_cast<int32_t>(g * 0xC2B2AE35U + 0x99AABBCCU);
+                }
+                cols.emplace_back(std::move(c0));
+                cols.emplace_back(std::move(c1));
+                cols.emplace_back(std::move(c2));
+                cols.emplace_back(std::move(c3));
+                break;
+            }
+            case FixedKeyBenchShape::Q8_Int64Int32_12B: {
+                auto c0 = Int64Column::create();
+                auto c1 = Int32Column::create();
+                c0->get_data().resize(kBenchChunkSize);
+                c1->get_data().resize(kBenchChunkSize);
+                for (int i = 0; i < kBenchChunkSize; ++i) {
+                    const uint64_t g = static_cast<uint64_t>(uni(rng));
+                    c0->get_data()[i] = static_cast<int64_t>(g * 0x9E3779B97F4A7C15ULL + 1ULL);
+                    c1->get_data()[i] = static_cast<int32_t>(static_cast<uint32_t>(g) * 0x85EBCA6BU + 2U);
+                }
+                cols.emplace_back(std::move(c0));
+                cols.emplace_back(std::move(c1));
+                break;
+            }
+            case FixedKeyBenchShape::Nullable_Int64Int32_16B: {
+                auto d0 = Int64Column::create();
+                auto n0 = NullColumn::create();
+                auto d1 = Int32Column::create();
+                auto n1 = NullColumn::create();
+                d0->get_data().resize(kBenchChunkSize);
+                n0->get_data().resize(kBenchChunkSize);
+                d1->get_data().resize(kBenchChunkSize);
+                n1->get_data().resize(kBenchChunkSize);
+                for (int i = 0; i < kBenchChunkSize; ++i) {
+                    const uint64_t g = static_cast<uint64_t>(uni(rng));
+                    const bool null0 = (g % 20 == 0);
+                    const bool null1 = (g % 25 == 0);
+                    n0->get_data()[i] = null0 ? 1 : 0;
+                    d0->get_data()[i] = null0 ? 0 : static_cast<int64_t>(g * 0x9E3779B97F4A7C15ULL + 1ULL);
+                    n1->get_data()[i] = null1 ? 1 : 0;
+                    d1->get_data()[i] = null1 ? 0 : static_cast<int32_t>(static_cast<uint32_t>(g) * 0x85EBCA6BU + 2U);
+                }
+                auto col0 = NullableColumn::create(std::move(d0), std::move(n0));
+                auto col1 = NullableColumn::create(std::move(d1), std::move(n1));
+                col0->update_has_null();
+                col1->update_has_null();
+                cols.emplace_back(std::move(col0));
+                cols.emplace_back(std::move(col1));
+                break;
+            }
+            case FixedKeyBenchShape::SubWidth_Int32Int16_6B: {
+                auto c0 = Int32Column::create();
+                auto c1 = Int16Column::create();
+                c0->get_data().resize(kBenchChunkSize);
+                c1->get_data().resize(kBenchChunkSize);
+                for (int i = 0; i < kBenchChunkSize; ++i) {
+                    const uint32_t g = static_cast<uint32_t>(uni(rng));
+                    c0->get_data()[i] = static_cast<int32_t>(g * 0x9E3779B1U + 1U);
+                    c1->get_data()[i] = static_cast<int16_t>((g * 0x85EBU) & 0xFFFFU);
+                }
+                cols.emplace_back(std::move(c0));
+                cols.emplace_back(std::move(c1));
+                break;
+            }
+            case FixedKeyBenchShape::SubWidth_Int16Int8_3B: {
+                auto c0 = Int16Column::create();
+                auto c1 = Int8Column::create();
+                c0->get_data().resize(kBenchChunkSize);
+                c1->get_data().resize(kBenchChunkSize);
+                for (int i = 0; i < kBenchChunkSize; ++i) {
+                    const uint32_t g = static_cast<uint32_t>(uni(rng));
+                    c0->get_data()[i] = static_cast<int16_t>(g & 0xFFFFU);
+                    c1->get_data()[i] = static_cast<int8_t>((g >> 8) ^ (g & 0xFFU));
+                }
+                cols.emplace_back(std::move(c0));
+                cols.emplace_back(std::move(c1));
+                break;
+            }
+            case FixedKeyBenchShape::FullWidth_4xInt64_32B: {
+                auto c0 = Int64Column::create();
+                auto c1 = Int64Column::create();
+                auto c2 = Int64Column::create();
+                auto c3 = Int64Column::create();
+                c0->get_data().resize(kBenchChunkSize);
+                c1->get_data().resize(kBenchChunkSize);
+                c2->get_data().resize(kBenchChunkSize);
+                c3->get_data().resize(kBenchChunkSize);
+                for (int i = 0; i < kBenchChunkSize; ++i) {
+                    const uint64_t g = static_cast<uint64_t>(uni(rng));
+                    c0->get_data()[i] = static_cast<int64_t>(g);
+                    c1->get_data()[i] = static_cast<int64_t>(g * 0x9E3779B97F4A7C15ULL + 1ULL);
+                    c2->get_data()[i] = static_cast<int64_t>(g * 0xBF58476D1CE4E5B9ULL + 2ULL);
+                    c3->get_data()[i] = static_cast<int64_t>(g * 0x94D049BB133111EBULL + 3ULL);
+                }
+                cols.emplace_back(std::move(c0));
+                cols.emplace_back(std::move(c1));
+                cols.emplace_back(std::move(c2));
+                cols.emplace_back(std::move(c3));
+                break;
+            }
+            }
+            _chunks.emplace_back(std::move(cols));
+        }
+    }
+
+    const std::vector<Columns>& chunks() const { return _chunks; }
+
+private:
+    std::vector<Columns> _chunks;
+};
+
+template <typename Wrapper, FixedKeyBenchShape Shape, bool HasNull, int FixedByteSize>
+static void RunFixedSizeBench(benchmark::State& state) {
+    const int distinct = static_cast<int>(state.range(0));
+    const double saved_ratio = config::agg_prefetch_l2_ratio;
+    DeferOp restore_ratio([&]() { config::agg_prefetch_l2_ratio = saved_ratio; });
+    // Keep distinct <= 16384 strictly in noprefetch and distinct >= 65536 in prefetch.
+    config::agg_prefetch_l2_ratio = (distinct <= 16384) ? 2.0 : 1.0;
+
+    BenchSuite suite;
+    suite.SetUp();
+    FixedSizeKeyChunkStream stream(kFixedSizeBenchRows, distinct, Shape);
+
+    int64_t total_rows = 0;
+    size_t final_groups = 0;
+    size_t final_ht_bytes = 0;
+    int prefetch_active = 0;
+    int64_t cum_checksum = 0;
+
+    for (auto _ : state) {
+        state.PauseTiming();
+        auto wrapper = std::make_unique<Wrapper>(kBenchChunkSize, suite._agg_stat.get());
+        wrapper->has_null_column = HasNull;
+        wrapper->fixed_byte_size = FixedByteSize;
+        HashTableKeyAllocator allocator;
+        allocator.aggregate_key_size = sizeof(int64_t);
+        allocator.pool = suite._mem_pool.get();
+        BenchAllocateState alloc{&allocator};
+        Buffer<AggDataPtr> agg_states(kBenchChunkSize);
+        state.ResumeTiming();
+
+        for (const auto& key_columns : stream.chunks()) {
+            wrapper->build_hash_map(kBenchChunkSize, key_columns, suite._mem_pool.get(), alloc, &agg_states);
+            total_rows += kBenchChunkSize;
+        }
+        benchmark::DoNotOptimize(agg_states.data());
+        benchmark::ClobberMemory();
+
+        state.PauseTiming();
+        final_groups = wrapper->hash_map.size();
+        final_ht_bytes = hash_table_bytes(wrapper.get());
+        prefetch_active = agg_should_prefetch_table(wrapper->hash_map) ? 1 : 0;
+        int64_t cs = 0;
+        for (int i = 0; i < kBenchChunkSize; ++i) {
+            cs += reinterpret_cast<intptr_t>(agg_states[i]);
+        }
+        cum_checksum += cs;
+        wrapper.reset();
+        suite._mem_pool->clear();
+    }
+    benchmark::DoNotOptimize(cum_checksum);
+    state.SetItemsProcessed(total_rows);
+    state.counters["distinct"] = distinct;
+    state.counters["stride_B"] = Wrapper::max_fixed_size;
+    state.counters["prefetch"] = prefetch_active;
+    state.counters["final_groups"] = final_groups;
+    state.counters["hash_table_bytes"] = final_ht_bytes;
+
+    suite.TearDown();
+}
+
+template <typename Wrapper>
+static void BM_FixedSize16_Q35_4xInt32_NoNull(benchmark::State& state) {
+    RunFixedSizeBench<Wrapper, FixedKeyBenchShape::Q35_4xInt32_16B, false, 16>(state);
+}
+
+template <typename Wrapper>
+static void BM_FixedSize16_Q8_Int64Int32_NoNull(benchmark::State& state) {
+    RunFixedSizeBench<Wrapper, FixedKeyBenchShape::Q8_Int64Int32_12B, false, 12>(state);
+}
+
+template <typename Wrapper>
+static void BM_FixedSize16_Nullable(benchmark::State& state) {
+    RunFixedSizeBench<Wrapper, FixedKeyBenchShape::Nullable_Int64Int32_16B, true, -1>(state);
+}
+
+template <typename Wrapper>
+static void BM_FixedSize8_SubWidth_NoNull(benchmark::State& state) {
+    RunFixedSizeBench<Wrapper, FixedKeyBenchShape::SubWidth_Int32Int16_6B, false, 6>(state);
+}
+
+template <typename Wrapper>
+static void BM_FixedSize4_SubWidth_NoNull(benchmark::State& state) {
+    RunFixedSizeBench<Wrapper, FixedKeyBenchShape::SubWidth_Int16Int8_3B, false, 3>(state);
+}
+
+template <typename Wrapper>
+static void BM_FixedSize32_4xInt64_NoNull(benchmark::State& state) {
+    RunFixedSizeBench<Wrapper, FixedKeyBenchShape::FullWidth_4xInt64_32B, false, 32>(state);
+}
+
+static void RegisterArgs_FixedSize16_4Card(::benchmark::Benchmark* b) {
+    b->ArgNames({"distinct"});
+    for (int distinct : {1024, 16384, 65536, 500000}) {
+        b->Args({distinct});
+    }
+    b->Unit(benchmark::kMillisecond);
+    b->Iterations(3);
+}
+
+static void RegisterArgs_FixedSize_2Card(::benchmark::Benchmark* b) {
+    b->ArgNames({"distinct"});
+    for (int distinct : {1024, 65536}) {
+        b->Args({distinct});
+    }
+    b->Unit(benchmark::kMillisecond);
+    b->Iterations(3);
+}
+
+// 1. BM_FixedSize16_Q35_4xInt32_NoNull (16B full-width key, noprefetch & prefetch)
+BENCHMARK_TEMPLATE(BM_FixedSize16_Q35_4xInt32_NoNull, FixedSize16SoAWrapper)->Apply(RegisterArgs_FixedSize16_4Card);
+BENCHMARK_TEMPLATE(BM_FixedSize16_Q35_4xInt32_NoNull, FixedSize16AoS32BWrapper)->Apply(RegisterArgs_FixedSize16_4Card);
+BENCHMARK_TEMPLATE(BM_FixedSize16_Q35_4xInt32_NoNull, FixedSize16AoS24BWrapper)->Apply(RegisterArgs_FixedSize16_4Card);
+BENCHMARK_TEMPLATE(BM_FixedSize16_Q35_4xInt32_NoNull, FixedSize16MainMixedStrideWrapper)
+        ->Apply(RegisterArgs_FixedSize16_4Card);
+
+// 2. BM_FixedSize16_Q8_Int64Int32_NoNull (12B sub-width key, noprefetch & prefetch)
+BENCHMARK_TEMPLATE(BM_FixedSize16_Q8_Int64Int32_NoNull, FixedSize16SoAWrapper)->Apply(RegisterArgs_FixedSize16_4Card);
+BENCHMARK_TEMPLATE(BM_FixedSize16_Q8_Int64Int32_NoNull, FixedSize16AoS32BWrapper)
+        ->Apply(RegisterArgs_FixedSize16_4Card);
+BENCHMARK_TEMPLATE(BM_FixedSize16_Q8_Int64Int32_NoNull, FixedSize16AoS24BWrapper)
+        ->Apply(RegisterArgs_FixedSize16_4Card);
+BENCHMARK_TEMPLATE(BM_FixedSize16_Q8_Int64Int32_NoNull, FixedSize16MainMixedStrideWrapper)
+        ->Apply(RegisterArgs_FixedSize16_4Card);
+
+// 3. BM_FixedSize16_Nullable (has_null_column = true, per-chunk memset + serialize + probe)
+BENCHMARK_TEMPLATE(BM_FixedSize16_Nullable, FixedSize16SoAWrapper)->Apply(RegisterArgs_FixedSize_2Card);
+BENCHMARK_TEMPLATE(BM_FixedSize16_Nullable, FixedSize16AoS32BWrapper)->Apply(RegisterArgs_FixedSize_2Card);
+BENCHMARK_TEMPLATE(BM_FixedSize16_Nullable, FixedSize16AoS24BWrapper)->Apply(RegisterArgs_FixedSize_2Card);
+BENCHMARK_TEMPLATE(BM_FixedSize16_Nullable, FixedSize16MainMixedStrideWrapper)->Apply(RegisterArgs_FixedSize_2Card);
+
+// 4. BM_FixedSize8_SubWidth_NoNull (6B key in SliceKey8: 8B SoA stride vs 16B AoS stride)
+BENCHMARK_TEMPLATE(BM_FixedSize8_SubWidth_NoNull, FixedSize8SoAWrapper)->Apply(RegisterArgs_FixedSize_2Card);
+BENCHMARK_TEMPLATE(BM_FixedSize8_SubWidth_NoNull, FixedSize8AoS16BWrapper)->Apply(RegisterArgs_FixedSize_2Card);
+BENCHMARK_TEMPLATE(BM_FixedSize8_SubWidth_NoNull, FixedSize8MainMixedStrideWrapper)
+        ->Apply(RegisterArgs_FixedSize_2Card);
+
+// 5. BM_FixedSize4_SubWidth_NoNull (3B key in SliceKey4: 4B SoA stride vs 16B AoS stride)
+BENCHMARK_TEMPLATE(BM_FixedSize4_SubWidth_NoNull, FixedSize4SoAWrapper)->Apply(RegisterArgs_FixedSize_2Card);
+BENCHMARK_TEMPLATE(BM_FixedSize4_SubWidth_NoNull, FixedSize4AoS16BWrapper)->Apply(RegisterArgs_FixedSize_2Card);
+BENCHMARK_TEMPLATE(BM_FixedSize4_SubWidth_NoNull, FixedSize4MainMixedStrideWrapper)
+        ->Apply(RegisterArgs_FixedSize_2Card);
+
+// 6. BM_FixedSize32_4xInt64_NoNull (32B key in SliceKey32: 32B SoA stride vs 40B AoS stride)
+BENCHMARK_TEMPLATE(BM_FixedSize32_4xInt64_NoNull, FixedSize32SoAWrapper)->Apply(RegisterArgs_FixedSize_2Card);
+BENCHMARK_TEMPLATE(BM_FixedSize32_4xInt64_NoNull, FixedSize32AoS40BWrapper)->Apply(RegisterArgs_FixedSize_2Card);
+BENCHMARK_TEMPLATE(BM_FixedSize32_4xInt64_NoNull, FixedSize32MainMixedStrideWrapper)
+        ->Apply(RegisterArgs_FixedSize_2Card);
 
 } // namespace starrocks
 
