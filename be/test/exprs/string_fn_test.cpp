@@ -3498,6 +3498,31 @@ PARALLEL_TEST(VecStringFunctionsTest, replaceCoverageAllBranches) {
 
         ASSERT_TRUE(StringFunctions::replace_close(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
     }
+
+    // 4. NullableColumn with has_null() == false in replace_const_pattern_and_rpl must preserve is_nullable()
+    {
+        std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+        auto* context = ctx.get();
+        auto data = BinaryColumn::create();
+        data->append("hello_ptn");
+        data->append("world");
+        auto nulls = NullColumn::create(2, 0);
+        auto str = NullableColumn::create(std::move(data), std::move(nulls));
+        ASSERT_TRUE(str->is_nullable());
+        ASSERT_FALSE(str->has_null());
+
+        auto ptn = ColumnHelper::create_const_column<TYPE_VARCHAR>("ptn", 2);
+        auto rpl = ColumnHelper::create_const_column<TYPE_VARCHAR>("X", 2);
+        Columns columns{str, ptn, rpl};
+        context->set_constant_columns(columns);
+        ASSERT_TRUE(
+                StringFunctions::replace_prepare(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+        const auto res = StringFunctions::replace(context, columns).value();
+        EXPECT_TRUE(res->is_nullable());
+        EXPECT_EQ("hello_X", res->get(0).get_slice().to_string());
+        EXPECT_EQ("world", res->get(1).get_slice().to_string());
+        ASSERT_TRUE(StringFunctions::replace_close(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+    }
 }
 
 PARALLEL_TEST(VecStringFunctionsTest, moneyFormatDouble) {

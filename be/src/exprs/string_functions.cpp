@@ -5294,6 +5294,7 @@ struct ReplaceState {
 
     const char* search(const char* haystack, size_t haystack_size) const {
         if (UNLIKELY(pattern.size() >= VolnitskyTraits::min_needle_size_for_algorithm &&
+                     pattern.size() < std::numeric_limits<VolnitskyTraits::Offset>::max() &&
                      haystack_size >= VolnitskyTraits::min_haystack_size_for_algorithm)) {
             std::call_once(volnitsky_once, [this]() {
                 volnitsky = std::make_unique<VolnitskyUTF8>(pattern.data(), pattern.size(),
@@ -5379,8 +5380,9 @@ static ColumnPtr merge_null_with_src_column(const ColumnPtr& src_col, const Colu
     const auto* extra_nullable = down_cast<const NullableColumn*>(unpacked_extra.get());
     if (unpacked_src->is_nullable()) {
         const auto* src_nullable = down_cast<const NullableColumn*>(unpacked_src.get());
-        auto merged_null = NullColumn::static_pointer_cast(std::move(*src_nullable->null_column()).mutate());
+        NullColumn::MutablePtr merged_null;
         if (src_nullable->has_null()) {
+            merged_null = NullColumn::static_pointer_cast(std::move(*src_nullable->null_column()).mutate());
             ColumnHelper::or_two_filters(&merged_null->get_data(),
                                          extra_nullable->null_column()->immutable_data().data());
         } else {
@@ -5726,7 +5728,7 @@ static StatusOr<ColumnPtr> replace_const_pattern_and_rpl(const ReplaceState* sta
         return ConstColumn::create(std::move(dst), num_rows);
     }
 
-    if (null_data != nullptr) {
+    if (columns[0]->is_nullable()) {
         const auto* src_nullable = down_cast<const NullableColumn*>(columns[0].get());
         return NullableColumn::create(
                 std::move(dst), NullColumn::static_pointer_cast(std::move(*src_nullable->null_column()).mutate()));
@@ -5775,12 +5777,18 @@ static StatusOr<ColumnPtr> replace_const_pattern(const ReplaceState* state, cons
     const bool all_const = ColumnHelper::is_all_const(columns);
     const size_t eval_rows = all_const ? 1 : num_rows;
 
+    const BinaryColumn* src_binary = ColumnHelper::get_binary_column(columns[0].get());
+    const size_t ptn_size = state->pattern.size();
+    const char* const src_base = src_binary->get_string_begin();
+    const size_t src_total_bytes = static_cast<size_t>(src_binary->get_offset().back());
+    if (src_total_bytes < ptn_size || state->search(src_base, src_total_bytes) == src_base + src_total_bytes) {
+        return merge_null_with_src_column(columns[0], columns[2], num_rows, all_const);
+    }
+
     const auto str_viewer = ColumnViewer<TYPE_VARCHAR>(columns[0]);
     const auto rpl_viewer = ColumnViewer<TYPE_VARCHAR>(columns[2]);
-    const BinaryColumn* src_binary = ColumnHelper::get_binary_column(columns[0].get());
     const size_t initial_bytes =
             columns[0]->is_constant() ? src_binary->get_slice(0).size * eval_rows : src_binary->get_offset().back();
-    const size_t ptn_size = state->pattern.size();
     const Slice const_rpl_slice(state->repl);
 
     bool any_match = false;
@@ -5953,9 +5961,9 @@ StatusOr<ColumnPtr> StringFunctions::replace(FunctionContext* context, const Col
     const auto num_rows = arg0->size();
     const auto* state =
             reinterpret_cast<const ReplaceState*>(context->get_function_state(FunctionContext::FRAGMENT_LOCAL));
+    DCHECK(state != nullptr);
 
-    if (arg0->only_null() || columns[1]->only_null() || columns[2]->only_null() ||
-        (state != nullptr && state->only_null)) {
+    if (arg0->only_null() || columns[1]->only_null() || columns[2]->only_null() || state->only_null) {
         return ColumnHelper::create_const_null_column(num_rows);
     }
 
