@@ -19,6 +19,14 @@
 #include <cstring>
 #include <string_view>
 
+#if defined(__x86_64__)
+#include <immintrin.h>
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+#include "base/simd/simd.h"
+
 namespace starrocks {
 
 struct ByteSet {
@@ -110,6 +118,130 @@ struct ByteSet {
     }
 };
 
+template <bool Simd = true>
+inline const char* skip_leading_char(const char* begin, const char* end, char c) noexcept {
+    if (begin == nullptr || begin >= end) {
+        return begin;
+    }
+    const char* p = begin;
+    if constexpr (Simd) {
+#if defined(__AVX2__)
+        if (static_cast<size_t>(end - p) >= 32) {
+            const __m256i target256 = _mm256_set1_epi8(c);
+            do {
+                const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+                const uint32_t eq_mask = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, target256)));
+                const uint32_t keep_mask = ~eq_mask;
+                if (keep_mask != 0) {
+                    return p + __builtin_ctz(keep_mask);
+                }
+                p += 32;
+            } while (static_cast<size_t>(end - p) >= 32);
+        }
+        if (static_cast<size_t>(end - p) >= 16) {
+            const __m128i target128 = _mm_set1_epi8(c);
+            const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
+            const uint32_t eq_mask = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(v, target128)));
+            const uint32_t keep_mask = (~eq_mask) & 0xFFFFu;
+            if (keep_mask != 0) {
+                return p + __builtin_ctz(keep_mask);
+            }
+            p += 16;
+        }
+#elif defined(__SSE2__)
+        if (static_cast<size_t>(end - p) >= 16) {
+            const __m128i target128 = _mm_set1_epi8(c);
+            do {
+                const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
+                const uint32_t eq_mask = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(v, target128)));
+                const uint32_t keep_mask = (~eq_mask) & 0xFFFFu;
+                if (keep_mask != 0) {
+                    return p + __builtin_ctz(keep_mask);
+                }
+                p += 16;
+            } while (static_cast<size_t>(end - p) >= 16);
+        }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+        if (static_cast<size_t>(end - p) >= 16) {
+            const uint8x16_t target_vec = vdupq_n_u8(static_cast<uint8_t>(c));
+            do {
+                const uint8x16_t v = vld1q_u8(reinterpret_cast<const uint8_t*>(p));
+                const uint64_t keep_mask = ~SIMD::get_nibble_mask(vceqq_u8(v, target_vec));
+                if (keep_mask != 0) {
+                    return p + (__builtin_ctzll(keep_mask) >> 2);
+                }
+                p += 16;
+            } while (static_cast<size_t>(end - p) >= 16);
+        }
+#endif
+    }
+    for (; p < end && *p == c; ++p) {
+    }
+    return p;
+}
+
+template <bool Simd = true>
+inline const char* skip_trailing_char(const char* begin, const char* end, char c) noexcept {
+    if (begin == nullptr || begin >= end) {
+        return end;
+    }
+    const char* p = end;
+    if constexpr (Simd) {
+#if defined(__AVX2__)
+        if (static_cast<size_t>(p - begin) >= 32) {
+            const __m256i target256 = _mm256_set1_epi8(c);
+            do {
+                const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p - 32));
+                const uint32_t eq_mask = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, target256)));
+                const uint32_t keep_mask = ~eq_mask;
+                if (keep_mask != 0) {
+                    return p - __builtin_clz(keep_mask);
+                }
+                p -= 32;
+            } while (static_cast<size_t>(p - begin) >= 32);
+        }
+        if (static_cast<size_t>(p - begin) >= 16) {
+            const __m128i target128 = _mm_set1_epi8(c);
+            const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p - 16));
+            const uint32_t eq_mask = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(v, target128)));
+            const uint32_t keep_mask = (~eq_mask) & 0xFFFFu;
+            if (keep_mask != 0) {
+                return (p - 16) + (32 - __builtin_clz(keep_mask));
+            }
+            p -= 16;
+        }
+#elif defined(__SSE2__)
+        if (static_cast<size_t>(p - begin) >= 16) {
+            const __m128i target128 = _mm_set1_epi8(c);
+            do {
+                const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p - 16));
+                const uint32_t eq_mask = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(v, target128)));
+                const uint32_t keep_mask = (~eq_mask) & 0xFFFFu;
+                if (keep_mask != 0) {
+                    return (p - 16) + (32 - __builtin_clz(keep_mask));
+                }
+                p -= 16;
+            } while (static_cast<size_t>(p - begin) >= 16);
+        }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+        if (static_cast<size_t>(p - begin) >= 16) {
+            const uint8x16_t target_vec = vdupq_n_u8(static_cast<uint8_t>(c));
+            do {
+                const uint8x16_t v = vld1q_u8(reinterpret_cast<const uint8_t*>(p - 16));
+                const uint64_t keep_mask = ~SIMD::get_nibble_mask(vceqq_u8(v, target_vec));
+                if (keep_mask != 0) {
+                    return p - (__builtin_clzll(keep_mask) >> 2);
+                }
+                p -= 16;
+            } while (static_cast<size_t>(p - begin) >= 16);
+        }
+#endif
+    }
+    for (; p > begin && *(p - 1) == c; --p) {
+    }
+    return p;
+}
+
 // Removes the leading and trailing ASCII spaces (0x20) of `str` and returns the remaining
 // substring, which still points into the buffer owned by the caller.
 //
@@ -118,15 +250,21 @@ struct ByteSet {
 // whitespace set would silently change what they parse. Use StripWhiteSpace() from
 // gutil/strings/strip.h when the full whitespace set should be removed instead.
 inline std::string_view trim_spaces(std::string_view str) {
-    size_t begin = 0;
-    size_t end = str.size();
-    while (begin < end && str[begin] == ' ') {
-        ++begin;
+    const char* begin = str.data();
+    const char* end = begin + str.size();
+    if (begin == end) {
+        return str;
     }
-    while (end > begin && str[end - 1] == ' ') {
-        --end;
+    if (*begin == ' ') {
+        begin = skip_leading_char<true>(begin + 1, end, ' ');
+        if (begin == end) {
+            return {begin, 0};
+        }
     }
-    return str.substr(begin, end - begin);
+    if (*(end - 1) == ' ') {
+        end = skip_trailing_char<true>(begin, end - 1, ' ');
+    }
+    return {begin, static_cast<size_t>(end - begin)};
 }
 
 } // namespace starrocks
