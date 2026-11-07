@@ -102,6 +102,57 @@ private:
 
         return haystack_end;
     }
+
+    __attribute__((target("sse4.1"))) const uint8_t* _rsearch_sse41_upto(const uint8_t* haystack, const uint8_t* p,
+                                                                         const uint8_t* haystack_end) const {
+        const size_t last_off = needle_size - 1;
+        const __m128i v_first = _mm_set1_epi8(static_cast<char>(first));
+        const __m128i v_last = _mm_set1_epi8(static_cast<char>(last));
+        const __m128i v_mid = _mm_set1_epi8(static_cast<char>(mid));
+
+        while (static_cast<size_t>(p - haystack) >= 16) {
+            p -= 16;
+            const __m128i f0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
+            const __m128i l0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + last_off));
+            __m128i eq0 = _mm_and_si128(_mm_cmpeq_epi8(f0, v_first), _mm_cmpeq_epi8(l0, v_last));
+            uint32_t mask = static_cast<uint32_t>(_mm_movemask_epi8(eq0));
+            if (mask != 0 && needle_size > 2) {
+                const __m128i m0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + mid_off));
+                eq0 = _mm_and_si128(eq0, _mm_cmpeq_epi8(m0, v_mid));
+                mask = static_cast<uint32_t>(_mm_movemask_epi8(eq0));
+            }
+            while (mask != 0) {
+                const uint32_t bit = 31U - static_cast<uint32_t>(__builtin_clz(mask));
+                if (_verify_interior(p + bit)) {
+                    return p + bit;
+                }
+                mask ^= (1U << bit);
+            }
+        }
+
+        if (p > haystack) {
+            const size_t rem = static_cast<size_t>(p - haystack);
+            const uint32_t head_mask = (1U << rem) - 1U;
+            const __m128i f0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(haystack));
+            const __m128i l0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(haystack + last_off));
+            __m128i eq0 = _mm_and_si128(_mm_cmpeq_epi8(f0, v_first), _mm_cmpeq_epi8(l0, v_last));
+            uint32_t mask = static_cast<uint32_t>(_mm_movemask_epi8(eq0)) & head_mask;
+            if (mask != 0 && needle_size > 2) {
+                const __m128i m0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(haystack + mid_off));
+                eq0 = _mm_and_si128(eq0, _mm_cmpeq_epi8(m0, v_mid));
+                mask = static_cast<uint32_t>(_mm_movemask_epi8(eq0)) & head_mask;
+            }
+            while (mask != 0) {
+                const uint32_t bit = 31U - static_cast<uint32_t>(__builtin_clz(mask));
+                if (_verify_interior(haystack + bit)) {
+                    return haystack + bit;
+                }
+                mask ^= (1U << bit);
+            }
+        }
+
+        return haystack_end;
+    }
 #endif
 
 public:
@@ -357,6 +408,203 @@ public:
     template <typename CharT, typename = std::enable_if_t<sizeof(CharT) == 1>>
     const CharT* search(const CharT* haystack, const size_t haystack_size) const {
         return search(haystack, haystack + haystack_size);
+    }
+
+    const uint8_t* rsearch_scalar(const uint8_t* haystack, const uint8_t* haystack_end) const {
+        if (needle_size == 0 || haystack == nullptr || haystack_end == nullptr || haystack >= haystack_end ||
+            static_cast<size_t>(haystack_end - haystack) < needle_size) {
+            return haystack_end;
+        }
+        if (needle_size == 1) {
+#if defined(__linux__) || defined(__GLIBC__)
+            const void* res = memrchr(haystack, first, static_cast<size_t>(haystack_end - haystack));
+            return res != nullptr ? static_cast<const uint8_t*>(res) : haystack_end;
+#else
+            const uint8_t* p = haystack_end;
+            while (p > haystack) {
+                --p;
+                if (*p == first) {
+                    return p;
+                }
+            }
+            return haystack_end;
+#endif
+        }
+
+        const size_t last_off = needle_size - 1;
+        const uint8_t* p = haystack_end - needle_size;
+        while (true) {
+            if (p[0] == first && p[last_off] == last && _verify_interior(p)) {
+                return p;
+            }
+            if (p == haystack) {
+                break;
+            }
+            --p;
+        }
+        return haystack_end;
+    }
+
+#if defined(__x86_64__)
+    __attribute__((target("sse4.1"))) const uint8_t* rsearch_sse41(const uint8_t* haystack,
+                                                                   const uint8_t* haystack_end) const {
+        if (needle_size <= 1 || haystack == nullptr || haystack_end == nullptr || haystack >= haystack_end ||
+            static_cast<size_t>(haystack_end - haystack) < (needle_size - 1) + 16) {
+            return rsearch_scalar(haystack, haystack_end);
+        }
+        const size_t last_off = needle_size - 1;
+        return _rsearch_sse41_upto(haystack, haystack_end - last_off, haystack_end);
+    }
+
+    __attribute__((target("avx2"))) const uint8_t* rsearch_avx2(const uint8_t* haystack,
+                                                                const uint8_t* haystack_end) const {
+        if (needle_size <= 1 || haystack == nullptr || haystack_end == nullptr || haystack >= haystack_end ||
+            static_cast<size_t>(haystack_end - haystack) < (needle_size - 1) + 16) {
+            return rsearch_scalar(haystack, haystack_end);
+        }
+
+        const size_t last_off = needle_size - 1;
+        const __m256i v_first256 = _mm256_set1_epi8(static_cast<char>(first));
+        const __m256i v_last256 = _mm256_set1_epi8(static_cast<char>(last));
+        const __m256i v_mid256 = _mm256_set1_epi8(static_cast<char>(mid));
+        const uint8_t* p = haystack_end - last_off;
+
+        while (static_cast<size_t>(p - haystack) >= 32) {
+            p -= 32;
+            const __m256i f = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+            const __m256i l = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + last_off));
+            __m256i eq = _mm256_and_si256(_mm256_cmpeq_epi8(f, v_first256), _mm256_cmpeq_epi8(l, v_last256));
+            uint32_t mask = static_cast<uint32_t>(_mm256_movemask_epi8(eq));
+            if (mask != 0 && needle_size > 2) {
+                const __m256i m = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + mid_off));
+                eq = _mm256_and_si256(eq, _mm256_cmpeq_epi8(m, v_mid256));
+                mask = static_cast<uint32_t>(_mm256_movemask_epi8(eq));
+            }
+            while (mask != 0) {
+                const uint32_t bit = 31U - static_cast<uint32_t>(__builtin_clz(mask));
+                if (_verify_interior(p + bit)) {
+                    return p + bit;
+                }
+                mask ^= (1U << bit);
+            }
+        }
+
+        return _rsearch_sse41_upto(haystack, p, haystack_end);
+    }
+#elif defined(__ARM_NEON)
+    const uint8_t* rsearch_neon(const uint8_t* haystack, const uint8_t* haystack_end) const {
+        if (needle_size <= 1 || haystack == nullptr || haystack_end == nullptr || haystack >= haystack_end ||
+            static_cast<size_t>(haystack_end - haystack) < (needle_size - 1) + 16) {
+            return rsearch_scalar(haystack, haystack_end);
+        }
+
+        const size_t last_off = needle_size - 1;
+        const uint8x16_t v_first = vdupq_n_u8(first);
+        const uint8x16_t v_last = vdupq_n_u8(last);
+        const uint8x16_t v_mid = vdupq_n_u8(mid);
+        const uint8_t* p = haystack_end - last_off;
+
+        while (static_cast<size_t>(p - haystack) >= 32) {
+            p -= 32;
+            const uint8x16_t f0 = vld1q_u8(p);
+            const uint8x16_t l0 = vld1q_u8(p + last_off);
+            const uint8x16_t f1 = vld1q_u8(p + 16);
+            const uint8x16_t l1 = vld1q_u8(p + 16 + last_off);
+
+            uint8x16_t eq0 = vandq_u8(vceqq_u8(f0, v_first), vceqq_u8(l0, v_last));
+            uint8x16_t eq1 = vandq_u8(vceqq_u8(f1, v_first), vceqq_u8(l1, v_last));
+
+            if (vmaxvq_u8(vorrq_u8(eq0, eq1)) != 0) {
+                if (needle_size > 2) {
+                    const uint8x16_t m0 = vld1q_u8(p + mid_off);
+                    const uint8x16_t m1 = vld1q_u8(p + 16 + mid_off);
+                    eq0 = vandq_u8(eq0, vceqq_u8(m0, v_mid));
+                    eq1 = vandq_u8(eq1, vceqq_u8(m1, v_mid));
+                }
+                uint64_t mask1 = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(eq1), 4)), 0);
+                while (mask1 != 0) {
+                    const uint32_t bit = static_cast<uint32_t>((63 - __builtin_clzll(mask1)) >> 2);
+                    if (_verify_interior(p + 16 + bit)) {
+                        return p + 16 + bit;
+                    }
+                    mask1 &= ~(0xFULL << (bit << 2));
+                }
+                uint64_t mask0 = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(eq0), 4)), 0);
+                while (mask0 != 0) {
+                    const uint32_t bit = static_cast<uint32_t>((63 - __builtin_clzll(mask0)) >> 2);
+                    if (_verify_interior(p + bit)) {
+                        return p + bit;
+                    }
+                    mask0 &= ~(0xFULL << (bit << 2));
+                }
+            }
+        }
+
+        while (static_cast<size_t>(p - haystack) >= 16) {
+            p -= 16;
+            const uint8x16_t f0 = vld1q_u8(p);
+            const uint8x16_t l0 = vld1q_u8(p + last_off);
+            uint8x16_t eq0 = vandq_u8(vceqq_u8(f0, v_first), vceqq_u8(l0, v_last));
+            if (vmaxvq_u8(eq0) != 0) {
+                if (needle_size > 2) {
+                    const uint8x16_t m0 = vld1q_u8(p + mid_off);
+                    eq0 = vandq_u8(eq0, vceqq_u8(m0, v_mid));
+                }
+                uint64_t mask0 = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(eq0), 4)), 0);
+                while (mask0 != 0) {
+                    const uint32_t bit = static_cast<uint32_t>((63 - __builtin_clzll(mask0)) >> 2);
+                    if (_verify_interior(p + bit)) {
+                        return p + bit;
+                    }
+                    mask0 &= ~(0xFULL << (bit << 2));
+                }
+            }
+        }
+
+        if (p > haystack) {
+            const size_t rem = static_cast<size_t>(p - haystack);
+            const uint8x16_t f0 = vld1q_u8(haystack);
+            const uint8x16_t l0 = vld1q_u8(haystack + last_off);
+            uint8x16_t eq0 = vandq_u8(vceqq_u8(f0, v_first), vceqq_u8(l0, v_last));
+            if (vmaxvq_u8(eq0) != 0) {
+                if (needle_size > 2) {
+                    const uint8x16_t m0 = vld1q_u8(haystack + mid_off);
+                    eq0 = vandq_u8(eq0, vceqq_u8(m0, v_mid));
+                }
+                uint64_t mask64 = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(eq0), 4)), 0);
+                mask64 &= (1ULL << (rem << 2)) - 1ULL;
+                while (mask64 != 0) {
+                    const uint32_t bit = static_cast<uint32_t>((63 - __builtin_clzll(mask64)) >> 2);
+                    if (_verify_interior(haystack + bit)) {
+                        return haystack + bit;
+                    }
+                    mask64 &= ~(0xFULL << (bit << 2));
+                }
+            }
+        }
+
+        return haystack_end;
+    }
+#endif
+
+    template <typename CharT, typename = std::enable_if_t<sizeof(CharT) == 1>>
+    const CharT* rsearch(const CharT* haystack, const CharT* const haystack_end) const {
+        const auto* h = reinterpret_cast<const uint8_t*>(haystack);
+        const auto* h_end = reinterpret_cast<const uint8_t*>(haystack_end);
+#if defined(__AVX2__)
+        return reinterpret_cast<const CharT*>(rsearch_avx2(h, h_end));
+#elif defined(__SSE4_1__)
+        return reinterpret_cast<const CharT*>(rsearch_sse41(h, h_end));
+#elif defined(__ARM_NEON)
+        return reinterpret_cast<const CharT*>(rsearch_neon(h, h_end));
+#else
+        return reinterpret_cast<const CharT*>(rsearch_scalar(h, h_end));
+#endif
+    }
+
+    template <typename CharT, typename = std::enable_if_t<sizeof(CharT) == 1>>
+    const CharT* rsearch(const CharT* haystack, const size_t haystack_size) const {
+        return rsearch(haystack, haystack + haystack_size);
     }
 };
 

@@ -297,4 +297,158 @@ TEST_F(StringSearcherTest, LongHomogeneousNeedleCapsAnchorSelection) {
     }
 }
 
+static std::vector<const uint8_t*> run_all_rkernels(const StringSearcher& s, const uint8_t* b, const uint8_t* e,
+                                                     size_t needle_len) {
+    std::vector<const uint8_t*> r{s.rsearch(b, e), s.rsearch_scalar(b, e)};
+    if (needle_len >= 2) {
+#if defined(__x86_64__)
+        if (__builtin_cpu_supports("sse4.1")) r.push_back(s.rsearch_sse41(b, e));
+        if (__builtin_cpu_supports("avx2")) r.push_back(s.rsearch_avx2(b, e));
+#elif defined(__ARM_NEON)
+        r.push_back(s.rsearch_neon(b, e));
+#endif
+    }
+    return r;
+}
+
+TEST_F(StringSearcherTest, RSearchFindLastAndNotFound) {
+    const std::string haystack = "abchellodefhelloghi";
+    TightBuffer hay(haystack);
+    StringSearcher searcher("hello", 5);
+    for (const auto* r : run_all_rkernels(searcher, hay.begin(), hay.end(), 5)) {
+        EXPECT_EQ(hay.begin() + 11, r);
+    }
+    EXPECT_EQ(reinterpret_cast<const char*>(hay.begin() + 11),
+              searcher.rsearch(reinterpret_cast<const char*>(hay.begin()), hay.size()));
+
+    StringSearcher missing("xyz", 3);
+    for (const auto* r : run_all_rkernels(missing, hay.begin(), hay.end(), 3)) {
+        EXPECT_EQ(hay.end(), r);
+    }
+}
+
+TEST_F(StringSearcherTest, RSearchMultipleHitsSameWindow) {
+    // Multiple hits within a single 16B and 32B window; rsearch must return the rightmost match.
+    const std::string haystack = "xy_ab_ab_ab_ab_ab_ab_ab_ab_ab_zw";
+    TightBuffer hay(haystack);
+    StringSearcher s2("ab", 2);
+    for (const auto* r : run_all_rkernels(s2, hay.begin(), hay.end(), 2)) {
+        EXPECT_EQ(hay.begin() + 27, r);
+    }
+    StringSearcher s1("a", 1);
+    for (const auto* r : run_all_rkernels(s1, hay.begin(), hay.end(), 1)) {
+        EXPECT_EQ(hay.begin() + 27, r);
+    }
+}
+
+TEST_F(StringSearcherTest, RSearchOverlappingNeedlesAndHeadWindow) {
+    // "abc###123###234" with "##": last hit at 10, then in [0, 10) ("abc###123#") last hit at 4,
+    // then in [0, 4) ("abc#") miss.
+    TightBuffer hay("abc###123###234");
+    StringSearcher s("##", 2);
+    for (const auto* r1 : run_all_rkernels(s, hay.begin(), hay.end(), 2)) {
+        ASSERT_EQ(hay.begin() + 10, r1);
+    }
+    for (const auto* r2 : run_all_rkernels(s, hay.begin(), hay.begin() + 10, 2)) {
+        ASSERT_EQ(hay.begin() + 4, r2);
+    }
+    for (const auto* r3 : run_all_rkernels(s, hay.begin(), hay.begin() + 4, 2)) {
+        ASSERT_EQ(hay.begin() + 4, r3);
+    }
+
+    // Exercise the overlapping head window (1 <= p - haystack < 16) with a false decoy at index 16
+    // that was already excluded by shrinking cur_end, or a match only in the head prefix [0, rem).
+    for (size_t rem = 1; rem < 16; ++rem) {
+        std::string buf(16 + rem + 3, 'x');
+        buf.replace(rem - 1, 4, "ABCD");
+        TightBuffer tb(buf);
+        StringSearcher s4("ABCD", 4);
+        for (const auto* r : run_all_rkernels(s4, tb.begin(), tb.end(), 4)) {
+            EXPECT_EQ(tb.begin() + (rem - 1), r) << "rem=" << rem;
+        }
+    }
+}
+
+TEST_F(StringSearcherTest, RSearchEmptyNullAndEmbeddedNul) {
+    StringSearcher two("ab", 2);
+    TightBuffer empty_hay("");
+    EXPECT_EQ(empty_hay.end(), two.rsearch(empty_hay.begin(), empty_hay.end()));
+    EXPECT_EQ(nullptr, two.rsearch(static_cast<const uint8_t*>(nullptr), static_cast<const uint8_t*>(nullptr)));
+    StringSearcher empty("", 0);
+    TightBuffer h("xyz");
+    EXPECT_EQ(h.end(), empty.rsearch(h.begin(), h.end()));
+
+    const std::string nul_needle("a\0b", 3);
+    const std::string nul_hay("xx a\0b yy a\0b zz", 16);
+    TightBuffer nh(nul_hay);
+    TightBuffer nn(nul_needle);
+    StringSearcher nul_searcher(nn.begin(), nn.size());
+    for (const auto* r : run_all_rkernels(nul_searcher, nh.begin(), nh.end(), 3)) {
+        EXPECT_EQ(nh.begin() + 10, r);
+    }
+    const std::string zero_byte("\0", 1);
+    TightBuffer zb(zero_byte);
+    StringSearcher zero_searcher(zb.begin(), zb.size());
+    EXPECT_EQ(nh.begin() + 11, zero_searcher.rsearch(nh.begin(), nh.end()));
+}
+
+TEST_F(StringSearcherTest, RSearchAllLengthsOffsetsAndKernelEquivalence) {
+    for (size_t needle_len : {size_t(1), size_t(2), size_t(3), size_t(6), size_t(15), size_t(16), size_t(17),
+                              size_t(31), size_t(32), size_t(33)}) {
+        std::string needle(needle_len, 'a');
+        needle.front() = 'F';
+        needle.back() = 'L';
+        if (needle_len > 2) {
+            needle[needle_len / 2] = 'M';
+        }
+        TightBuffer ndl(needle);
+        StringSearcher searcher(ndl.begin(), ndl.size());
+
+        for (size_t hay_len : {size_t(0), needle_len - 1, needle_len, needle_len + 1, size_t(48), size_t(96)}) {
+            std::string hay(hay_len, 'x');
+            TightBuffer miss_buf(hay);
+            for (const auto* r : run_all_rkernels(searcher, miss_buf.begin(), miss_buf.end(), needle_len)) {
+                EXPECT_EQ(miss_buf.end(), r);
+            }
+
+            if (hay_len >= needle_len) {
+                for (size_t pos = 0; pos <= hay_len - needle_len; ++pos) {
+                    std::string h = hay;
+                    h.replace(pos, needle_len, needle);
+                    TightBuffer hit_buf(h);
+                    const auto* expected = hit_buf.begin() + pos;
+                    for (const auto* r : run_all_rkernels(searcher, hit_buf.begin(), hit_buf.end(), needle_len)) {
+                        EXPECT_EQ(expected, r)
+                                << "needle_len=" << needle_len << " hay_len=" << hay_len << " pos=" << pos;
+                    }
+                }
+            }
+        }
+    }
+}
+
+TEST_F(StringSearcherTest, RSearchRandomisedDifferentialFuzz) {
+    constexpr uint32_t kSeed = 0x5EED1234;
+    std::mt19937 rng(kSeed);
+    for (int iter = 0; iter < 100000; ++iter) {
+        const int alphabet = 2 + static_cast<int>(rng() % 2);
+        auto gen = [&](size_t n) {
+            std::string s(n, 'a');
+            for (auto& c : s) c = static_cast<char>('a' + rng() % alphabet);
+            return s;
+        };
+        const size_t needle_len = 1 + rng() % 40;
+        const std::string needle = gen(needle_len);
+        const std::string hay = gen(rng() % 301);
+        TightBuffer h(hay);
+        TightBuffer n(needle);
+        StringSearcher searcher(n.begin(), n.size());
+        const size_t pos = std::string_view(hay).rfind(needle);
+        const uint8_t* expected = pos == std::string_view::npos ? h.end() : h.begin() + pos;
+        for (const auto* r : run_all_rkernels(searcher, h.begin(), h.end(), needle_len)) {
+            ASSERT_EQ(expected, r) << "seed=" << kSeed << " iter=" << iter << " needle=" << needle << " hay=" << hay;
+        }
+    }
+}
+
 } // namespace starrocks
