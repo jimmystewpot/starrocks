@@ -4512,4 +4512,53 @@ PARALLEL_TEST(VecStringFunctionsTest, initcapTest) {
     ASSERT_NE(std::string(error_result.status().message()).find("Invalid UTF-8 sequence"), std::string::npos);
 }
 
+PARALLEL_TEST(VecStringFunctionsTest, lengthOffsetOnlyBinaryColumnTest) {
+    std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+
+    // 1. Non-nullable offset-only BinaryColumn
+    auto col = BinaryColumn::create();
+    col->set_offset_only(true);
+    const std::vector<std::string> inputs = {
+            "", "a", "https://yandex.ru/search/?text=starrocks+clickbench+q27", "壹贰叁", "", std::string(300, 'u'),
+    };
+    for (const auto& s : inputs) {
+        col->append_string(s);
+    }
+    ASSERT_TRUE(col->is_offset_only());
+    ASSERT_EQ(0u, col->get_immutable_bytes().size());
+
+    Columns columns = {col};
+    auto res_or = StringFunctions::length(ctx.get(), columns);
+    ASSERT_TRUE(res_or.ok()) << res_or.status();
+    const auto* int_col = down_cast<const Int32Column*>(res_or.value().get());
+    ASSERT_EQ(inputs.size(), int_col->size());
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        ASSERT_EQ(static_cast<int32_t>(inputs[i].size()), int_col->get_data()[i]) << "i=" << i;
+    }
+
+    // 2. Nullable offset-only BinaryColumn
+    auto data_col = BinaryColumn::create();
+    data_col->set_offset_only(true);
+    auto null_col = NullColumn::create();
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        bool is_null = (i == 1 || i == 4);
+        data_col->append_string(is_null ? "" : inputs[i]);
+        null_col->append(is_null ? 1 : 0);
+    }
+    auto nullable_col = NullableColumn::create(std::move(data_col), std::move(null_col));
+    Columns nullable_columns = {nullable_col};
+    auto nullable_res_or = StringFunctions::length(ctx.get(), nullable_columns);
+    ASSERT_TRUE(nullable_res_or.ok()) << nullable_res_or.status();
+    const auto* res_nullable = down_cast<const NullableColumn*>(nullable_res_or.value().get());
+    const auto* res_ints = down_cast<const Int32Column*>(res_nullable->data_column().get());
+    ASSERT_EQ(inputs.size(), res_nullable->size());
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        bool expected_null = (i == 1 || i == 4);
+        ASSERT_EQ(expected_null, res_nullable->is_null(i)) << "i=" << i;
+        if (!expected_null) {
+            ASSERT_EQ(static_cast<int32_t>(inputs[i].size()), res_ints->get_data()[i]) << "i=" << i;
+        }
+    }
+}
+
 } // namespace starrocks
