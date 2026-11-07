@@ -4559,6 +4559,20 @@ PARALLEL_TEST(VecStringFunctionsTest, lengthOffsetOnlyBinaryColumnTest) {
             ASSERT_EQ(static_cast<int32_t>(inputs[i].size()), res_ints->get_data()[i]) << "i=" << i;
         }
     }
+
+    // 3. ConstColumn wrapping an offset-only BinaryColumn of size 1, repeated across 4 rows
+    auto const_data = BinaryColumn::create();
+    const_data->set_offset_only(true);
+    const_data->append_string(inputs[2]);
+    auto const_col = ConstColumn::create(std::move(const_data), 4);
+    Columns const_columns = {const_col};
+    auto const_res_or = StringFunctions::length(ctx.get(), const_columns);
+    ASSERT_TRUE(const_res_or.ok()) << const_res_or.status();
+    ASSERT_TRUE(const_res_or.value()->is_constant());
+    ASSERT_EQ(4u, const_res_or.value()->size());
+    const auto* res_const = down_cast<const ConstColumn*>(const_res_or.value().get());
+    const auto* res_const_ints = down_cast<const Int32Column*>(res_const->data_column().get());
+    ASSERT_EQ(static_cast<int32_t>(inputs[2].size()), res_const_ints->get_data()[0]);
 }
 
 } // namespace starrocks
