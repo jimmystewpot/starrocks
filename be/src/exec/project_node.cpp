@@ -275,21 +275,25 @@ void ProjectNode::_push_down_offset_only_slots() {
             ctx->root()->for_each_slot_id([&total_refs](SlotId id) { total_refs[id]++; });
         }
     }
-    for (const auto& [rf_id, rf_desc] : _runtime_filter_collector.descriptors()) {
-        if (rf_desc == nullptr) {
-            continue;
-        }
-        if (rf_desc->probe_expr_ctx() != nullptr && rf_desc->probe_expr_ctx()->root() != nullptr) {
-            rf_desc->probe_expr_ctx()->root()->for_each_slot_id([&total_refs](SlotId id) { total_refs[id]++; });
-        }
-        if (rf_desc->partition_by_expr_contexts() != nullptr) {
-            for (auto* part_ctx : *rf_desc->partition_by_expr_contexts()) {
-                if (part_ctx != nullptr && part_ctx->root() != nullptr) {
-                    part_ctx->root()->for_each_slot_id([&total_refs](SlotId id) { total_refs[id]++; });
+    auto collect_rf_slots = [&total_refs](const RuntimeFilterProbeCollector& collector) {
+        for (const auto& [rf_id, rf_desc] : collector.descriptors()) {
+            if (rf_desc == nullptr) {
+                continue;
+            }
+            if (rf_desc->probe_expr_ctx() != nullptr && rf_desc->probe_expr_ctx()->root() != nullptr) {
+                rf_desc->probe_expr_ctx()->root()->for_each_slot_id([&total_refs](SlotId id) { total_refs[id]++; });
+            }
+            if (rf_desc->partition_by_expr_contexts() != nullptr) {
+                for (auto* part_ctx : *rf_desc->partition_by_expr_contexts()) {
+                    if (part_ctx != nullptr && part_ctx->root() != nullptr) {
+                        part_ctx->root()->for_each_slot_id([&total_refs](SlotId id) { total_refs[id]++; });
+                    }
                 }
             }
         }
-    }
+    };
+    collect_rf_slots(_runtime_filter_collector);
+    collect_rf_slots(scan_node->runtime_filter_collector());
 
     std::unordered_set<SlotId> offset_only_slots;
     for (const auto& [slot_id, count] : total_refs) {
