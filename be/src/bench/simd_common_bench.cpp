@@ -48,6 +48,7 @@
 #include "base/simd/simd.h"
 #include "base/simd/string_length_filter.h"
 #include "base/string/string_searcher.h"
+#include "base/string/trim.h"
 #include "base/string/volnitsky.h"
 
 namespace starrocks {
@@ -493,8 +494,7 @@ BENCHMARK(BM_LengthEqMask_SmallSizes_SIMD)->DenseRange(1, 15, 1);
 
 // =====================================================================
 // Constant substring search baseline (VolnitskyUTF8 vs StringSearcher)
-// 
-=============================================================
+// =====================================================================
 //
 // Synthetic URL-like corpus matching ClickBench Q20-Q23 shape:
 //   * 4,096 rows per chunk (~68 bytes/row, ~278.5 KB/chunk)
@@ -1430,8 +1430,6 @@ BENCHMARK(BM_LikeSubstring_MultiThread_Optimized)
         ->UseRealTime();
 
 // =====================================================================
-=======
-
 // SIMD::Filter::filter_range across sizes and per-mille selectivities
 // =====================================================================
 
@@ -1466,8 +1464,6 @@ static void BM_FilterRange_Width(benchmark::State& state) {
 
 BENCHMARK_TEMPLATE(BM_FilterRange_Width, uint32_t)->Name("BM_FilterRange_4B")->Apply(GenerateFilterRangeMatrixArgs);
 BENCHMARK_TEMPLATE(BM_FilterRange_Width, uint64_t)->Name("BM_FilterRange_8B")->Apply(GenerateFilterRangeMatrixArgs);
-<<<<<<< HEAD
-=======
 
 // =====================================================================
 // 3-state Streaming Pre-Aggregation Selection Dispatch:
@@ -1664,7 +1660,251 @@ BENCHMARK(BM_StreamingAggSelectiveDispatch_Future)->Apply(GenerateStreamingAggDi
 BENCHMARK(BM_StreamingAggAutoAdjust_PrePR)->Apply(GenerateStreamingAggDispatchArgs);
 BENCHMARK(BM_StreamingAggAutoAdjust_CurrentPR)->Apply(GenerateStreamingAggDispatchArgs);
 BENCHMARK(BM_StreamingAggAutoAdjust_Future)->Apply(GenerateStreamingAggDispatchArgs);
->>>>>>> perf/simd-count-zero-mask-strlen
+
+// =====================================================================
+// String TRIM / LTRIM / RTRIM and trim_spaces microbenchmarks
+// =====================================================================
+//
+// Parameterized by (str_len, pad_len) over a 4,096-slice batch:
+//   * (24, 0)   : short strings, 0 leading/trailing trim chars (fast-reject path)
+//   * (64, 2)   : medium strings, 2 leading + 2 trailing trim chars
+//   * (64, 24)  : medium strings, 24 leading + 24 trailing trim chars
+//   * (256, 96) : long strings, 96 leading + 96 trailing trim chars
+
+static inline std::string_view legacy_trim_spaces(std::string_view str) {
+    size_t begin = 0;
+    size_t end = str.size();
+    while (begin < end && str[begin] == ' ') {
+        ++begin;
+    }
+    while (end > begin && str[end - 1] == ' ') {
+        --end;
+    }
+    return str.substr(begin, end - begin);
+}
+
+static inline const char* legacy_skip_leading_single(const char* begin, const char* end, char c) {
+    auto p = begin;
+#if defined(__SSE2__)
+    const auto size = end - begin;
+    const auto SSE2_BYTES = sizeof(__m128i);
+    const auto sse2_end = begin + (size & ~(SSE2_BYTES - 1));
+    const auto spaces = _mm_set1_epi8(c);
+    for (; p < sse2_end; p += SSE2_BYTES) {
+        uint32_t masks =
+                _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)), spaces));
+        int pos = __builtin_ctz((1u << SSE2_BYTES) | ~masks);
+        if (pos < static_cast<int>(SSE2_BYTES)) {
+            return p + pos;
+        }
+    }
+#endif
+    if (c == ' ') {
+        for (; p < end && *p == ' '; ++p) {
+        }
+    } else {
+        for (; p < end && *p == c; ++p) {
+        }
+    }
+    return p;
+}
+
+static inline const char* legacy_skip_trailing_single(const char* begin, const char* end, char c) {
+    if (begin == nullptr || begin == end) {
+        return end;
+    }
+    auto p = end;
+#if defined(__SSE2__)
+    const auto size = end - begin;
+    const auto SSE2_BYTES = sizeof(__m128i);
+    const auto sse2_begin = end - (size & ~(SSE2_BYTES - 1));
+    const auto spaces = _mm_set1_epi8(c);
+    for (p = end - SSE2_BYTES; p >= sse2_begin; p -= SSE2_BYTES) {
+        uint32_t masks =
+                _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)), spaces));
+        int pos = __builtin_clz(~(masks << SSE2_BYTES));
+        if (pos < static_cast<int>(SSE2_BYTES)) {
+            return p + SSE2_BYTES - pos;
+        }
+    }
+    p += SSE2_BYTES;
+#endif
+    if (c == ' ') {
+        for (--p; p >= begin && *p == ' '; --p) {
+        }
+    } else {
+        for (--p; p >= begin && *p == c; --p) {
+        }
+    }
+    return p + 1;
+}
+
+static inline const char* legacy_skip_leading_multi(const char* begin, const char* end, std::string_view remove) {
+    auto p = begin;
+    for (; p < end && remove.find(*p) != std::string_view::npos; ++p) {
+    }
+    return p;
+}
+
+static inline const char* legacy_skip_trailing_multi(const char* begin, const char* end, std::string_view remove) {
+    if (begin == nullptr || begin == end) {
+        return end;
+    }
+    auto p = end;
+    for (--p; p >= begin && remove.find(*p) != std::string_view::npos; --p) {
+    }
+    return p + 1;
+}
+
+struct TrimBenchBatch {
+    std::string arena;
+    std::vector<std::string_view> slices;
+};
+
+static TrimBenchBatch BuildTrimBenchBatch(size_t str_len, size_t pad_len, std::string_view pad_alphabet) {
+    TrimBenchBatch batch;
+    batch.arena.resize(kBatch * str_len);
+    batch.slices.resize(kBatch);
+    const size_t body_len = (2 * pad_len <= str_len) ? (str_len - 2 * pad_len) : 0;
+    for (size_t i = 0; i < kBatch; ++i) {
+        char* dst = batch.arena.data() + i * str_len;
+        for (size_t j = 0; j < pad_len; ++j) {
+            dst[j] = pad_alphabet[(i + j) % pad_alphabet.size()];
+        }
+        for (size_t j = 0; j < body_len; ++j) {
+            dst[pad_len + j] = static_cast<char>('a' + ((i + j) % 26));
+        }
+        for (size_t j = 0; j < pad_len; ++j) {
+            dst[pad_len + body_len + j] = pad_alphabet[(i + j + 3) % pad_alphabet.size()];
+        }
+        batch.slices[i] = std::string_view(dst, str_len);
+    }
+    return batch;
+}
+
+static void GenerateTrimBenchArgs(benchmark::Benchmark* b) {
+    b->Args({24, 0});
+    b->Args({64, 2});
+    b->Args({64, 24});
+    b->Args({256, 96});
+}
+
+static void BM_TrimSpaces_LegacyScalar(benchmark::State& state) {
+    const size_t str_len = static_cast<size_t>(state.range(0));
+    const size_t pad_len = static_cast<size_t>(state.range(1));
+    const auto batch = BuildTrimBenchBatch(str_len, pad_len, " ");
+    for (auto _ : state) {
+        size_t total_remaining = 0;
+        for (size_t i = 0; i < kBatch; ++i) {
+            std::string_view res = legacy_trim_spaces(batch.slices[i]);
+            total_remaining += res.size();
+        }
+        benchmark::DoNotOptimize(total_remaining);
+    }
+    state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(kBatch * str_len));
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(kBatch));
+}
+
+static void BM_TrimSpaces_Current(benchmark::State& state) {
+    const size_t str_len = static_cast<size_t>(state.range(0));
+    const size_t pad_len = static_cast<size_t>(state.range(1));
+    const auto batch = BuildTrimBenchBatch(str_len, pad_len, " ");
+    for (auto _ : state) {
+        size_t total_remaining = 0;
+        for (size_t i = 0; i < kBatch; ++i) {
+            std::string_view res = trim_spaces(batch.slices[i]);
+            total_remaining += res.size();
+        }
+        benchmark::DoNotOptimize(total_remaining);
+    }
+    state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(kBatch * str_len));
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(kBatch));
+}
+
+static void BM_TrimSingleChar_LegacySSE2(benchmark::State& state) {
+    const size_t str_len = static_cast<size_t>(state.range(0));
+    const size_t pad_len = static_cast<size_t>(state.range(1));
+    const auto batch = BuildTrimBenchBatch(str_len, pad_len, " ");
+    for (auto _ : state) {
+        size_t total_remaining = 0;
+        for (size_t i = 0; i < kBatch; ++i) {
+            const char* b = batch.slices[i].data();
+            const char* e = b + batch.slices[i].size();
+            b = legacy_skip_leading_single(b, e, ' ');
+            e = legacy_skip_trailing_single(b, e, ' ');
+            total_remaining += static_cast<size_t>(e - b);
+        }
+        benchmark::DoNotOptimize(total_remaining);
+    }
+    state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(kBatch * str_len));
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(kBatch));
+}
+
+static void BM_TrimSingleChar_Current(benchmark::State& state) {
+    const size_t str_len = static_cast<size_t>(state.range(0));
+    const size_t pad_len = static_cast<size_t>(state.range(1));
+    const auto batch = BuildTrimBenchBatch(str_len, pad_len, " ");
+    for (auto _ : state) {
+        size_t total_remaining = 0;
+        for (size_t i = 0; i < kBatch; ++i) {
+            const char* b = batch.slices[i].data();
+            const char* e = b + batch.slices[i].size();
+            b = legacy_skip_leading_single(b, e, ' ');
+            e = legacy_skip_trailing_single(b, e, ' ');
+            total_remaining += static_cast<size_t>(e - b);
+        }
+        benchmark::DoNotOptimize(total_remaining);
+    }
+    state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(kBatch * str_len));
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(kBatch));
+}
+
+static void BM_TrimMultiChar_LegacyFind(benchmark::State& state) {
+    const size_t str_len = static_cast<size_t>(state.range(0));
+    const size_t pad_len = static_cast<size_t>(state.range(1));
+    constexpr std::string_view kRemove = " \t\r\n\v\f";
+    const auto batch = BuildTrimBenchBatch(str_len, pad_len, kRemove);
+    for (auto _ : state) {
+        size_t total_remaining = 0;
+        for (size_t i = 0; i < kBatch; ++i) {
+            const char* b = batch.slices[i].data();
+            const char* e = b + batch.slices[i].size();
+            b = legacy_skip_leading_multi(b, e, kRemove);
+            e = legacy_skip_trailing_multi(b, e, kRemove);
+            total_remaining += static_cast<size_t>(e - b);
+        }
+        benchmark::DoNotOptimize(total_remaining);
+    }
+    state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(kBatch * str_len));
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(kBatch));
+}
+
+static void BM_TrimMultiChar_Current(benchmark::State& state) {
+    const size_t str_len = static_cast<size_t>(state.range(0));
+    const size_t pad_len = static_cast<size_t>(state.range(1));
+    constexpr std::string_view kRemove = " \t\r\n\v\f";
+    const auto batch = BuildTrimBenchBatch(str_len, pad_len, kRemove);
+    for (auto _ : state) {
+        size_t total_remaining = 0;
+        for (size_t i = 0; i < kBatch; ++i) {
+            const char* b = batch.slices[i].data();
+            const char* e = b + batch.slices[i].size();
+            b = legacy_skip_leading_multi(b, e, kRemove);
+            e = legacy_skip_trailing_multi(b, e, kRemove);
+            total_remaining += static_cast<size_t>(e - b);
+        }
+        benchmark::DoNotOptimize(total_remaining);
+    }
+    state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(kBatch * str_len));
+    state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(kBatch));
+}
+
+BENCHMARK(BM_TrimSpaces_LegacyScalar)->Apply(GenerateTrimBenchArgs);
+BENCHMARK(BM_TrimSpaces_Current)->Apply(GenerateTrimBenchArgs);
+BENCHMARK(BM_TrimSingleChar_LegacySSE2)->Apply(GenerateTrimBenchArgs);
+BENCHMARK(BM_TrimSingleChar_Current)->Apply(GenerateTrimBenchArgs);
+BENCHMARK(BM_TrimMultiChar_LegacyFind)->Apply(GenerateTrimBenchArgs);
+BENCHMARK(BM_TrimMultiChar_Current)->Apply(GenerateTrimBenchArgs);
 
 } // namespace starrocks
 
