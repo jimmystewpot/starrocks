@@ -30,6 +30,7 @@
 //   * string_length_filter.h : length_eq_mask  vs scalar batched compute
 
 #include <benchmark/benchmark.h>
+#include <re2/stringpiece.h>
 
 #include <cstdint>
 #include <limits>
@@ -39,6 +40,12 @@
 #include "base/simd/rle_simd.h"
 #include "base/simd/simd.h"
 #include "base/simd/string_length_filter.h"
+#include "base/string/slice.h"
+#include "column/binary_column.h"
+#include "column/column_helper.h"
+#include "exprs/binary_function.h"
+#include "exprs/function_context.h"
+#include "exprs/like_predicate.h"
 
 namespace starrocks {
 
@@ -319,6 +326,128 @@ static void BM_LengthEqMask_SIMD(benchmark::State& state) {
 
 BENCHMARK(BM_LengthEqMask_Scalar)->Arg(256)->Arg(1024)->Arg(4096);
 BENCHMARK(BM_LengthEqMask_SIMD)->Arg(256)->Arg(1024)->Arg(4096);
+
+// =====================================================================
+// Constant starts_with / ends_with / equals (Legacy Slice vs SIMD Raw)
+// =====================================================================
+
+namespace {
+
+struct LegacyStartsImpl {
+    template <LogicalType Type, LogicalType ResultType>
+    static inline RunTimeCppType<ResultType> apply(const RunTimeCppType<Type>& s, const RunTimeCppType<Type>& p) {
+        return (s.size >= p.size) && (Slice(s.data, p.size) == p);
+    }
+};
+
+struct LegacyEndsImpl {
+    template <LogicalType Type, LogicalType ResultType>
+    static inline RunTimeCppType<ResultType> apply(const RunTimeCppType<Type>& s, const RunTimeCppType<Type>& p) {
+        return (s.size >= p.size) && (Slice(s.data + s.size - p.size, p.size) == p);
+    }
+};
+
+struct LegacyEqualsImpl {
+    template <LogicalType Type, LogicalType ResultType>
+    static inline RunTimeCppType<ResultType> apply(const RunTimeCppType<Type>& s, const RunTimeCppType<Type>& p) {
+        return s == p;
+    }
+};
+
+struct LegacyRe2StartsImpl {
+    template <LogicalType Type, LogicalType ResultType>
+    static inline RunTimeCppType<ResultType> apply(const RunTimeCppType<Type>& s, const RunTimeCppType<Type>& p) {
+        re2::StringPiece str_sp(s.data, s.size);
+        re2::StringPiece prefix_sp(p.data, p.size);
+        return str_sp.starts_with(prefix_sp);
+    }
+};
+
+// profile:
+//   0 = length-rejected (all rows shorter than pattern for starts/ends, or len != pat_len for equals)
+//   1 = length-pass, 0% match (mismatch on last byte of pattern)
+//   2 = 50% match
+//   3 = 100% match
+static std::pair<ColumnPtr, std::string> make_like_bench_column(size_t num_rows, size_t pat_len, int profile,
+                                                                bool is_ends) {
+    std::string pattern(pat_len, 'a');
+    for (size_t i = 0; i < pat_len; ++i) {
+        pattern[i] = static_cast<char>('a' + (i % 26));
+    }
+    auto col = BinaryColumn::create();
+    col->reserve(num_rows, num_rows * (pat_len + 16));
+    for (size_t r = 0; r < num_rows; ++r) {
+        if (profile == 0) {
+            size_t short_len = pat_len > 0 ? (r % pat_len) : 0;
+            col->append(Slice(pattern.data(), short_len));
+        } else {
+            bool match = (profile == 3) || (profile == 2 && (r & 1) == 0);
+            std::string row_pat = pattern;
+            if (!match && !row_pat.empty()) {
+                row_pat.back() ^= 0x01;
+            }
+            std::string extra("0123456789abcdef", (r % 8) + 4);
+            std::string val = is_ends ? (extra + row_pat) : (row_pat + extra);
+            col->append(Slice(val));
+        }
+    }
+    return {std::move(col), std::move(pattern)};
+}
+
+} // namespace
+
+static void BM_ConstStartsWith_Legacy(benchmark::State& state) {
+    const size_t pat_len = static_cast<size_t>(state.range(0));
+    const int profile = static_cast<int>(state.range(1));
+    auto [col, pat_str] = make_like_bench_column(kBatch, pat_len, profile, false);
+    ColumnPtr pat_col = ColumnHelper::create_const_column<TYPE_VARCHAR>(Slice(pat_str), 1);
+    for (auto _ : state) {
+        ColumnPtr res =
+                VectorizedStrictBinaryFunction<LegacyStartsImpl>::evaluate<TYPE_VARCHAR, TYPE_BOOLEAN>(col, pat_col);
+        benchmark::DoNotOptimize(res);
+    }
+}
+
+static void BM_ConstStartsWith_Re2Legacy(benchmark::State& state) {
+    const size_t pat_len = static_cast<size_t>(state.range(0));
+    const int profile = static_cast<int>(state.range(1));
+    auto [col, pat_str] = make_like_bench_column(kBatch, pat_len, profile, false);
+    ColumnPtr pat_col = ColumnHelper::create_const_column<TYPE_VARCHAR>(Slice(pat_str), kBatch);
+    for (auto _ : state) {
+        ColumnPtr res =
+                VectorizedStrictBinaryFunction<LegacyRe2StartsImpl>::evaluate<TYPE_VARCHAR, TYPE_BOOLEAN>(col, pat_col);
+        benchmark::DoNotOptimize(res);
+    }
+}
+
+static void BM_ConstEndsWith_Legacy(benchmark::State& state) {
+    const size_t pat_len = static_cast<size_t>(state.range(0));
+    const int profile = static_cast<int>(state.range(1));
+    auto [col, pat_str] = make_like_bench_column(kBatch, pat_len, profile, true);
+    ColumnPtr pat_col = ColumnHelper::create_const_column<TYPE_VARCHAR>(Slice(pat_str), 1);
+    for (auto _ : state) {
+        ColumnPtr res =
+                VectorizedStrictBinaryFunction<LegacyEndsImpl>::evaluate<TYPE_VARCHAR, TYPE_BOOLEAN>(col, pat_col);
+        benchmark::DoNotOptimize(res);
+    }
+}
+
+static void BM_ConstEquals_Legacy(benchmark::State& state) {
+    const size_t pat_len = static_cast<size_t>(state.range(0));
+    const int profile = static_cast<int>(state.range(1));
+    auto [col, pat_str] = make_like_bench_column(kBatch, pat_len, profile, false);
+    ColumnPtr pat_col = ColumnHelper::create_const_column<TYPE_VARCHAR>(Slice(pat_str), 1);
+    for (auto _ : state) {
+        ColumnPtr res =
+                VectorizedStrictBinaryFunction<LegacyEqualsImpl>::evaluate<TYPE_VARCHAR, TYPE_BOOLEAN>(col, pat_col);
+        benchmark::DoNotOptimize(res);
+    }
+}
+
+BENCHMARK(BM_ConstStartsWith_Legacy)->ArgsProduct({{4, 7, 13, 24, 48}, {0, 1, 2, 3}});
+BENCHMARK(BM_ConstStartsWith_Re2Legacy)->ArgsProduct({{4, 7, 13, 24, 48}, {0, 1, 2, 3}});
+BENCHMARK(BM_ConstEndsWith_Legacy)->ArgsProduct({{4, 7, 13, 24, 48}, {0, 1, 2, 3}});
+BENCHMARK(BM_ConstEquals_Legacy)->ArgsProduct({{4, 7, 13, 24, 48}, {0, 1, 2, 3}});
 
 } // namespace starrocks
 
