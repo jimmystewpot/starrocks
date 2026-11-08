@@ -37,6 +37,11 @@ public:
     }
 
 public:
+    static bool has_compiled_regex_or_hs(FunctionContext* context) {
+        return LikePredicate::shared_state(context)->database != nullptr ||
+               LikePredicate::shared_state(context)->re2 != nullptr;
+    }
+
     TExprNode expr_node;
 };
 
@@ -1000,5 +1005,34 @@ TEST_F(LikeTest, issue76417RegexpAlternation) {
 
         ASSERT_TRUE(LikePredicate::regex_close(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
     }
+}
+
+TEST_F(LikeTest, emptyConstPatternLikeUsesConstantEquals) {
+    auto context = FunctionContext::create_test_context();
+    std::unique_ptr<FunctionContext> ctx(context);
+    Columns columns;
+
+    auto str = BinaryColumn::create();
+    str->append("");
+    str->append("a");
+    str->append("");
+    str->append("hello");
+    auto pattern = ColumnHelper::create_const_column<TYPE_VARCHAR>("", 4);
+
+    columns.emplace_back(std::move(str));
+    columns.emplace_back(std::move(pattern));
+    context->set_constant_columns(columns);
+
+    ASSERT_TRUE(LikePredicate::like_prepare(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+    EXPECT_FALSE(has_compiled_regex_or_hs(context));
+
+    auto result = LikePredicate::like(context, columns).value();
+    const auto* data = ColumnHelper::cast_to_raw<TYPE_BOOLEAN>(result)->immutable_data().data();
+    EXPECT_EQ(1, data[0]);
+    EXPECT_EQ(0, data[1]);
+    EXPECT_EQ(1, data[2]);
+    EXPECT_EQ(0, data[3]);
+
+    ASSERT_TRUE(LikePredicate::like_close(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
 }
 } // namespace starrocks

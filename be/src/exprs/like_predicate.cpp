@@ -134,7 +134,7 @@ Status LikePredicate::setup_like_state(FunctionContext* context, LikePredicateSt
         remove_escape_character(&search_string);
         state->set_search_string(search_string);
         state->function = &constant_starts_with_fn;
-    } else if (RE2::FullMatch(pattern_str, LIKE_EQUALS_RE, &search_string)) {
+    } else if (pattern_str.empty() || RE2::FullMatch(pattern_str, LIKE_EQUALS_RE, &search_string)) {
         remove_escape_character(&search_string);
         state->set_search_string(search_string);
         state->function = &constant_equals_fn;
@@ -315,9 +315,7 @@ StatusOr<ColumnPtr> LikePredicate::constant_starts_with_fn(FunctionContext* cont
 }
 
 // constant_equals
-DEFINE_BINARY_FUNCTION_WITH_IMPL(ConstantEqualsImpl, value, pattern) {
-    return value == pattern;
-}
+using ConstantEqualsImpl = BinaryStringEqNeKernel<false>;
 
 StatusOr<ColumnPtr> LikePredicate::constant_equals_fn(FunctionContext* context, const starrocks::Columns& columns) {
     auto state = shared_state(context);
