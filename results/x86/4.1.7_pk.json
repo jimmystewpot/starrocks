@@ -1,0 +1,27 @@
+{
+  "version": "4.1.7",
+  "phases": {
+    "phase1_bulk_load": {
+      "duration_seconds": 172.42,
+      "rows": 79995964,
+      "rows_per_second": 463959.9,
+      "sstable_bytes": 8063090465
+    },
+    "phase2_upsert_compaction": {
+      "new_rows_load_seconds": 35.0,
+      "updates_load_seconds": 0.0,
+      "compaction_seconds": 0.05,
+      "total_rows": 99997497,
+      "sstable_bytes": 8063090465
+    },
+    "phase3_point_lookups": {
+      "count": 1000,
+      "p50_ms": 32.99,
+      "p90_ms": 37.52,
+      "p95_ms": 39.11,
+      "p99_ms": 44.33,
+      "mean_ms": 33.11,
+      "total_seconds": 33.106
+    }
+  }
+}

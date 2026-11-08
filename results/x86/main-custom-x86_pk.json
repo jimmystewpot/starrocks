@@ -1,0 +1,27 @@
+{
+  "version": "main-custom-x86",
+  "phases": {
+    "phase1_bulk_load": {
+      "duration_seconds": 147.181,
+      "rows": 79995964,
+      "rows_per_second": 543522.7,
+      "sstable_bytes": 3396391288
+    },
+    "phase2_upsert_compaction": {
+      "new_rows_load_seconds": 48.184,
+      "updates_load_seconds": 31.315,
+      "compaction_seconds": 0.208,
+      "total_rows": 99997497,
+      "sstable_bytes": 4798822240
+    },
+    "phase3_point_lookups": {
+      "count": 1000,
+      "p50_ms": 40.39,
+      "p90_ms": 47.95,
+      "p95_ms": 50.04,
+      "p99_ms": 55.86,
+      "mean_ms": 40.04,
+      "total_seconds": 40.044
+    }
+  }
+}

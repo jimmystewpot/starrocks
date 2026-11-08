@@ -1,0 +1,27 @@
+{
+  "version": "unknown",
+  "phases": {
+    "phase1_bulk_load": {
+      "duration_seconds": 145.59,
+      "rows": 79995964,
+      "rows_per_second": 549461.8,
+      "sstable_bytes": 0
+    },
+    "phase2_upsert_compaction": {
+      "new_rows_load_seconds": 46.741,
+      "updates_load_seconds": 28.798,
+      "compaction_seconds": 0.059,
+      "total_rows": 99997497,
+      "sstable_bytes": 0
+    },
+    "phase3_point_lookups": {
+      "count": 1000,
+      "p50_ms": 42.12,
+      "p90_ms": 49.83,
+      "p95_ms": 52.18,
+      "p99_ms": 58.8,
+      "mean_ms": 41.84,
+      "total_seconds": 41.841
+    }
+  }
+}
