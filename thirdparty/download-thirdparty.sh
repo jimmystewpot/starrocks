@@ -955,8 +955,13 @@ fi
 # snappy patch to prevent CMake from forcibly disabling RTTI (-fno-rtti), maintaining compiler flag and ABI consistency with StarRocks
 if [[ -d $TP_SOURCE_DIR/$SNAPPY_SOURCE ]] ; then
     cd $TP_SOURCE_DIR/$SNAPPY_SOURCE
-    if [ ! -f "$PATCHED_MARK" ] && [[ $SNAPPY_SOURCE == "snappy-1.2.1" ]] ; then
-        apply_patch -p1 "$TP_PATCH_DIR/snappy-1.2.1-rtti.patch"
+    if [ ! -f "$PATCHED_MARK" ] ; then
+        if [[ $SNAPPY_SOURCE == "snappy-1.2.1" ]] ; then
+            apply_patch -p1 "$TP_PATCH_DIR/snappy-1.2.1-rtti.patch"
+        else
+            chmod +w CMakeLists.txt
+            sed -i '/-fno-rtti/d; /\/GR-/d' CMakeLists.txt
+        fi
         touch "$PATCHED_MARK"
     fi
     cd -
