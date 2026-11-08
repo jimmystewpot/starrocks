@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "base/testutil/parallel_test.h"
+#include "gutil/dynamic_annotations.h"
 
 namespace starrocks {
 
@@ -736,10 +737,6 @@ PARALLEL_TEST(SimdFilterTest, aarch64_explicit_neon_kernels) {
 }
 #endif
 
-
-    }
-}
-
 struct Elem3B {
     uint8_t bytes[3];
     bool operator==(const Elem3B& o) const { return std::memcmp(bytes, o.bytes, 3) == 0; }
@@ -772,7 +769,7 @@ static void check_element_width_patterns(GenFn gen_fn) {
             std::vector<T> src;
             std::vector<T> dst;
             std::vector<uint8_t> sel;
-            size_t out = filter_range(dst.data(), src.data(), sel, 0, 0);
+            size_t out = starrocks::filter_range(dst.data(), src.data(), sel, 0, 0);
             EXPECT_EQ(0, out);
             continue;
         }
@@ -811,7 +808,7 @@ static void check_element_width_patterns(GenFn gen_fn) {
 
             // Separate buffer
             std::vector<T> dst(n);
-            size_t out_sz = filter_range(dst.data(), src.data(), selector, 0, n);
+            size_t out_sz = starrocks::filter_range(dst.data(), src.data(), selector, 0, n);
             ASSERT_EQ(expected.size(), out_sz);
             for (size_t i = 0; i < out_sz; ++i) {
                 ASSERT_TRUE(expected[i] == dst[i]);
@@ -819,7 +816,7 @@ static void check_element_width_patterns(GenFn gen_fn) {
 
             // In-place
             std::vector<T> in_place = src;
-            size_t ip_sz = filter_range(in_place.data(), in_place.data(), selector, 0, n);
+            size_t ip_sz = starrocks::filter_range(in_place.data(), in_place.data(), selector, 0, n);
             ASSERT_EQ(expected.size(), ip_sz);
             for (size_t i = 0; i < ip_sz; ++i) {
                 ASSERT_TRUE(expected[i] == in_place[i]);
@@ -1172,7 +1169,7 @@ static void check_exact_capacity_asan_for_type() {
                 // Poison memory region strictly past `to`
                 ASAN_POISON_MEMORY_REGION(dst_buf.data() + to, kRedzone * sizeof(T));
 
-                size_t out_sz = filter_range(dst_buf.data(), src.data(), selector, from, to);
+                size_t out_sz = starrocks::filter_range(dst_buf.data(), src.data(), selector, from, to);
                 ASSERT_EQ(from + expected.size(), out_sz)
                         << "from=" << from << " to=" << to << " case=" << selectivity_case;
 
