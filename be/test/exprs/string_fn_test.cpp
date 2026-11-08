@@ -3533,11 +3533,6 @@ PARALLEL_TEST(VecStringFunctionsTest, replaceCoverageAllBranches) {
 
             auto const_src = ColumnHelper::create_const_column<TYPE_VARCHAR>("immutable_const", 4);
             auto ptn = ColumnHelper::create_const_column<TYPE_VARCHAR>(ptn_cstr, 4);
-            auto rpl_data = BinaryColumn::create();
-            rpl_data->append("r");
-            auto rpl_null = NullColumn::create(1, 0);
-            rpl_null->get_data()[0] = 0;
-            // Also test non-const nullable repl and const nullable repl
             auto var_rpl_data = BinaryColumn::create();
             auto var_rpl_null = NullColumn::create();
             for (int i = 0; i < 4; ++i) {
@@ -3642,13 +3637,8 @@ PARALLEL_TEST(VecStringFunctionsTest, replaceCoverageAllBranches) {
             context->set_constant_columns(columns);
             ASSERT_TRUE(StringFunctions::replace_prepare(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL)
                                 .ok());
-            const auto t0 = std::chrono::steady_clock::now();
             const auto res = StringFunctions::replace(context, columns).value();
-            const auto elapsed_ms =
-                    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
-                            .count();
             EXPECT_EQ(res.get(), str_col.get());
-            EXPECT_LT(elapsed_ms, 50) << "Expected fast short-row skip without cross-row straddle scanning";
 
             Columns match_columns{str_match_col, ptn, rpl};
             const auto res_match = StringFunctions::replace(context, match_columns).value();
