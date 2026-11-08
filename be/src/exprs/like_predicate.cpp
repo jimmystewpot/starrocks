@@ -14,8 +14,18 @@
 
 #include "exprs/like_predicate.h"
 
+#include <cstring>
+#include <limits>
 #include <memory>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
+#include "base/hash/unaligned_access.h"
+#include "base/simd/string_length_filter.h"
+#include "base/string/memcmp.h"
 #include "base/string/volnitsky.h"
 #include "base/utility/defer_op.h"
 #include "exprs/binary_function.h"
@@ -125,6 +135,17 @@ Status LikePredicate::setup_like_state(FunctionContext* context, LikePredicateSt
     auto pattern = ColumnHelper::get_const_value<TYPE_VARCHAR>(column);
     std::string pattern_str = pattern.to_string();
     std::string search_string;
+
+    if (pattern.empty()) {
+        state->set_search_string("");
+        state->function = &constant_equals_fn;
+        return Status::OK();
+    }
+    if (std::all_of(pattern_str.begin(), pattern_str.end(), [](char c) { return c == '%'; })) {
+        state->set_search_string("");
+        state->function = &constant_starts_with_fn;
+        return Status::OK();
+    }
 
     if (RE2::FullMatch(pattern_str, LIKE_ENDS_WITH_RE, &search_string)) {
         remove_escape_character(&search_string);
@@ -285,54 +306,361 @@ StatusOr<ColumnPtr> LikePredicate::match_fn_with_long_constant_pattern(FunctionC
     return result.build(all_const);
 }
 
-// constant_ends
-DEFINE_BINARY_FUNCTION_WITH_IMPL(ConstantEndsImpl, value, pattern) {
-    return (value.size >= pattern.size) && (pattern == Slice(value.data + value.size - pattern.size, pattern.size));
+namespace {
+
+enum class ConstantMatchMode {
+    STARTS_WITH,
+    ENDS_WITH,
+    EQUALS,
+};
+
+inline bool compare_interior_gt32_simd(const char* cand, const char* pat_data, size_t pat_len) {
+    size_t off = 8;
+#if defined(__SSE2__)
+    while (off + 16 <= pat_len - 8) {
+        __m128i vc = _mm_loadu_si128(reinterpret_cast<const __m128i*>(cand + off));
+        __m128i vp = _mm_loadu_si128(reinterpret_cast<const __m128i*>(pat_data + off));
+        __m128i diff = _mm_cmpeq_epi8(vc, vp);
+        if (_mm_movemask_epi8(diff) != 0xffff) {
+            return false;
+        }
+        off += 16;
+    }
+    if (off < pat_len - 8) {
+        __m128i vc = _mm_loadu_si128(reinterpret_cast<const __m128i*>(cand + pat_len - 24));
+        __m128i vp = _mm_loadu_si128(reinterpret_cast<const __m128i*>(pat_data + pat_len - 24));
+        __m128i diff = _mm_cmpeq_epi8(vc, vp);
+        if (_mm_movemask_epi8(diff) != 0xffff) {
+            return false;
+        }
+    }
+    return true;
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    while (off + 16 <= pat_len - 8) {
+        uint8x16_t vc = vld1q_u8(reinterpret_cast<const uint8_t*>(cand + off));
+        uint8x16_t vp = vld1q_u8(reinterpret_cast<const uint8_t*>(pat_data + off));
+        uint8x16_t diff = veorq_u8(vc, vp);
+        if (vmaxvq_u8(diff) != 0) {
+            return false;
+        }
+        off += 16;
+    }
+    if (off < pat_len - 8) {
+        uint8x16_t vc = vld1q_u8(reinterpret_cast<const uint8_t*>(cand + pat_len - 24));
+        uint8x16_t vp = vld1q_u8(reinterpret_cast<const uint8_t*>(pat_data + pat_len - 24));
+        uint8x16_t diff = veorq_u8(vc, vp);
+        if (vmaxvq_u8(diff) != 0) {
+            return false;
+        }
+    }
+    return true;
+#else
+    return std::memcmp(cand + 8, pat_data + 8, pat_len - 16) == 0;
+#endif
+}
+
+template <ConstantMatchMode Mode, typename OffsetT, typename MatchFn>
+inline void evaluate_with_comparator(const OffsetT* __restrict offset_data, const char* __restrict base_ptr,
+                                     uint32_t pat_len, size_t num_rows, uint8_t* __restrict dst, MatchFn&& match_fn) {
+    size_t i = 0;
+    if constexpr (sizeof(OffsetT) == sizeof(uint32_t) && SIMD::kStringLenSimdWidth > 1) {
+        constexpr size_t kSimdWidth = SIMD::kStringLenSimdWidth;
+        const auto* offsets32 = reinterpret_cast<const uint32_t*>(offset_data);
+        for (; i + kSimdWidth <= num_rows; i += kSimdWidth) {
+            uint32_t mask = 0;
+            if constexpr (Mode == ConstantMatchMode::EQUALS) {
+                mask = SIMD::length_eq_mask(offsets32, i, pat_len);
+            } else {
+                mask = SIMD::length_in_range_mask(offsets32, i, pat_len, std::numeric_limits<uint32_t>::max());
+            }
+
+            if (mask == 0) {
+                std::memset(dst + i, 0, kSimdWidth);
+                continue;
+            }
+
+            if (mask == SIMD::kStringLenSimdMask) {
+                for (size_t k = 0; k < kSimdWidth; ++k) {
+                    const size_t row = i + k;
+                    const char* cand = (Mode == ConstantMatchMode::ENDS_WITH)
+                                               ? (base_ptr + offset_data[row + 1] - pat_len)
+                                               : (base_ptr + offset_data[row]);
+                    dst[row] = static_cast<uint8_t>(match_fn(cand));
+                }
+                continue;
+            }
+
+            std::memset(dst + i, 0, kSimdWidth);
+            do {
+                const uint32_t bit = static_cast<uint32_t>(__builtin_ctz(mask));
+                const size_t row = i + bit;
+                const char* cand = (Mode == ConstantMatchMode::ENDS_WITH) ? (base_ptr + offset_data[row + 1] - pat_len)
+                                                                          : (base_ptr + offset_data[row]);
+                dst[row] = static_cast<uint8_t>(match_fn(cand));
+                mask &= (mask - 1);
+            } while (mask != 0);
+        }
+    }
+
+    for (; i < num_rows; ++i) {
+        const OffsetT off0 = offset_data[i];
+        const OffsetT off1 = offset_data[i + 1];
+        const OffsetT row_len = off1 - off0;
+        bool len_ok = false;
+        if constexpr (Mode == ConstantMatchMode::EQUALS) {
+            len_ok = (row_len == pat_len);
+        } else {
+            len_ok = (row_len >= pat_len);
+        }
+        if (len_ok) {
+            const char* cand = (Mode == ConstantMatchMode::ENDS_WITH) ? (base_ptr + off1 - pat_len) : (base_ptr + off0);
+            dst[i] = static_cast<uint8_t>(match_fn(cand));
+        } else {
+            dst[i] = 0;
+        }
+    }
+}
+
+template <ConstantMatchMode Mode>
+static void evaluate_binary_column(const BinaryColumn* haystack, const Slice& pattern, uint8_t* __restrict dst) {
+    const size_t num_rows = haystack->size();
+    if (num_rows == 0) {
+        return;
+    }
+
+    const size_t pat_size = pattern.size;
+    if (pat_size == 0) {
+        if constexpr (Mode == ConstantMatchMode::STARTS_WITH || Mode == ConstantMatchMode::ENDS_WITH) {
+            std::memset(dst, 1, num_rows);
+        } else {
+            haystack->get_offset().visit_storage([&](const auto& offsets_buf) {
+                const auto* __restrict offset_data = offsets_buf.data();
+                for (size_t i = 0; i < num_rows; ++i) {
+                    dst[i] = static_cast<uint8_t>(offset_data[i + 1] == offset_data[i]);
+                }
+            });
+        }
+        return;
+    }
+
+    const size_t total_bytes = haystack->get_immutable_bytes().size();
+    if (total_bytes < pat_size || pat_size > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+        std::memset(dst, 0, num_rows);
+        return;
+    }
+
+    const uint32_t pat_len = static_cast<uint32_t>(pat_size);
+    const char* const pat_data = pattern.data;
+    const char* const base_ptr = reinterpret_cast<const char*>(haystack->get_immutable_bytes().data());
+
+    haystack->get_offset().visit_storage([&](const auto& offsets_buf) {
+        using OffsetT = typename std::decay_t<decltype(offsets_buf)>::value_type;
+        const OffsetT* __restrict offset_data = offsets_buf.data();
+
+        switch (pat_len) {
+        case 1: {
+            const char c0 = pat_data[0];
+            evaluate_with_comparator<Mode, OffsetT>(offset_data, base_ptr, pat_len, num_rows, dst,
+                                                    [c0](const char* cand) { return cand[0] == c0; });
+            break;
+        }
+        case 2: {
+            const uint16_t w16 = unaligned_load<uint16_t>(pat_data);
+            evaluate_with_comparator<Mode, OffsetT>(
+                    offset_data, base_ptr, pat_len, num_rows, dst,
+                    [w16](const char* cand) { return unaligned_load<uint16_t>(cand) == w16; });
+            break;
+        }
+        case 3: {
+            const uint16_t head16 = unaligned_load<uint16_t>(pat_data);
+            const char tail8 = pat_data[2];
+            evaluate_with_comparator<Mode, OffsetT>(
+                    offset_data, base_ptr, pat_len, num_rows, dst, [head16, tail8](const char* cand) {
+                        return (unaligned_load<uint16_t>(cand) == head16) && (cand[2] == tail8);
+                    });
+            break;
+        }
+        case 4: {
+            const uint32_t w32 = unaligned_load<uint32_t>(pat_data);
+            evaluate_with_comparator<Mode, OffsetT>(
+                    offset_data, base_ptr, pat_len, num_rows, dst,
+                    [w32](const char* cand) { return unaligned_load<uint32_t>(cand) == w32; });
+            break;
+        }
+        case 5:
+        case 6:
+        case 7: {
+            const uint32_t head32 = unaligned_load<uint32_t>(pat_data);
+            const uint32_t tail32 = unaligned_load<uint32_t>(pat_data + pat_len - 4);
+            evaluate_with_comparator<Mode, OffsetT>(
+                    offset_data, base_ptr, pat_len, num_rows, dst, [head32, tail32, pat_len](const char* cand) {
+                        return ((unaligned_load<uint32_t>(cand) ^ head32) |
+                                (unaligned_load<uint32_t>(cand + pat_len - 4) ^ tail32)) == 0;
+                    });
+            break;
+        }
+        case 8: {
+            const uint64_t w64 = unaligned_load<uint64_t>(pat_data);
+            evaluate_with_comparator<Mode, OffsetT>(
+                    offset_data, base_ptr, pat_len, num_rows, dst,
+                    [w64](const char* cand) { return unaligned_load<uint64_t>(cand) == w64; });
+            break;
+        }
+        case 9:
+        case 10:
+        case 11:
+        case 12:
+        case 13:
+        case 14:
+        case 15:
+        case 16: {
+            const uint64_t head64 = unaligned_load<uint64_t>(pat_data);
+            const uint64_t tail64 = unaligned_load<uint64_t>(pat_data + pat_len - 8);
+            evaluate_with_comparator<Mode, OffsetT>(
+                    offset_data, base_ptr, pat_len, num_rows, dst, [head64, tail64, pat_len](const char* cand) {
+                        return ((unaligned_load<uint64_t>(cand) ^ head64) |
+                                (unaligned_load<uint64_t>(cand + pat_len - 8) ^ tail64)) == 0;
+                    });
+            break;
+        }
+        case 17:
+        case 18:
+        case 19:
+        case 20:
+        case 21:
+        case 22:
+        case 23:
+        case 24: {
+            const uint64_t head64 = unaligned_load<uint64_t>(pat_data);
+            const uint64_t tail64 = unaligned_load<uint64_t>(pat_data + pat_len - 8);
+            const uint64_t mid64 = unaligned_load<uint64_t>(pat_data + 8);
+            evaluate_with_comparator<Mode, OffsetT>(
+                    offset_data, base_ptr, pat_len, num_rows, dst, [head64, tail64, mid64, pat_len](const char* cand) {
+                        return (((unaligned_load<uint64_t>(cand) ^ head64) |
+                                 (unaligned_load<uint64_t>(cand + pat_len - 8) ^ tail64)) == 0) &&
+                               (unaligned_load<uint64_t>(cand + 8) == mid64);
+                    });
+            break;
+        }
+        case 25:
+        case 26:
+        case 27:
+        case 28:
+        case 29:
+        case 30:
+        case 31:
+        case 32: {
+            const uint64_t head64 = unaligned_load<uint64_t>(pat_data);
+            const uint64_t tail64 = unaligned_load<uint64_t>(pat_data + pat_len - 8);
+            const uint64_t mid_head64 = unaligned_load<uint64_t>(pat_data + 8);
+            const uint64_t mid_tail64 = unaligned_load<uint64_t>(pat_data + pat_len - 16);
+            evaluate_with_comparator<Mode, OffsetT>(
+                    offset_data, base_ptr, pat_len, num_rows, dst,
+                    [head64, tail64, mid_head64, mid_tail64, pat_len](const char* cand) {
+                        return (((unaligned_load<uint64_t>(cand) ^ head64) |
+                                 (unaligned_load<uint64_t>(cand + pat_len - 8) ^ tail64)) == 0) &&
+                               (((unaligned_load<uint64_t>(cand + 8) ^ mid_head64) |
+                                 (unaligned_load<uint64_t>(cand + pat_len - 16) ^ mid_tail64)) == 0);
+                    });
+            break;
+        }
+        default: {
+            const uint64_t head64 = unaligned_load<uint64_t>(pat_data);
+            const uint64_t tail64 = unaligned_load<uint64_t>(pat_data + pat_len - 8);
+            evaluate_with_comparator<Mode, OffsetT>(
+                    offset_data, base_ptr, pat_len, num_rows, dst,
+                    [head64, tail64, pat_data, pat_len](const char* cand) {
+                        if (((unaligned_load<uint64_t>(cand) ^ head64) |
+                             (unaligned_load<uint64_t>(cand + pat_len - 8) ^ tail64)) != 0) {
+                            return false;
+                        }
+                        return compare_interior_gt32_simd(cand, pat_data, pat_len);
+                    });
+            break;
+        }
+        }
+    });
+}
+
+template <ConstantMatchMode Mode>
+static StatusOr<ColumnPtr> evaluate_constant_pattern(const ColumnPtr& value_col, const Slice& pattern) {
+    if (value_col->only_null()) {
+        return ColumnHelper::create_const_null_column(value_col->size());
+    }
+
+    if (value_col->is_constant()) {
+        Slice haystack = ColumnHelper::get_const_value<TYPE_VARCHAR>(value_col);
+        bool matched = false;
+        if constexpr (Mode == ConstantMatchMode::STARTS_WITH) {
+            matched = haystack.starts_with(pattern);
+        } else if constexpr (Mode == ConstantMatchMode::ENDS_WITH) {
+            matched = haystack.ends_with(pattern);
+        } else {
+            matched = (haystack == pattern);
+        }
+        auto res = RunTimeColumnType<TYPE_BOOLEAN>::create();
+        res->append(matched);
+        return ConstColumn::create(std::move(res), value_col->size());
+    }
+
+    const BinaryColumn* haystack = nullptr;
+    NullColumnPtr res_null = nullptr;
+    if (value_col->is_nullable()) {
+        const auto* haystack_null = ColumnHelper::as_raw_column<NullableColumn>(value_col);
+        haystack = ColumnHelper::as_raw_column<BinaryColumn>(haystack_null->data_column());
+        res_null = haystack_null->null_column();
+    } else {
+        haystack = ColumnHelper::as_raw_column<BinaryColumn>(value_col);
+    }
+
+    const size_t num_rows = haystack->size();
+    auto res = RunTimeColumnType<TYPE_BOOLEAN>::create();
+    res->resize_uninitialized(num_rows);
+    uint8_t* __restrict dst = res->get_data().data();
+
+    evaluate_binary_column<Mode>(haystack, pattern, dst);
+
+    if (value_col->has_null()) {
+        return NullableColumn::create(std::move(res), std::move(res_null));
+    }
+    return res;
+}
+
+} // namespace
+
+StatusOr<ColumnPtr> LikePredicate::match_constant_starts_with(const ColumnPtr& value_col, const Slice& pattern) {
+    return evaluate_constant_pattern<ConstantMatchMode::STARTS_WITH>(value_col, pattern);
+}
+
+StatusOr<ColumnPtr> LikePredicate::match_constant_ends_with(const ColumnPtr& value_col, const Slice& pattern) {
+    return evaluate_constant_pattern<ConstantMatchMode::ENDS_WITH>(value_col, pattern);
+}
+
+StatusOr<ColumnPtr> LikePredicate::match_constant_equals(const ColumnPtr& value_col, const Slice& pattern) {
+    return evaluate_constant_pattern<ConstantMatchMode::EQUALS>(value_col, pattern);
 }
 
 StatusOr<ColumnPtr> LikePredicate::constant_ends_with_fn(FunctionContext* context, const starrocks::Columns& columns) {
     auto state = shared_state(context);
-
-    const auto& value = VECTORIZED_FN_ARGS(0);
-    auto pattern = state->_search_string_column;
-
-    return VectorizedStrictBinaryFunction<ConstantEndsImpl>::evaluate<TYPE_VARCHAR, TYPE_BOOLEAN>(value, pattern);
-}
-
-// constant_starts
-DEFINE_BINARY_FUNCTION_WITH_IMPL(ConstantStartsImpl, value, pattern) {
-    return (value.size >= pattern.size) && (pattern == Slice(value.data, pattern.size));
+    return match_constant_ends_with(VECTORIZED_FN_ARGS(0), state->search_string_sv);
 }
 
 StatusOr<ColumnPtr> LikePredicate::constant_starts_with_fn(FunctionContext* context,
                                                            const starrocks::Columns& columns) {
     auto state = shared_state(context);
-
-    const auto& value = VECTORIZED_FN_ARGS(0);
-    auto pattern = state->_search_string_column;
-
-    return VectorizedStrictBinaryFunction<ConstantStartsImpl>::evaluate<TYPE_VARCHAR, TYPE_BOOLEAN>(value, pattern);
-}
-
-// constant_equals
-DEFINE_BINARY_FUNCTION_WITH_IMPL(ConstantEqualsImpl, value, pattern) {
-    return value == pattern;
+    return match_constant_starts_with(VECTORIZED_FN_ARGS(0), state->search_string_sv);
 }
 
 StatusOr<ColumnPtr> LikePredicate::constant_equals_fn(FunctionContext* context, const starrocks::Columns& columns) {
     auto state = shared_state(context);
-
-    const auto& value = VECTORIZED_FN_ARGS(0);
-    auto pattern = state->_search_string_column;
-
-    return VectorizedStrictBinaryFunction<ConstantEqualsImpl>::evaluate<TYPE_VARCHAR, TYPE_BOOLEAN>(value, pattern);
+    return match_constant_equals(VECTORIZED_FN_ARGS(0), state->search_string_sv);
 }
 
 StatusOr<ColumnPtr> LikePredicate::constant_substring_fn(FunctionContext* context, const starrocks::Columns& columns) {
     RETURN_IF_COLUMNS_ONLY_NULL(columns);
     auto state = shared_state(context);
 
-    Slice needle = ColumnHelper::get_const_value<TYPE_VARCHAR>(state->_search_string_column);
+    Slice needle = state->search_string_sv;
     auto res = RunTimeColumnType<TYPE_BOOLEAN>::create();
 
     if (columns[0]->is_constant()) {
@@ -566,7 +894,7 @@ StatusOr<ColumnPtr> LikePredicate::regex_match_full(FunctionContext* context, co
             remove_escape_character(&str_pattern);
             auto pattern_slice = Slice(str_pattern);
             pattern_slice.remove_suffix(1);
-            result.append(ConstantStartsImpl::apply<Slice, Slice, bool>(value_viewer.value(row), pattern_slice));
+            result.append(value_viewer.value(row).starts_with(pattern_slice));
             break;
         }
         case FastPathType::END_WITH: {
@@ -574,7 +902,7 @@ StatusOr<ColumnPtr> LikePredicate::regex_match_full(FunctionContext* context, co
             remove_escape_character(&str_pattern);
             auto pattern_slice = Slice(str_pattern);
             pattern_slice.remove_prefix(1);
-            result.append(ConstantEndsImpl::apply<Slice, Slice, bool>(value_viewer.value(row), pattern_slice));
+            result.append(value_viewer.value(row).ends_with(pattern_slice));
             break;
         }
         case FastPathType::SUBSTRING: {
