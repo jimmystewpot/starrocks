@@ -334,29 +334,29 @@ BENCHMARK(BM_LengthEqMask_SIMD)->Arg(256)->Arg(1024)->Arg(4096);
 namespace {
 
 struct LegacyStartsImpl {
-    template <LogicalType Type, LogicalType ResultType>
-    static inline RunTimeCppType<ResultType> apply(const RunTimeCppType<Type>& s, const RunTimeCppType<Type>& p) {
+    template <typename LType, typename RType, typename ResultType>
+    static inline ResultType apply(const LType& s, const RType& p) {
         return (s.size >= p.size) && (Slice(s.data, p.size) == p);
     }
 };
 
 struct LegacyEndsImpl {
-    template <LogicalType Type, LogicalType ResultType>
-    static inline RunTimeCppType<ResultType> apply(const RunTimeCppType<Type>& s, const RunTimeCppType<Type>& p) {
+    template <typename LType, typename RType, typename ResultType>
+    static inline ResultType apply(const LType& s, const RType& p) {
         return (s.size >= p.size) && (Slice(s.data + s.size - p.size, p.size) == p);
     }
 };
 
 struct LegacyEqualsImpl {
-    template <LogicalType Type, LogicalType ResultType>
-    static inline RunTimeCppType<ResultType> apply(const RunTimeCppType<Type>& s, const RunTimeCppType<Type>& p) {
+    template <typename LType, typename RType, typename ResultType>
+    static inline ResultType apply(const LType& s, const RType& p) {
         return s == p;
     }
 };
 
 struct LegacyRe2StartsImpl {
-    template <LogicalType Type, LogicalType ResultType>
-    static inline RunTimeCppType<ResultType> apply(const RunTimeCppType<Type>& s, const RunTimeCppType<Type>& p) {
+    template <typename LType, typename RType, typename ResultType>
+    static inline ResultType apply(const LType& s, const RType& p) {
         re2::StringPiece str_sp(s.data, s.size);
         re2::StringPiece prefix_sp(p.data, p.size);
         return str_sp.starts_with(prefix_sp);
@@ -369,7 +369,7 @@ struct LegacyRe2StartsImpl {
 //   2 = 50% match
 //   3 = 100% match
 static std::pair<ColumnPtr, std::string> make_like_bench_column(size_t num_rows, size_t pat_len, int profile,
-                                                                bool is_ends) {
+                                                                bool is_ends, bool is_equals = false) {
     std::string pattern(pat_len, 'a');
     for (size_t i = 0; i < pat_len; ++i) {
         pattern[i] = static_cast<char>('a' + (i % 26));
@@ -386,8 +386,13 @@ static std::pair<ColumnPtr, std::string> make_like_bench_column(size_t num_rows,
             if (!match && !row_pat.empty()) {
                 row_pat.back() ^= 0x01;
             }
-            std::string extra("0123456789abcdef", (r % 8) + 4);
-            std::string val = is_ends ? (extra + row_pat) : (row_pat + extra);
+            std::string val;
+            if (is_equals) {
+                val = row_pat;
+            } else {
+                std::string extra("0123456789abcdef", (r % 8) + 4);
+                val = is_ends ? (extra + row_pat) : (row_pat + extra);
+            }
             col->append(Slice(val));
         }
     }
@@ -435,7 +440,7 @@ static void BM_ConstEndsWith_Legacy(benchmark::State& state) {
 static void BM_ConstEquals_Legacy(benchmark::State& state) {
     const size_t pat_len = static_cast<size_t>(state.range(0));
     const int profile = static_cast<int>(state.range(1));
-    auto [col, pat_str] = make_like_bench_column(kBatch, pat_len, profile, false);
+    auto [col, pat_str] = make_like_bench_column(kBatch, pat_len, profile, false, true);
     ColumnPtr pat_col = ColumnHelper::create_const_column<TYPE_VARCHAR>(Slice(pat_str), 1);
     for (auto _ : state) {
         ColumnPtr res =
@@ -444,10 +449,46 @@ static void BM_ConstEquals_Legacy(benchmark::State& state) {
     }
 }
 
+static void BM_ConstStartsWith_SIMD(benchmark::State& state) {
+    const size_t pat_len = static_cast<size_t>(state.range(0));
+    const int profile = static_cast<int>(state.range(1));
+    auto [col, pat_str] = make_like_bench_column(kBatch, pat_len, profile, false);
+    Slice pat(pat_str);
+    for (auto _ : state) {
+        ColumnPtr res = LikePredicate::match_constant_starts_with(col, pat).value();
+        benchmark::DoNotOptimize(res);
+    }
+}
+
+static void BM_ConstEndsWith_SIMD(benchmark::State& state) {
+    const size_t pat_len = static_cast<size_t>(state.range(0));
+    const int profile = static_cast<int>(state.range(1));
+    auto [col, pat_str] = make_like_bench_column(kBatch, pat_len, profile, true);
+    Slice pat(pat_str);
+    for (auto _ : state) {
+        ColumnPtr res = LikePredicate::match_constant_ends_with(col, pat).value();
+        benchmark::DoNotOptimize(res);
+    }
+}
+
+static void BM_ConstEquals_SIMD(benchmark::State& state) {
+    const size_t pat_len = static_cast<size_t>(state.range(0));
+    const int profile = static_cast<int>(state.range(1));
+    auto [col, pat_str] = make_like_bench_column(kBatch, pat_len, profile, false, true);
+    Slice pat(pat_str);
+    for (auto _ : state) {
+        ColumnPtr res = LikePredicate::match_constant_equals(col, pat).value();
+        benchmark::DoNotOptimize(res);
+    }
+}
+
 BENCHMARK(BM_ConstStartsWith_Legacy)->ArgsProduct({{4, 7, 13, 24, 48}, {0, 1, 2, 3}});
 BENCHMARK(BM_ConstStartsWith_Re2Legacy)->ArgsProduct({{4, 7, 13, 24, 48}, {0, 1, 2, 3}});
 BENCHMARK(BM_ConstEndsWith_Legacy)->ArgsProduct({{4, 7, 13, 24, 48}, {0, 1, 2, 3}});
 BENCHMARK(BM_ConstEquals_Legacy)->ArgsProduct({{4, 7, 13, 24, 48}, {0, 1, 2, 3}});
+BENCHMARK(BM_ConstStartsWith_SIMD)->ArgsProduct({{4, 7, 13, 24, 48}, {0, 1, 2, 3}});
+BENCHMARK(BM_ConstEndsWith_SIMD)->ArgsProduct({{4, 7, 13, 24, 48}, {0, 1, 2, 3}});
+BENCHMARK(BM_ConstEquals_SIMD)->ArgsProduct({{4, 7, 13, 24, 48}, {0, 1, 2, 3}});
 
 } // namespace starrocks
 
