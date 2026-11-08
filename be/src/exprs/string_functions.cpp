@@ -43,6 +43,7 @@
 #include "base/container/raw_container.h"
 #include "base/crypto/blake3_hash.h"
 #include "base/crypto/sm3.h"
+#include "base/string/trim.h"
 #include "base/string/utf8.h"
 #include "base/string/utf8_encoding.h"
 #include "base/types/int128.h"
@@ -2337,95 +2338,54 @@ StatusOr<ColumnPtr> StringFunctions::reverse(FunctionContext* context, const Col
     return VectorizedUnaryFunction<ReverseFunction>::evaluate<TYPE_VARCHAR>(columns[0]);
 }
 
+struct TrimState {
+    std::string remove_chars;
+    bool is_utf8 = false;
+    std::vector<size_t> utf8_index;
+    ByteSet byte_set;
+};
+
 // strings with little spaces can not benefit from simd optimization,
 // simd_optimization = false, turn off SIMD optimization
 template <bool simd_optimization, bool trim_single, bool trim_utf8>
-static inline const char* skip_leading_spaces(const char* begin, const char* end, const std::string& remove,
-                                              const std::vector<size_t>& utf8_index) {
-    auto p = begin;
-#if defined(__SSE2__)
-    if constexpr (simd_optimization && trim_single) {
-        const auto size = end - begin;
-        const auto SSE2_BYTES = sizeof(__m128i);
-        const auto sse2_end = begin + (size & ~(SSE2_BYTES - 1));
-        const auto spaces = _mm_set1_epi8(remove[0]);
-        for (; p < sse2_end; p += SSE2_BYTES) {
-            uint32_t masks = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128((__m128i*)p), spaces));
-            int pos = __builtin_ctz((1u << SSE2_BYTES) | ~masks);
-            if (pos < SSE2_BYTES) {
-                return p + pos;
-            }
-        }
-    }
-#endif
+static inline const char* skip_leading_spaces(const char* begin, const char* end, const TrimState& state) {
     if constexpr (trim_single) {
-        if (remove[0] == ' ') {
-            for (; p < end && *p == ' '; ++p) {
-            }
-        } else {
-            for (; p < end && *p == remove[0]; ++p) {
-            }
-        }
+        return skip_leading_char<simd_optimization>(begin, end, state.remove_chars[0]);
     } else if constexpr (!trim_utf8) {
-        for (; p < end && remove.find(*p) != remove.npos; ++p) {
-        }
+        return skip_leading_byteset<simd_optimization>(begin, end, state.byte_set);
     } else {
+        auto p = begin;
         size_t char_size = UTF8_BYTE_LENGTH_TABLE[(uint8_t)*p];
-        while (p < end && utf8_contains(remove, utf8_index, {p, char_size})) {
+        while (p < end && utf8_contains(state.remove_chars, state.utf8_index, {p, char_size})) {
             char_size = UTF8_BYTE_LENGTH_TABLE[(uint8_t)*p];
             p += char_size;
         }
+        return p;
     }
-    return p;
 }
 
 // strings with little spaces can not benefit from simd optimization,
 // simd_optimization = false, turn off SIMD optimization
 template <bool simd_optimization, bool trim_single, bool trim_utf8>
-static const char* skip_trailing_spaces(const char* begin, const char* end, const std::string& remove,
-                                        const std::vector<size_t>& utf8_index) {
-    if (UNLIKELY(begin == nullptr)) {
-        return begin;
-    }
-    // Nothing to trim when the slice is empty. Avoids walking backwards from
-    // end - 1, which would underflow when begin == end.
-    if (begin == end) {
-        return end;
-    }
-    auto p = end;
-#if defined(__SSE2__)
-    if constexpr (simd_optimization && trim_single && !trim_utf8) {
-        const auto size = end - begin;
-        const auto SSE2_BYTES = sizeof(__m128i);
-        const auto sse2_begin = end - (size & ~(SSE2_BYTES - 1));
-        const auto spaces = _mm_set1_epi8(remove[0]);
-        for (p = end - SSE2_BYTES; p >= sse2_begin; p -= SSE2_BYTES) {
-            uint32_t masks = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128((__m128i*)p), spaces));
-            int pos = __builtin_clz(~(masks << SSE2_BYTES));
-            if (pos < SSE2_BYTES) {
-                return p + SSE2_BYTES - pos;
-            }
-        }
-        p += SSE2_BYTES;
-    }
-#endif
+static inline const char* skip_trailing_spaces(const char* begin, const char* end, const TrimState& state) {
     if constexpr (trim_single) {
-        if (remove[0] == ' ') {
-            for (--p; p >= begin && *p == ' '; --p) {
-            }
-        } else {
-            for (--p; p >= begin && *p == remove[0]; --p) {
-            }
-        }
+        return skip_trailing_char<simd_optimization>(begin, end, state.remove_chars[0]);
     } else if constexpr (!trim_utf8) {
-        for (--p; p >= begin && remove.find(*p) != remove.npos; --p) {
-        }
+        return skip_trailing_byteset<simd_optimization>(begin, end, state.byte_set);
     } else {
-        p--;
+        if (UNLIKELY(begin == nullptr)) {
+            return begin;
+        }
+        // Nothing to trim when the slice is empty. Avoids walking backwards from
+        // end - 1, which would underflow when begin == end.
+        if (begin == end) {
+            return end;
+        }
+        auto p = end - 1;
         while (true) {
             // TODO: Maybe we could also match the charcters in reverse order instead of find the start of utf-8 char
             Slice utf8_char = utf8_char_start(p);
-            if (!utf8_contains(remove, utf8_index, utf8_char)) {
+            if (!utf8_contains(state.remove_chars, state.utf8_index, utf8_char)) {
                 break;
             }
             p = utf8_char.data - 1;
@@ -2433,8 +2393,8 @@ static const char* skip_trailing_spaces(const char* begin, const char* end, cons
                 break;
             }
         }
+        return p + 1;
     }
-    return p + 1;
 }
 
 enum TrimType { TRIM_LEFT, TRIM_RIGHT, TRIM_BOTH };
@@ -2443,8 +2403,7 @@ enum TrimSimdOptimization { TRIM_SIMD_NONE, TRIM_SIMD_LEFT, TRIM_SIMD_RIGHT, TRI
 template <TrimType trim_type, TrimSimdOptimization trim_simd_optimization, bool compute_spaces_num, bool trim_single,
           bool trim_utf8>
 static inline void trim_per_slice(const BinaryColumn* src, const size_t i, Bytes* bytes, Offsets* offsets,
-                                  const std::string& remove, const std::vector<size_t>& utf8_index,
-                                  [[maybe_unused]] size_t* leading_spaces_num,
+                                  const TrimState& state, [[maybe_unused]] size_t* leading_spaces_num,
                                   [[maybe_unused]] size_t* trailing_spaces_num) {
     auto s = src->get_slice(i);
     if (UNLIKELY(s.size == 0)) {
@@ -2459,7 +2418,7 @@ static inline void trim_per_slice(const BinaryColumn* src, const size_t i, Bytes
     if constexpr (trim_type == TRIM_LEFT || trim_type == TRIM_BOTH) {
         constexpr auto simd_enable =
                 trim_simd_optimization == TRIM_SIMD_LEFT || trim_simd_optimization == TRIM_SIMD_BOTH;
-        from_ptr = skip_leading_spaces<simd_enable, trim_single, trim_utf8>(from_ptr, end, remove, utf8_index);
+        from_ptr = skip_leading_spaces<simd_enable, trim_single, trim_utf8>(from_ptr, end, state);
         if constexpr (compute_spaces_num) {
             *leading_spaces_num += from_ptr - begin;
         }
@@ -2469,7 +2428,7 @@ static inline void trim_per_slice(const BinaryColumn* src, const size_t i, Bytes
     if constexpr (trim_type == TRIM_RIGHT || trim_type == TRIM_BOTH) {
         constexpr auto simd_enable =
                 trim_simd_optimization == TRIM_SIMD_RIGHT || trim_simd_optimization == TRIM_SIMD_BOTH;
-        to_ptr = skip_trailing_spaces<simd_enable, trim_single, trim_utf8>(from_ptr, to_ptr, remove, utf8_index);
+        to_ptr = skip_trailing_spaces<simd_enable, trim_single, trim_utf8>(from_ptr, to_ptr, state);
         if constexpr (compute_spaces_num) {
             *trailing_spaces_num += end - to_ptr;
         }
@@ -2481,66 +2440,192 @@ static inline void trim_per_slice(const BinaryColumn* src, const size_t i, Bytes
 
 template <TrimType trim_type, size_t simd_threshold, bool trim_single, bool trim_utf8>
 struct AdaptiveTrimFunction {
-    template <LogicalType Type, LogicalType ResultType, class RemoveArg, class Utf8Index>
-    static ColumnPtr evaluate(const ColumnPtr& column, RemoveArg&& remove, Utf8Index&& utf8_index) {
+    template <LogicalType Type, LogicalType ResultType, class StateArg>
+    static ColumnPtr evaluate(const ColumnPtr& column, StateArg&& state) {
         const auto* src = down_cast<const BinaryColumn*>(column.get());
+        const size_t num_rows = src->size();
+        if (num_rows == 0) {
+            return column;
+        }
+
+        if constexpr (!trim_utf8) {
+            return src->get_offset().visit_storage([&](const auto& src_offsets) -> ColumnPtr {
+                const size_t src_bytes_size = static_cast<size_t>(src_offsets[num_rows]);
+                if (src_bytes_size == 0) {
+                    return column;
+                }
+
+                const char* const src_base = src->get_string_begin();
+                const char remove_char = trim_single ? state.remove_chars[0] : '\0';
+                const ByteSet& byte_set = state.byte_set;
+
+                auto slice_needs_trim = [&](const char* b, const char* e) ALWAYS_INLINE -> bool {
+                    if constexpr (trim_single) {
+                        if constexpr (trim_type == TRIM_LEFT) {
+                            return *b == remove_char;
+                        } else if constexpr (trim_type == TRIM_RIGHT) {
+                            return *(e - 1) == remove_char;
+                        } else {
+                            return (*b == remove_char) || (*(e - 1) == remove_char);
+                        }
+                    } else {
+                        if constexpr (trim_type == TRIM_LEFT) {
+                            return byte_set.contains(static_cast<uint8_t>(*b));
+                        } else if constexpr (trim_type == TRIM_RIGHT) {
+                            return byte_set.contains(static_cast<uint8_t>(*(e - 1)));
+                        } else {
+                            return byte_set.contains(static_cast<uint8_t>(*b)) ||
+                                   byte_set.contains(static_cast<uint8_t>(*(e - 1)));
+                        }
+                    }
+                };
+
+                size_t first_trimmed_row = num_rows;
+                for (size_t r = 0; r < num_rows; ++r) {
+                    const auto start_off = src_offsets[r];
+                    const auto end_off = src_offsets[r + 1];
+                    if (start_off < end_off && slice_needs_trim(src_base + start_off, src_base + end_off)) {
+                        first_trimmed_row = r;
+                        break;
+                    }
+                }
+                if (first_trimmed_row == num_rows) {
+                    return column;
+                }
+
+                auto dst = RunTimeColumnType<TYPE_VARCHAR>::create();
+                auto& dst_offsets = dst->get_offset();
+                auto& dst_bytes = dst->get_bytes();
+                dst_offsets.make_room(num_rows + 1, src_bytes_size);
+
+                if (LIKELY(src_bytes_size <= STRING_FUNCTION_INITIAL_RESERVE_LIMIT)) {
+                    raw::make_room(&dst_bytes, src_bytes_size);
+                    uint8_t* const dst_byte_ptr = dst_bytes.data();
+
+                    dst_offsets.visit_storage([&](auto& dst_off_buf) {
+                        using DstOffsetT = typename std::decay_t<decltype(dst_off_buf)>::value_type;
+                        DstOffsetT* const dst_off_ptr = dst_off_buf.data();
+
+                        const size_t prefix_bytes = static_cast<size_t>(src_offsets[first_trimmed_row]);
+                        if (first_trimmed_row > 0) {
+                            for (size_t r = 0; r <= first_trimmed_row; ++r) {
+                                dst_off_ptr[r] = static_cast<DstOffsetT>(src_offsets[r]);
+                            }
+                            if (prefix_bytes > 0) {
+                                strings::memcpy_inlined(dst_byte_ptr, src_base, prefix_bytes);
+                            }
+                        } else {
+                            dst_off_ptr[0] = 0;
+                        }
+
+                        size_t dst_byte_offset = prefix_bytes;
+                        auto trim_row = [&]<bool leading_simd, bool trailing_simd, bool compute_spaces>(
+                                                size_t i, size_t* leading_spaces_num,
+                                                size_t* trailing_spaces_num) ALWAYS_INLINE {
+                            const auto start_off = src_offsets[i];
+                            const auto end_off = src_offsets[i + 1];
+                            if (UNLIKELY(start_off == end_off)) {
+                                dst_off_ptr[i + 1] = static_cast<DstOffsetT>(dst_byte_offset);
+                                return;
+                            }
+                            const char* const begin = src_base + start_off;
+                            const char* const end = src_base + end_off;
+                            const char* from_ptr = begin;
+                            if constexpr (trim_type == TRIM_LEFT || trim_type == TRIM_BOTH) {
+                                if constexpr (trim_single) {
+                                    from_ptr = skip_leading_char<leading_simd>(from_ptr, end, remove_char);
+                                } else {
+                                    from_ptr = skip_leading_byteset<leading_simd>(from_ptr, end, byte_set);
+                                }
+                                if constexpr (compute_spaces) {
+                                    *leading_spaces_num += static_cast<size_t>(from_ptr - begin);
+                                }
+                            }
+                            const char* to_ptr = end;
+                            if constexpr (trim_type == TRIM_RIGHT || trim_type == TRIM_BOTH) {
+                                if constexpr (trim_single) {
+                                    to_ptr = skip_trailing_char<trailing_simd>(from_ptr, to_ptr, remove_char);
+                                } else {
+                                    to_ptr = skip_trailing_byteset<trailing_simd>(from_ptr, to_ptr, byte_set);
+                                }
+                                if constexpr (compute_spaces) {
+                                    *trailing_spaces_num += static_cast<size_t>(end - to_ptr);
+                                }
+                            }
+                            const size_t kept_len = static_cast<size_t>(to_ptr - from_ptr);
+                            if (kept_len > 0) {
+                                strings::memcpy_inlined(dst_byte_ptr + dst_byte_offset, from_ptr, kept_len);
+                                dst_byte_offset += kept_len;
+                            }
+                            dst_off_ptr[i + 1] = static_cast<DstOffsetT>(dst_byte_offset);
+                        };
+
+                        size_t leading_spaces_num = 0;
+                        size_t trailing_spaces_num = 0;
+                        const size_t sample_end = std::min(num_rows, first_trimmed_row + 100ul);
+                        for (size_t i = first_trimmed_row; i < sample_end; ++i) {
+                            trim_row.template operator()<false, false, true>(i, &leading_spaces_num,
+                                                                             &trailing_spaces_num);
+                        }
+                        if (sample_end < num_rows) {
+                            const size_t sample_count = sample_end - first_trimmed_row;
+                            const bool leading_simd = leading_spaces_num > simd_threshold * sample_count;
+                            const bool trailing_simd = trailing_spaces_num > simd_threshold * sample_count;
+                            if (leading_simd && trailing_simd) {
+                                for (size_t i = sample_end; i < num_rows; ++i) {
+                                    trim_row.template operator()<true, true, false>(i, &leading_spaces_num,
+                                                                                    &trailing_spaces_num);
+                                }
+                            } else if (leading_simd && !trailing_simd) {
+                                for (size_t i = sample_end; i < num_rows; ++i) {
+                                    trim_row.template operator()<true, false, false>(i, &leading_spaces_num,
+                                                                                     &trailing_spaces_num);
+                                }
+                            } else if (!leading_simd && trailing_simd) {
+                                for (size_t i = sample_end; i < num_rows; ++i) {
+                                    trim_row.template operator()<false, true, false>(i, &leading_spaces_num,
+                                                                                     &trailing_spaces_num);
+                                }
+                            } else {
+                                for (size_t i = sample_end; i < num_rows; ++i) {
+                                    trim_row.template operator()<false, false, false>(i, &leading_spaces_num,
+                                                                                      &trailing_spaces_num);
+                                }
+                            }
+                        }
+                        dst_bytes.resize(dst_byte_offset);
+                    });
+                    return dst;
+                }
+
+                dst_offsets.set(0, 0);
+                dst_bytes.reserve(capped_string_function_initial_reserve(src_bytes_size));
+                size_t dummy = 0;
+                for (size_t i = 0; i < num_rows; ++i) {
+                    trim_per_slice<trim_type, TRIM_SIMD_BOTH, false, trim_single, trim_utf8>(
+                            src, i, &dst_bytes, &dst_offsets, state, &dummy, &dummy);
+                }
+                return dst;
+            });
+        }
 
         auto dst = RunTimeColumnType<TYPE_VARCHAR>::create();
         auto& dst_offsets = dst->get_offset();
         auto& dst_bytes = dst->get_bytes();
 
-        const auto num_rows = src->size();
         const auto src_bytes_size = src->get_immutable_bytes().size();
         dst_offsets.make_room(num_rows + 1, src_bytes_size);
         dst_offsets.set(0, 0);
         dst_bytes.reserve(capped_string_function_initial_reserve(src_bytes_size));
 
-        size_t i = 0;
-        const auto sample_num = std::min(num_rows, 100ul);
         size_t leading_spaces_num = 0;
         size_t trailing_spaces_num = 0;
-
-        for (; i < sample_num; ++i) {
-            trim_per_slice<trim_type, TRIM_SIMD_NONE, true, trim_single, trim_utf8>(
-                    src, i, &dst_bytes, &dst_offsets, remove, utf8_index, &leading_spaces_num, &trailing_spaces_num);
-        }
-        // when the average number of leading/trailing spaces in the sample is greater than
-        // simd_threshold, SIMD optimization is enabled.
-        bool leading_simd = leading_spaces_num > simd_threshold * sample_num;
-        bool trailing_simd = trailing_spaces_num > simd_threshold * sample_num;
-        if (leading_simd && trailing_simd) {
-            for (; i < num_rows; ++i) {
-                trim_per_slice<trim_type, TRIM_SIMD_BOTH, false, trim_single, trim_utf8>(
-                        src, i, &dst_bytes, &dst_offsets, remove, utf8_index, &leading_spaces_num,
-                        &trailing_spaces_num);
-            }
-        } else if (leading_simd) {
-            for (; i < num_rows; ++i) {
-                trim_per_slice<trim_type, TRIM_SIMD_LEFT, false, trim_single, trim_utf8>(
-                        src, i, &dst_bytes, &dst_offsets, remove, utf8_index, &leading_spaces_num,
-                        &trailing_spaces_num);
-            }
-        } else if (trailing_simd) {
-            for (; i < num_rows; ++i) {
-                trim_per_slice<trim_type, TRIM_SIMD_RIGHT, false, trim_single, trim_utf8>(
-                        src, i, &dst_bytes, &dst_offsets, remove, utf8_index, &leading_spaces_num,
-                        &trailing_spaces_num);
-            }
-        } else {
-            for (; i < num_rows; ++i) {
-                trim_per_slice<trim_type, TRIM_SIMD_NONE, false, trim_single, trim_utf8>(
-                        src, i, &dst_bytes, &dst_offsets, remove, utf8_index, &leading_spaces_num,
-                        &trailing_spaces_num);
-            }
+        for (size_t i = 0; i < num_rows; ++i) {
+            trim_per_slice<trim_type, TRIM_SIMD_NONE, false, trim_single, trim_utf8>(
+                    src, i, &dst_bytes, &dst_offsets, state, &leading_spaces_num, &trailing_spaces_num);
         }
         return dst;
     }
-};
-
-struct TrimState {
-    std::string remove_chars;
-    bool is_utf8;
-    std::vector<size_t> utf8_index;
 };
 
 template <TrimType trim_type>
@@ -2552,14 +2637,14 @@ static StatusOr<ColumnPtr> trim_impl(FunctionContext* context, const starrocks::
     if (!state->is_utf8) {
         if (remove_chars.size() == 1) {
             return VectorizedUnaryFunction<AdaptiveTrimFunction<trim_type, 8, true, false>>::template evaluate<
-                    TYPE_VARCHAR, const std::string&>(columns[0], remove_chars, state->utf8_index);
+                    TYPE_VARCHAR, const TrimState&>(columns[0], *state);
         } else {
             return VectorizedUnaryFunction<AdaptiveTrimFunction<trim_type, 8, false, false>>::template evaluate<
-                    TYPE_VARCHAR, const std::string&>(columns[0], remove_chars, state->utf8_index);
+                    TYPE_VARCHAR, const TrimState&>(columns[0], *state);
         }
     } else {
         return VectorizedUnaryFunction<AdaptiveTrimFunction<trim_type, 8, false, true>>::template evaluate<
-                TYPE_VARCHAR, const std::string&>(columns[0], remove_chars, state->utf8_index);
+                TYPE_VARCHAR, const TrimState&>(columns[0], *state);
     }
 }
 
@@ -2571,6 +2656,8 @@ Status StringFunctions::trim_prepare(FunctionContext* context, FunctionContext::
         auto* state = new TrimState();
         context->set_function_state(scope, state);
         state->remove_chars = " ";
+        state->is_utf8 = false;
+        state->byte_set = ByteSet::from_bytes(state->remove_chars);
         return Status::OK();
     }
     if (!context->is_constant_column(1)) {
@@ -2591,6 +2678,9 @@ Status StringFunctions::trim_prepare(FunctionContext* context, FunctionContext::
     state->remove_chars = std::move(remove);
     size_t utf8_len = get_utf8_index(state->remove_chars, &state->utf8_index);
     state->is_utf8 = state->remove_chars.length() > utf8_len;
+    if (!state->is_utf8) {
+        state->byte_set = ByteSet::from_bytes(state->remove_chars);
+    }
 
     return Status::OK();
 }
