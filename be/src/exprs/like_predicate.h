@@ -62,6 +62,10 @@ public:
      */
     DEFINE_VECTORIZED_FN(regex);
 
+    static StatusOr<ColumnPtr> match_constant_starts_with(const ColumnPtr& value_col, const Slice& pattern);
+    static StatusOr<ColumnPtr> match_constant_ends_with(const ColumnPtr& value_col, const Slice& pattern);
+    static StatusOr<ColumnPtr> match_constant_equals(const ColumnPtr& value_col, const Slice& pattern);
+
 private:
     /**
      * use for:
