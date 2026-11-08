@@ -1225,6 +1225,95 @@ PARALLEL_TEST(VecStringFunctionsTest, endsWithNullTest) {
     }
 }
 
+PARALLEL_TEST(VecStringFunctionsTest, startsAndEndsWithConstAndEdgeCasesTest) {
+    std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+
+    // 1. 1-row only_null() constant pattern column with 20-row data column MUST return 20 rows
+    {
+        auto str = BinaryColumn::create();
+        for (int i = 0; i < 20; ++i) {
+            str->append("row_" + std::to_string(i));
+        }
+        auto null_const_1 = ColumnHelper::create_const_null_column(1);
+        Columns cols = {str, null_const_1};
+
+        ColumnPtr res_starts = StringFunctions::starts_with(ctx.get(), cols).value();
+        ASSERT_TRUE(res_starts->only_null());
+        ASSERT_EQ(20, res_starts->size());
+
+        ColumnPtr res_ends = StringFunctions::ends_with(ctx.get(), cols).value();
+        ASSERT_TRUE(res_ends->only_null());
+        ASSERT_EQ(20, res_ends->size());
+    }
+
+    // 2. Constant pattern across all size classes + embedded NUL + nullable haystack
+    const std::vector<size_t> pat_lengths = {0, 1, 2, 3, 4, 7, 8, 13, 16, 24, 32, 48};
+    for (size_t pat_len : pat_lengths) {
+        std::string pat(pat_len, '\0');
+        for (size_t i = 0; i < pat_len; ++i) {
+            pat[i] = (i == 1 && pat_len >= 3) ? '\0' : static_cast<char>('A' + (i % 26));
+        }
+        auto data_col = BinaryColumn::create();
+        auto null_col = NullColumn::create();
+        const size_t n_rows = 35;
+        for (size_t r = 0; r < n_rows; ++r) {
+            null_col->append(r % 7 == 0 ? 1 : 0);
+            if (r % 4 == 0) {
+                data_col->append(Slice(pat + "suffix"));
+            } else if (r % 4 == 1) {
+                data_col->append(Slice("prefix" + pat));
+            } else if (r % 4 == 2) {
+                data_col->append(Slice(pat));
+            } else {
+                data_col->append(Slice("x"));
+            }
+        }
+        auto nullable_str = NullableColumn::create(data_col, null_col);
+        auto const_pat = ColumnHelper::create_const_column<TYPE_VARCHAR>(Slice(pat), n_rows);
+        Columns cols = {nullable_str, const_pat};
+
+        ColumnPtr res_s = StringFunctions::starts_with(ctx.get(), cols).value();
+        ColumnPtr res_e = StringFunctions::ends_with(ctx.get(), cols).value();
+        ASSERT_EQ(n_rows, res_s->size());
+        ASSERT_EQ(n_rows, res_e->size());
+
+        auto s_null = ColumnHelper::as_raw_column<NullableColumn>(res_s);
+        auto e_null = ColumnHelper::as_raw_column<NullableColumn>(res_e);
+        auto s_data = ColumnHelper::cast_to<TYPE_BOOLEAN>(s_null->data_column())->immutable_data();
+        auto e_data = ColumnHelper::cast_to<TYPE_BOOLEAN>(e_null->data_column())->immutable_data();
+
+        for (size_t r = 0; r < n_rows; ++r) {
+            if (r % 7 == 0) {
+                ASSERT_TRUE(res_s->is_null(r));
+                ASSERT_TRUE(res_e->is_null(r));
+            } else {
+                ASSERT_FALSE(res_s->is_null(r));
+                ASSERT_FALSE(res_e->is_null(r));
+                bool exp_s = (pat_len == 0) || (r % 4 == 0) || (r % 4 == 2);
+                bool exp_e = (pat_len == 0) || (r % 4 == 1) || (r % 4 == 2);
+                ASSERT_EQ(exp_s, static_cast<bool>(s_data[r])) << "pat_len=" << pat_len << " r=" << r;
+                ASSERT_EQ(exp_e, static_cast<bool>(e_data[r])) << "pat_len=" << pat_len << " r=" << r;
+            }
+        }
+    }
+
+    // 3. Non-constant embedded NUL test
+    {
+        auto str = BinaryColumn::create();
+        auto pfx = BinaryColumn::create();
+        str->append(Slice("ab\0cd", 5));
+        pfx->append(Slice("ab\0c", 4));
+        str->append(Slice("ab\0cd", 5));
+        pfx->append(Slice("ab\0x", 4));
+
+        Columns cols = {str, pfx};
+        auto res_s = StringFunctions::starts_with(ctx.get(), cols).value();
+        auto s_data = ColumnHelper::cast_to<TYPE_BOOLEAN>(res_s)->immutable_data();
+        ASSERT_EQ(1, s_data[0]);
+        ASSERT_EQ(0, s_data[1]);
+    }
+}
+
 PARALLEL_TEST(VecStringFunctionsTest, appendTrailingCharIfAbsentTest) {
     std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
     Columns columns;
