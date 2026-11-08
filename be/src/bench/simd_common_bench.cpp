@@ -49,6 +49,12 @@
 #include "base/simd/string_length_filter.h"
 #include "base/string/string_searcher.h"
 #include "base/string/volnitsky.h"
+#include "column/binary_column.h"
+#include "column/column_builder.h"
+#include "column/column_helper.h"
+#include "column/column_viewer.h"
+#include "exprs/function_context.h"
+#include "exprs/string_functions.h"
 
 namespace starrocks {
 
@@ -493,8 +499,7 @@ BENCHMARK(BM_LengthEqMask_SmallSizes_SIMD)->DenseRange(1, 15, 1);
 
 // =====================================================================
 // Constant substring search baseline (VolnitskyUTF8 vs StringSearcher)
-// 
-=============================================================
+// =====================================================================
 //
 // Synthetic URL-like corpus matching ClickBench Q20-Q23 shape:
 //   * 4,096 rows per chunk (~68 bytes/row, ~278.5 KB/chunk)
@@ -1430,8 +1435,6 @@ BENCHMARK(BM_LikeSubstring_MultiThread_Optimized)
         ->UseRealTime();
 
 // =====================================================================
-=======
-
 // SIMD::Filter::filter_range across sizes and per-mille selectivities
 // =====================================================================
 
@@ -1466,8 +1469,6 @@ static void BM_FilterRange_Width(benchmark::State& state) {
 
 BENCHMARK_TEMPLATE(BM_FilterRange_Width, uint32_t)->Name("BM_FilterRange_4B")->Apply(GenerateFilterRangeMatrixArgs);
 BENCHMARK_TEMPLATE(BM_FilterRange_Width, uint64_t)->Name("BM_FilterRange_8B")->Apply(GenerateFilterRangeMatrixArgs);
-<<<<<<< HEAD
-=======
 
 // =====================================================================
 // 3-state Streaming Pre-Aggregation Selection Dispatch:
@@ -1664,7 +1665,126 @@ BENCHMARK(BM_StreamingAggSelectiveDispatch_Future)->Apply(GenerateStreamingAggDi
 BENCHMARK(BM_StreamingAggAutoAdjust_PrePR)->Apply(GenerateStreamingAggDispatchArgs);
 BENCHMARK(BM_StreamingAggAutoAdjust_CurrentPR)->Apply(GenerateStreamingAggDispatchArgs);
 BENCHMARK(BM_StreamingAggAutoAdjust_Future)->Apply(GenerateStreamingAggDispatchArgs);
->>>>>>> perf/simd-count-zero-mask-strlen
+
+// =====================================================================
+// StringFunctions::replace — Legacy (std::string::replace) vs Flat-Buffer SIMD
+// =====================================================================
+
+static ColumnPtr legacy_string_replace(const Columns& columns, const std::string& ptn, const std::string& rpl) {
+    const auto str_viewer = ColumnViewer<TYPE_VARCHAR>(columns[0]);
+    const auto size = columns[0]->size();
+    ColumnBuilder<TYPE_VARCHAR> result(size);
+    for (size_t row = 0; row < size; ++row) {
+        if (str_viewer.is_null(row)) {
+            result.append_null();
+            continue;
+        }
+        const auto str_slice = str_viewer.value(row);
+        if (str_slice.empty()) {
+            result.append(Slice());
+            continue;
+        }
+        std::string str = str_slice.to_string();
+        std::string::size_type ix = 0;
+        while (true) {
+            std::string::size_type found = str.find(ptn, ix);
+            if (found == std::string::npos) {
+                break;
+            }
+            str.replace(found, ptn.length(), rpl);
+            ix = found + rpl.length();
+        }
+        result.append(Slice(str));
+    }
+    return result.build(ColumnHelper::is_all_const(columns));
+}
+
+static Columns BuildStringReplaceColumns(int mode, int hit_pct, std::string* out_ptn, std::string* out_rpl,
+                                         size_t* out_total_bytes) {
+    std::string hit_row;
+    std::string miss_row;
+    if (mode == 0) {
+        *out_ptn = "foo";
+        *out_rpl = "bar";
+        hit_row = "abc_foo_defg";
+        miss_row = "abcdefghijkl";
+    } else if (mode == 1) {
+        *out_ptn = "-";
+        *out_rpl = "_";
+        hit_row = "2026-11-08-session-id-0123456789";
+        miss_row = "2026_11_08_session_id_0123456789";
+    } else if (mode == 2) {
+        *out_ptn = "ab";
+        *out_rpl = "wxyz";
+        hit_row = "0123ab456789ab0123456789abcdef01";
+        miss_row = "01234567890123456789012345678901";
+    } else {
+        *out_ptn = "ab";
+        *out_rpl = "";
+        hit_row = "0123ab456789ab0123456789abcdef01";
+        miss_row = "01234567890123456789012345678901";
+    }
+
+    auto str_col = BinaryColumn::create();
+    size_t total_bytes = 0;
+    for (size_t i = 0; i < kBatch; ++i) {
+        const bool is_hit = (hit_pct > 0) && (hit_pct >= 100 || ((i * static_cast<size_t>(hit_pct)) % 100) <
+                                                                        static_cast<size_t>(hit_pct));
+        const std::string& s = is_hit ? hit_row : miss_row;
+        str_col->append(s);
+        total_bytes += s.size();
+    }
+    *out_total_bytes = total_bytes;
+    auto ptn_col = ColumnHelper::create_const_column<TYPE_VARCHAR>(*out_ptn, kBatch);
+    auto rpl_col = ColumnHelper::create_const_column<TYPE_VARCHAR>(*out_rpl, kBatch);
+    return Columns{std::move(str_col), std::move(ptn_col), std::move(rpl_col)};
+}
+
+static void GenerateStringReplaceArgs(benchmark::Benchmark* b) {
+    for (int64_t mode : {0, 1, 2, 3}) {
+        for (int64_t hit_pct : {0, 1, 10, 100}) {
+            b->Args({mode, hit_pct});
+        }
+    }
+}
+
+static void BM_StringReplace_Legacy(benchmark::State& state) {
+    const int mode = static_cast<int>(state.range(0));
+    const int hit_pct = static_cast<int>(state.range(1));
+    std::string ptn;
+    std::string rpl;
+    size_t total_bytes = 0;
+    Columns columns = BuildStringReplaceColumns(mode, hit_pct, &ptn, &rpl, &total_bytes);
+
+    for (auto _ : state) {
+        ColumnPtr out = legacy_string_replace(columns, ptn, rpl);
+        benchmark::DoNotOptimize(out);
+    }
+    state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(total_bytes));
+}
+
+static void BM_StringReplace_SIMD(benchmark::State& state) {
+    const int mode = static_cast<int>(state.range(0));
+    const int hit_pct = static_cast<int>(state.range(1));
+    std::string ptn;
+    std::string rpl;
+    size_t total_bytes = 0;
+    Columns columns = BuildStringReplaceColumns(mode, hit_pct, &ptn, &rpl, &total_bytes);
+
+    std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+    ctx->set_constant_columns(columns);
+    (void)StringFunctions::replace_prepare(ctx.get(), FunctionContext::FRAGMENT_LOCAL);
+
+    for (auto _ : state) {
+        ColumnPtr out = StringFunctions::replace(ctx.get(), columns).value();
+        benchmark::DoNotOptimize(out);
+    }
+    (void)StringFunctions::replace_close(ctx.get(), FunctionContext::FRAGMENT_LOCAL);
+    state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(total_bytes));
+}
+
+BENCHMARK(BM_StringReplace_Legacy)->Apply(GenerateStringReplaceArgs);
+BENCHMARK(BM_StringReplace_SIMD)->Apply(GenerateStringReplaceArgs);
 
 } // namespace starrocks
 
