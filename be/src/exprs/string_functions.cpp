@@ -57,6 +57,7 @@
 #include "common/status.h"
 #include "common/storage_define.h"
 #include "exprs/binary_function.h"
+#include "exprs/like_predicate.h"
 #include "exprs/math_functions.h"
 #include "exprs/regexp_split.h"
 #include "exprs/unary_function.h"
@@ -792,24 +793,34 @@ StatusOr<ColumnPtr> StringFunctions::right(FunctionContext* context, const Colum
 
 // starts_with
 DEFINE_BINARY_FUNCTION_WITH_IMPL(starts_withImpl, str, prefix) {
-    re2::StringPiece str_sp(str.data, str.size);
-    re2::StringPiece prefix_sp(prefix.data, prefix.size);
-    return str_sp.starts_with(prefix_sp);
+    return str.starts_with(prefix);
 }
 
 StatusOr<ColumnPtr> StringFunctions::starts_with(FunctionContext* context, const Columns& columns) {
+    if (columns[0]->only_null() || columns[1]->only_null()) {
+        return ColumnHelper::create_const_null_column(columns[0]->size());
+    }
+    if (columns[1]->is_constant()) {
+        Slice prefix = ColumnHelper::get_const_value<TYPE_VARCHAR>(columns[1]);
+        return LikePredicate::match_constant_starts_with(columns[0], prefix);
+    }
     return VectorizedStrictBinaryFunction<starts_withImpl>::evaluate<TYPE_VARCHAR, TYPE_BOOLEAN>(columns[0],
                                                                                                  columns[1]);
 }
 
 // ends_with
 DEFINE_BINARY_FUNCTION_WITH_IMPL(ends_withImpl, str, suffix) {
-    re2::StringPiece str_sp(str.data, str.size);
-    re2::StringPiece suffix_sp(suffix.data, suffix.size);
-    return str_sp.ends_with(suffix_sp);
+    return str.ends_with(suffix);
 }
 
 StatusOr<ColumnPtr> StringFunctions::ends_with(FunctionContext* context, const Columns& columns) {
+    if (columns[0]->only_null() || columns[1]->only_null()) {
+        return ColumnHelper::create_const_null_column(columns[0]->size());
+    }
+    if (columns[1]->is_constant()) {
+        Slice suffix = ColumnHelper::get_const_value<TYPE_VARCHAR>(columns[1]);
+        return LikePredicate::match_constant_ends_with(columns[0], suffix);
+    }
     return VectorizedStrictBinaryFunction<ends_withImpl>::evaluate<TYPE_VARCHAR, TYPE_BOOLEAN>(columns[0], columns[1]);
 }
 
