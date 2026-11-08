@@ -662,6 +662,272 @@ TEST_F(VectorizedBinaryPredicateStringTest, kernelDirectAndLargeOffsets) {
     EXPECT_EQ(0, d_eq_16[5]);
 }
 
+TEST_F(VectorizedBinaryPredicateStringTest, allLengthTiersNearMissMatrix) {
+    const std::vector<size_t> lengths = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 15, 16, 17, 32, 128};
+    const std::vector<TExprOpcode::type> opcodes = {TExprOpcode::EQ, TExprOpcode::NE, TExprOpcode::EQ_FOR_NULL};
+
+    auto eval_pred = [&](TExprOpcode::type op, const ColumnPtr& lhs, const ColumnPtr& rhs) -> ColumnPtr {
+        expr_node.opcode = op;
+        std::unique_ptr<Expr> expr(VectorizedBinaryPredicateFactory::from_thrift(expr_node));
+        MockExpr e_lhs(expr_node, lhs);
+        MockExpr e_rhs(expr_node, rhs);
+        expr->add_child(&e_lhs);
+        expr->add_child(&e_rhs);
+        return expr->evaluate(nullptr, nullptr);
+    };
+
+    for (size_t target_len : lengths) {
+        std::string target(target_len, 'a');
+        for (size_t i = 0; i < target_len; ++i) {
+            target[i] = static_cast<char>('a' + (i % 26));
+        }
+
+        std::vector<std::string> candidates;
+        std::vector<bool> expected_eq;
+
+        // 0: exact match
+        candidates.push_back(target);
+        expected_eq.push_back(true);
+
+        if (target_len > 0) {
+            // byte-0 mismatch
+            std::string m0 = target;
+            m0[0] ^= 0x01;
+            candidates.push_back(m0);
+            expected_eq.push_back(false);
+
+            // middle-byte mismatch
+            std::string mmid = target;
+            mmid[target_len / 2] ^= 0x01;
+            candidates.push_back(mmid);
+            expected_eq.push_back(false);
+
+            // last-byte (target_len - 1) mismatch
+            std::string mlast = target;
+            mlast[target_len - 1] ^= 0x01;
+            candidates.push_back(mlast);
+            expected_eq.push_back(false);
+
+            // length target_len - 1
+            candidates.push_back(target.substr(0, target_len - 1));
+            expected_eq.push_back(false);
+        }
+
+        // length target_len + 1
+        candidates.push_back(target + "z");
+        expected_eq.push_back(false);
+
+        // empty string candidate when target_len > 0
+        if (target_len > 0) {
+            candidates.emplace_back("");
+            expected_eq.push_back(false);
+        }
+
+        auto vec_col = BinaryColumn::create();
+        auto rhs_vec_col = BinaryColumn::create();
+        for (const auto& s : candidates) {
+            vec_col->append(s);
+            rhs_vec_col->append(target);
+        }
+        const size_t n = candidates.size();
+        ColumnPtr const_col = ColumnHelper::create_const_column<TYPE_VARCHAR>(Slice(target), n);
+
+        for (auto op : opcodes) {
+            const bool is_ne = (op == TExprOpcode::NE);
+            auto res_vc = eval_pred(op, vec_col, const_col);
+            auto res_cv = eval_pred(op, const_col, vec_col);
+            auto res_vv = eval_pred(op, vec_col, rhs_vec_col);
+
+            const auto* d_vc = ColumnHelper::cast_to_raw<TYPE_BOOLEAN>(res_vc)->immutable_data().data();
+            const auto* d_cv = ColumnHelper::cast_to_raw<TYPE_BOOLEAN>(res_cv)->immutable_data().data();
+            const auto* d_vv = ColumnHelper::cast_to_raw<TYPE_BOOLEAN>(res_vv)->immutable_data().data();
+
+            for (size_t i = 0; i < n; ++i) {
+                uint8_t exp = static_cast<uint8_t>(expected_eq[i] ^ is_ne);
+                EXPECT_EQ(exp, d_vc[i]) << "len=" << target_len << " op=" << op << " row=" << i;
+                EXPECT_EQ(exp, d_cv[i]) << "len=" << target_len << " op=" << op << " row=" << i;
+                EXPECT_EQ(exp, d_vv[i]) << "len=" << target_len << " op=" << op << " row=" << i;
+            }
+        }
+    }
+}
+
+TEST_F(VectorizedBinaryPredicateStringTest, containerResourceNonZeroBaseOffsetAndAsanBounds) {
+    const std::vector<size_t> const_lengths = {0, 1, 4, 7, 8, 13, 16, 23};
+    std::vector<std::string> row_strings;
+    for (size_t len : const_lengths) {
+        std::string s(len, 'x');
+        for (size_t i = 0; i < len; ++i) {
+            s[i] = static_cast<char>('A' + ((len + i) % 26));
+        }
+        row_strings.push_back(s);
+    }
+
+    // Build an exact-sized std::vector<uint8_t> (no 16-byte tail padding) with a 5-byte prefix before row 0
+    BinaryColumn::Offsets offsets;
+    uint32_t cur_offset = 5;
+    offsets.emplace_back(cur_offset);
+    for (const auto& s : row_strings) {
+        cur_offset += static_cast<uint32_t>(s.size());
+        offsets.emplace_back(cur_offset);
+    }
+
+    auto raw_buf = std::make_shared<std::vector<uint8_t>>(cur_offset, 0x7F);
+    uint32_t write_pos = 5;
+    for (const auto& s : row_strings) {
+        if (!s.empty()) {
+            memcpy(raw_buf->data() + write_pos, s.data(), s.size());
+        }
+        write_pos += static_cast<uint32_t>(s.size());
+    }
+    ASSERT_EQ(raw_buf->size(), static_cast<size_t>(cur_offset));
+
+    ContainerResource resource(raw_buf, raw_buf->data(), raw_buf->size());
+    ColumnPtr col = BinaryColumn::create(std::move(resource), std::move(offsets));
+    ASSERT_EQ(row_strings.size(), col->size());
+
+    auto eval_pred = [&](TExprOpcode::type op, const ColumnPtr& lhs, const ColumnPtr& rhs) -> ColumnPtr {
+        expr_node.opcode = op;
+        std::unique_ptr<Expr> expr(VectorizedBinaryPredicateFactory::from_thrift(expr_node));
+        MockExpr e_lhs(expr_node, lhs);
+        MockExpr e_rhs(expr_node, rhs);
+        expr->add_child(&e_lhs);
+        expr->add_child(&e_rhs);
+        return expr->evaluate(nullptr, nullptr);
+    };
+
+    for (size_t idx = 0; idx < const_lengths.size(); ++idx) {
+        const std::string& target = row_strings[idx];
+        ColumnPtr c_col = ColumnHelper::create_const_column<TYPE_VARCHAR>(Slice(target), col->size());
+
+        for (auto op : {TExprOpcode::EQ, TExprOpcode::NE, TExprOpcode::EQ_FOR_NULL}) {
+            const bool is_ne = (op == TExprOpcode::NE);
+            auto res = eval_pred(op, col, c_col);
+            const auto* d = ColumnHelper::cast_to_raw<TYPE_BOOLEAN>(res)->immutable_data().data();
+            for (size_t row = 0; row < row_strings.size(); ++row) {
+                uint8_t exp = static_cast<uint8_t>((row == idx) ^ is_ne);
+                EXPECT_EQ(exp, d[row]) << "target_idx=" << idx << " row=" << row << " op=" << op;
+            }
+        }
+    }
+}
+
+TEST_F(VectorizedBinaryPredicateStringTest, nullSafeEqShortCircuitAndUnderlyingBytesUnderNull) {
+    expr_node.opcode = TExprOpcode::EQ_FOR_NULL;
+    auto eval_eq_for_null = [&](const ColumnPtr& lhs, const ColumnPtr& rhs) -> ColumnPtr {
+        std::unique_ptr<Expr> expr(VectorizedBinaryPredicateFactory::from_thrift(expr_node));
+        MockExpr e_lhs(expr_node, lhs);
+        MockExpr e_rhs(expr_node, rhs);
+        expr->add_child(&e_lhs);
+        expr->add_child(&e_rhs);
+        return expr->evaluate(nullptr, nullptr);
+    };
+
+    const size_t n = 4;
+    auto non_null_bin = BinaryColumn::create();
+    non_null_bin->append("alpha");
+    non_null_bin->append("target_str");
+    non_null_bin->append("gamma");
+    non_null_bin->append("delta");
+    ColumnPtr non_nullable_col = non_null_bin;
+    ColumnPtr only_null_col = ColumnHelper::create_const_null_column(n);
+
+    // 1a. only_null() <=> only_null() -> ConstColumn(true, n)
+    {
+        ColumnPtr res = eval_eq_for_null(only_null_col, only_null_col);
+        ASSERT_TRUE(res->is_constant());
+        ASSERT_TRUE(res->get(0).get_uint8());
+    }
+
+    // 1b. only_null() <=> non_nullable_col and non_nullable_col <=> only_null() -> ConstColumn(false, n)
+    {
+        ColumnPtr res1 = eval_eq_for_null(only_null_col, non_nullable_col);
+        ASSERT_TRUE(res1->is_constant());
+        ASSERT_FALSE(res1->get(0).get_uint8());
+
+        ColumnPtr res2 = eval_eq_for_null(non_nullable_col, only_null_col);
+        ASSERT_TRUE(res2->is_constant());
+        ASSERT_FALSE(res2->get(0).get_uint8());
+    }
+
+    // 2. NullableColumn <=> ConstColumn("target_str") where row 1 has null_data[1] = 1
+    // AND its underlying BinaryColumn at row 1 contains "target_str".
+    auto data1 = BinaryColumn::create();
+    data1->append("target_str"); // row 0: non-null, matches -> 1
+    data1->append("target_str"); // row 1: NULL, underlying bytes match -> must be 0!
+    data1->append("other_str");  // row 2: NULL, underlying bytes differ -> 0
+    data1->append("other_str");  // row 3: non-null, differs -> 0
+
+    auto null1 = NullColumn::create();
+    null1->append(0);
+    null1->append(1);
+    null1->append(1);
+    null1->append(0);
+    ColumnPtr nullable1 = NullableColumn::create(data1, null1);
+    ColumnPtr const_target = ColumnHelper::create_const_column<TYPE_VARCHAR>("target_str", n);
+
+    // 1c. only_null() <=> nullable1 and nullable1 <=> only_null()
+    {
+        ColumnPtr res1 = eval_eq_for_null(only_null_col, nullable1);
+        ASSERT_FALSE(res1->is_nullable());
+        const auto& d1 = BooleanColumn::static_pointer_cast(res1)->get_data();
+        EXPECT_EQ(0, d1[0]);
+        EXPECT_EQ(1, d1[1]);
+        EXPECT_EQ(1, d1[2]);
+        EXPECT_EQ(0, d1[3]);
+
+        ColumnPtr res2 = eval_eq_for_null(nullable1, only_null_col);
+        ASSERT_FALSE(res2->is_nullable());
+        const auto& d2 = BooleanColumn::static_pointer_cast(res2)->get_data();
+        EXPECT_EQ(0, d2[0]);
+        EXPECT_EQ(1, d2[1]);
+        EXPECT_EQ(1, d2[2]);
+        EXPECT_EQ(0, d2[3]);
+    }
+
+    {
+        ColumnPtr res = eval_eq_for_null(nullable1, const_target);
+        ASSERT_FALSE(res->is_nullable());
+        const auto& res_data = BooleanColumn::static_pointer_cast(res)->get_data();
+        EXPECT_EQ(1, res_data[0]);
+        EXPECT_EQ(0, res_data[1]);
+        EXPECT_EQ(0, res_data[2]);
+        EXPECT_EQ(0, res_data[3]);
+
+        ColumnPtr res_rev = eval_eq_for_null(const_target, nullable1);
+        ASSERT_FALSE(res_rev->is_nullable());
+        const auto& res_rev_data = BooleanColumn::static_pointer_cast(res_rev)->get_data();
+        EXPECT_EQ(1, res_rev_data[0]);
+        EXPECT_EQ(0, res_rev_data[1]);
+        EXPECT_EQ(0, res_rev_data[2]);
+        EXPECT_EQ(0, res_rev_data[3]);
+    }
+
+    // 3. NullableColumn <=> NullableColumn where both have null_data[2] = 1 with different underlying strings
+    auto data2 = BinaryColumn::create();
+    data2->append("target_str");      // row 0: both non-null, equal -> 1
+    data2->append("target_str");      // row 1: lhs null, rhs non-null (even though bytes match) -> 0
+    data2->append("completely_diff"); // row 2: both NULL (even though bytes differ) -> 1
+    data2->append("target_str");      // row 3: lhs non-null, rhs null -> 0
+
+    auto null2 = NullColumn::create();
+    null2->append(0);
+    null2->append(0);
+    null2->append(1);
+    null2->append(1);
+    ColumnPtr nullable2 = NullableColumn::create(data2, null2);
+
+    {
+        ColumnPtr res = eval_eq_for_null(nullable1, nullable2);
+        ASSERT_FALSE(res->is_nullable());
+        const auto& res_data = BooleanColumn::static_pointer_cast(res)->get_data();
+        EXPECT_EQ(1, res_data[0]);
+        EXPECT_EQ(0, res_data[1]);
+        EXPECT_EQ(1, res_data[2]);
+        EXPECT_EQ(0, res_data[3]);
+    }
+}
+
 class VectorizedBinaryPredicateArrayTest : public ::testing::Test {
 public:
     void SetUp() override {
