@@ -130,10 +130,10 @@ GTEST_SOURCE=googletest-release-1.10.0
 GTEST_MD5SUM="ecd1fa65e7de707cd5c00bdac56022cd"
 
 # snappy
-SNAPPY_DOWNLOAD="https://github.com/google/snappy/archive/1.2.1.tar.gz"
-SNAPPY_NAME=snappy-1.2.1.tar.gz
-SNAPPY_SOURCE=snappy-1.2.1
-SNAPPY_MD5SUM="dd6f9b667e69491e1dbf7419bdf68823"
+SNAPPY_DOWNLOAD="https://github.com/jimmystewpot/snappy/archive/527b299d7a8cdd59aabb44cd86e498ecbcda0aea.tar.gz"
+SNAPPY_NAME=snappy-527b299d7a8cdd59aabb44cd86e498ecbcda0aea.tar.gz
+SNAPPY_SOURCE=snappy-527b299d7a8cdd59aabb44cd86e498ecbcda0aea
+SNAPPY_MD5SUM="7e5aec5f83c71a6d0871478a04388a0d"
 
 # gperftools
 GPERFTOOLS_DOWNLOAD="https://github.com/gperftools/gperftools/archive/gperftools-2.7.tar.gz"
