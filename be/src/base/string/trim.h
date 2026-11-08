@@ -126,6 +126,9 @@ inline const char* skip_leading_char(const char* begin, const char* end, char c)
     if (begin == nullptr || begin >= end) {
         return begin;
     }
+    if (*begin != c) {
+        return begin;
+    }
     const char* p = begin;
     if constexpr (Simd) {
 #if defined(__AVX2__)
@@ -188,6 +191,9 @@ inline const char* skip_trailing_char(const char* begin, const char* end, char c
     if (begin == nullptr || begin >= end) {
         return end;
     }
+    if (*(end - 1) != c) {
+        return end;
+    }
     const char* p = end;
     if constexpr (Simd) {
 #if defined(__AVX2__)
@@ -248,6 +254,9 @@ inline const char* skip_trailing_char(const char* begin, const char* end, char c
 template <bool Simd = true>
 inline const char* skip_leading_byteset(const char* begin, const char* end, const ByteSet& set) noexcept {
     if (begin == nullptr || begin >= end) {
+        return begin;
+    }
+    if (!set.contains(static_cast<uint8_t>(*begin))) {
         return begin;
     }
     const char* p = begin;
@@ -336,6 +345,9 @@ inline const char* skip_leading_byteset(const char* begin, const char* end, cons
 template <bool Simd = true>
 inline const char* skip_trailing_byteset(const char* begin, const char* end, const ByteSet& set) noexcept {
     if (begin == nullptr || begin >= end) {
+        return end;
+    }
+    if (!set.contains(static_cast<uint8_t>(*(end - 1)))) {
         return end;
     }
     const char* p = end;
