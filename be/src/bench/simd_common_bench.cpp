@@ -417,7 +417,7 @@ static void BM_ConstStartsWith_Re2Legacy(benchmark::State& state) {
     const size_t pat_len = static_cast<size_t>(state.range(0));
     const int profile = static_cast<int>(state.range(1));
     auto [col, pat_str] = make_like_bench_column(kBatch, pat_len, profile, false);
-    ColumnPtr pat_col = ColumnHelper::create_const_column<TYPE_VARCHAR>(Slice(pat_str), kBatch);
+    ColumnPtr pat_col = ColumnHelper::create_const_column<TYPE_VARCHAR>(Slice(pat_str), 1);
     for (auto _ : state) {
         ColumnPtr res =
                 VectorizedStrictBinaryFunction<LegacyRe2StartsImpl>::evaluate<TYPE_VARCHAR, TYPE_BOOLEAN>(col, pat_col);

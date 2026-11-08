@@ -315,7 +315,7 @@ enum class ConstantMatchMode {
 };
 
 inline bool compare_interior_gt32_simd(const char* cand, const char* pat_data, size_t pat_len) {
-    size_t off = 8;
+    [[maybe_unused]] size_t off = 8;
 #if defined(__SSE2__)
     while (off + 16 <= pat_len - 8) {
         __m128i vc = _mm_loadu_si128(reinterpret_cast<const __m128i*>(cand + off));

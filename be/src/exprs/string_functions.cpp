@@ -798,7 +798,7 @@ DEFINE_BINARY_FUNCTION_WITH_IMPL(starts_withImpl, str, prefix) {
 
 StatusOr<ColumnPtr> StringFunctions::starts_with(FunctionContext* context, const Columns& columns) {
     if (columns[0]->only_null() || columns[1]->only_null()) {
-        return ColumnHelper::create_const_null_column(columns[0]->size());
+        return ColumnHelper::create_const_null_column(std::max(columns[0]->size(), columns[1]->size()));
     }
     if (columns[1]->is_constant()) {
         Slice prefix = ColumnHelper::get_const_value<TYPE_VARCHAR>(columns[1]);
@@ -815,7 +815,7 @@ DEFINE_BINARY_FUNCTION_WITH_IMPL(ends_withImpl, str, suffix) {
 
 StatusOr<ColumnPtr> StringFunctions::ends_with(FunctionContext* context, const Columns& columns) {
     if (columns[0]->only_null() || columns[1]->only_null()) {
-        return ColumnHelper::create_const_null_column(columns[0]->size());
+        return ColumnHelper::create_const_null_column(std::max(columns[0]->size(), columns[1]->size()));
     }
     if (columns[1]->is_constant()) {
         Slice suffix = ColumnHelper::get_const_value<TYPE_VARCHAR>(columns[1]);
