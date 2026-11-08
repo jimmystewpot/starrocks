@@ -15,13 +15,15 @@
 #include "column/column_hash/column_hash.h"
 
 #include <gtest/gtest.h>
-#include <zlib.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <zlib.h>
 
 #include <algorithm>
 #include <array>
 
+#include "base/hash/hash_util.hpp"
+#include "base/hash/xxh3.h"
 #include "column/array_column.h"
 #include "column/binary_column.h"
 #include "column/column_hash.h"
@@ -492,8 +494,6 @@ TEST(MemequalPaddedTest, PageBoundaryBeforeUnmappedPage) {
     ASSERT_EQ(0, munmap(map1, 2 * page_size));
     ASSERT_EQ(0, munmap(map2, 2 * page_size));
 }
-
-                         });
 
 namespace {
 
