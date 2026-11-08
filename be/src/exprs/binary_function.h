@@ -17,16 +17,165 @@
 #include <cstdint>
 
 #include "base/simd/simd.h"
+#include "column/binary_column.h"
 #include "column/column_helper.h"
 #include "column/const_column.h"
 #include "column/fixed_length_column.h"
 #include "column/nullable_column.h"
 #include "column/runtime_type_traits.h"
 #include "exprs/function_helper.h"
+#include "gutil/port.h"
+#include "gutil/strings/fastmem.h"
 #include "typeinfo"
 #include "types/logical_type.h"
 
 namespace starrocks {
+
+template <bool IsNe>
+struct BinaryStringEqNeKernel {
+    template <typename LType, typename RType, typename ResultType>
+    static inline ResultType apply(const LType& l, const RType& r) {
+        if constexpr (IsNe) {
+            return static_cast<ResultType>(l != r);
+        } else {
+            return static_cast<ResultType>(l == r);
+        }
+    }
+
+    template <typename ResultType, typename OffsetT>
+    static void eval_binary_vector_const(const OffsetT* __restrict offsets, const uint8_t* __restrict lhs_base,
+                                         const Slice& rhs, int size, ResultType* __restrict dst) {
+        const size_t target_len = rhs.size;
+        const auto* rhs_data = reinterpret_cast<const uint8_t*>(rhs.data);
+
+        switch (target_len) {
+        case 0: {
+            for (int i = 0; i < size; ++i) {
+                const bool eq = (offsets[i + 1] == offsets[i]);
+                dst[i] = static_cast<ResultType>(eq ^ IsNe);
+            }
+            return;
+        }
+        case 1: {
+            const uint8_t c0 = rhs_data[0];
+            for (int i = 0; i < size; ++i) {
+                const OffsetT off = offsets[i];
+                const bool eq = ((offsets[i + 1] - off) == 1) && (lhs_base[off] == c0);
+                dst[i] = static_cast<ResultType>(eq ^ IsNe);
+            }
+            return;
+        }
+        case 2: {
+            const uint16_t c0 = UNALIGNED_LOAD16(rhs_data);
+            for (int i = 0; i < size; ++i) {
+                const OffsetT off = offsets[i];
+                const bool eq = ((offsets[i + 1] - off) == 2) && (UNALIGNED_LOAD16(lhs_base + off) == c0);
+                dst[i] = static_cast<ResultType>(eq ^ IsNe);
+            }
+            return;
+        }
+        case 3: {
+            const uint16_t c0 = UNALIGNED_LOAD16(rhs_data);
+            const uint8_t c1 = rhs_data[2];
+            for (int i = 0; i < size; ++i) {
+                const OffsetT off = offsets[i];
+                const bool eq = ((offsets[i + 1] - off) == 3) && (((UNALIGNED_LOAD16(lhs_base + off) ^ c0) |
+                                                                   static_cast<uint16_t>(lhs_base[off + 2] ^ c1)) == 0);
+                dst[i] = static_cast<ResultType>(eq ^ IsNe);
+            }
+            return;
+        }
+        case 4: {
+            const uint32_t c0 = UNALIGNED_LOAD32(rhs_data);
+            for (int i = 0; i < size; ++i) {
+                const OffsetT off = offsets[i];
+                const bool eq = ((offsets[i + 1] - off) == 4) && (UNALIGNED_LOAD32(lhs_base + off) == c0);
+                dst[i] = static_cast<ResultType>(eq ^ IsNe);
+            }
+            return;
+        }
+        case 5:
+        case 6:
+        case 7: {
+            const uint32_t c_head = UNALIGNED_LOAD32(rhs_data);
+            const uint32_t c_tail = UNALIGNED_LOAD32(rhs_data + target_len - 4);
+            const OffsetT tlen = static_cast<OffsetT>(target_len);
+            const size_t tail_off = target_len - 4;
+            for (int i = 0; i < size; ++i) {
+                const OffsetT off = offsets[i];
+                const bool eq = ((offsets[i + 1] - off) == tlen) &&
+                                (((UNALIGNED_LOAD32(lhs_base + off) ^ c_head) |
+                                  (UNALIGNED_LOAD32(lhs_base + off + tail_off) ^ c_tail)) == 0);
+                dst[i] = static_cast<ResultType>(eq ^ IsNe);
+            }
+            return;
+        }
+        case 8: {
+            const uint64_t c0 = UNALIGNED_LOAD64(rhs_data);
+            for (int i = 0; i < size; ++i) {
+                const OffsetT off = offsets[i];
+                const bool eq = ((offsets[i + 1] - off) == 8) && (UNALIGNED_LOAD64(lhs_base + off) == c0);
+                dst[i] = static_cast<ResultType>(eq ^ IsNe);
+            }
+            return;
+        }
+        case 9:
+        case 10:
+        case 11:
+        case 12:
+        case 13:
+        case 14:
+        case 15:
+        case 16: {
+            const uint64_t c_head = UNALIGNED_LOAD64(rhs_data);
+            const uint64_t c_tail = UNALIGNED_LOAD64(rhs_data + target_len - 8);
+            const OffsetT tlen = static_cast<OffsetT>(target_len);
+            const size_t tail_off = target_len - 8;
+            for (int i = 0; i < size; ++i) {
+                const OffsetT off = offsets[i];
+                const bool eq = ((offsets[i + 1] - off) == tlen) &&
+                                (((UNALIGNED_LOAD64(lhs_base + off) ^ c_head) |
+                                  (UNALIGNED_LOAD64(lhs_base + off + tail_off) ^ c_tail)) == 0);
+                dst[i] = static_cast<ResultType>(eq ^ IsNe);
+            }
+            return;
+        }
+        default: {
+            const uint64_t c_head = UNALIGNED_LOAD64(rhs_data);
+            const OffsetT tlen = static_cast<OffsetT>(target_len);
+            const size_t rem_len = target_len - 8;
+            const uint8_t* rhs_rem = rhs_data + 8;
+            for (int i = 0; i < size; ++i) {
+                const OffsetT off = offsets[i];
+                const bool eq = ((offsets[i + 1] - off) == tlen) && (UNALIGNED_LOAD64(lhs_base + off) == c_head) &&
+                                strings::memeq(lhs_base + off + 8, rhs_rem, rem_len);
+                dst[i] = static_cast<ResultType>(eq ^ IsNe);
+            }
+            return;
+        }
+        }
+    }
+
+    template <typename ResultType, typename OffsetT>
+    static void eval_binary_const_vector(const Slice& lhs, const OffsetT* __restrict offsets,
+                                         const uint8_t* __restrict rhs_base, int size, ResultType* __restrict dst) {
+        eval_binary_vector_const<ResultType, OffsetT>(offsets, rhs_base, lhs, size, dst);
+    }
+
+    template <typename ResultType, typename OffsetT1, typename OffsetT2>
+    static void eval_binary_vector_vector(const OffsetT1* __restrict off1, const uint8_t* __restrict base1,
+                                          const OffsetT2* __restrict off2, const uint8_t* __restrict base2, int size,
+                                          ResultType* __restrict dst) {
+        for (int i = 0; i < size; ++i) {
+            const OffsetT1 o1 = off1[i];
+            const OffsetT2 o2 = off2[i];
+            const auto len1 = static_cast<size_t>(off1[i + 1] - o1);
+            const auto len2 = static_cast<size_t>(off2[i + 1] - o2);
+            const bool eq = (len1 == len2) && strings::memeq(base1 + o1, base2 + o2, len1);
+            dst[i] = static_cast<ResultType>(eq ^ IsNe);
+        }
+    }
+};
 
 class ResultNopCheck {
     template <typename Type, typename ResultType>
@@ -56,8 +205,34 @@ public:
         result->resize_uninitialized(v1->size());
         auto* data3 = result->get_data().data();
 
-        if constexpr (lt_is_string<LType> || lt_is_binary<LType> || lt_is_object_family<LType> ||
-                      lt_is_object_family<RType>) {
+        if constexpr (lt_is_string_or_binary<LType> && lt_is_string_or_binary<RType>) {
+            const auto* col1 = ColumnHelper::cast_to_raw<LType>(v1);
+            const auto* col2 = ColumnHelper::cast_to_raw<RType>(v2);
+            const uint8_t* lhs_base = col1->raw_bytes();
+            const uint8_t* rhs_base = col2->raw_bytes();
+            col1->get_offset().visit_storage([&](const auto& off1) {
+                const auto* off1_ptr = off1.data();
+                col2->get_offset().visit_storage([&](const auto& off2) {
+                    const auto* off2_ptr = off2.data();
+                    if constexpr (requires {
+                                      OP::template eval_binary_vector_vector<ResultCppType>(
+                                              off1_ptr, lhs_base, off2_ptr, rhs_base, s, data3);
+                                  }) {
+                        OP::template eval_binary_vector_vector<ResultCppType>(off1_ptr, lhs_base, off2_ptr, rhs_base, s,
+                                                                              data3);
+                    } else {
+                        for (int i = 0; i < s; ++i) {
+                            const auto o1 = off1_ptr[i];
+                            const auto o2 = off2_ptr[i];
+                            const Slice lhs(lhs_base + o1, off1_ptr[i + 1] - o1);
+                            const Slice rhs(rhs_base + o2, off2_ptr[i + 1] - o2);
+                            data3[i] = OP::template apply<LCppType, RCppType, ResultCppType>(lhs, rhs);
+                        }
+                    }
+                });
+            });
+        } else if constexpr (lt_is_string_or_binary<LType> || lt_is_string_or_binary<RType> ||
+                             lt_is_object_family<LType> || lt_is_object_family<RType>) {
             const auto r1 = ColumnHelper::cast_to_raw<LType>(v1)->immutable_data();
             const auto r2 = ColumnHelper::cast_to_raw<RType>(v2)->immutable_data();
             for (int i = 0; i < s; ++i) {
@@ -87,15 +262,35 @@ public:
         result->resize_uninitialized(size);
         auto* data3 = result->get_data().data();
 
-        const auto data1 = ColumnHelper::cast_to_raw<LType>(v1)->immutable_data()[0];
-        if constexpr (lt_is_string<LType> || lt_is_binary<LType> || lt_is_object_family<LType> ||
-                      lt_is_object_family<RType>) {
+        if constexpr (lt_is_string_or_binary<LType> && lt_is_string_or_binary<RType>) {
+            const Slice lhs = ColumnHelper::cast_to_raw<LType>(v1)->get_slice(0);
+            const auto* col2 = ColumnHelper::cast_to_raw<RType>(v2);
+            const uint8_t* rhs_base = col2->raw_bytes();
+            col2->get_offset().visit_storage([&](const auto& offsets) {
+                const auto* off_ptr = offsets.data();
+                if constexpr (requires {
+                                  OP::template eval_binary_const_vector<ResultCppType>(lhs, off_ptr, rhs_base, size,
+                                                                                       data3);
+                              }) {
+                    OP::template eval_binary_const_vector<ResultCppType>(lhs, off_ptr, rhs_base, size, data3);
+                } else {
+                    for (int i = 0; i < size; ++i) {
+                        const auto off = off_ptr[i];
+                        const Slice rhs(rhs_base + off, off_ptr[i + 1] - off);
+                        data3[i] = OP::template apply<LCppType, RCppType, ResultCppType>(lhs, rhs);
+                    }
+                }
+            });
+        } else if constexpr (lt_is_string_or_binary<LType> || lt_is_string_or_binary<RType> ||
+                             lt_is_object_family<LType> || lt_is_object_family<RType>) {
+            const auto data1 = ColumnHelper::cast_to_raw<LType>(v1)->immutable_data()[0];
             const auto data2 = ColumnHelper::cast_to_raw<RType>(v2)->immutable_data();
             for (int i = 0; i < size; ++i) {
                 data3[i] = OP::template apply<LCppType, RCppType, ResultCppType>(data1, data2[i]);
             }
         } else {
             // Use raw pointers for auto-vectorization to optimize performance with fixed-length values.
+            const auto data1 = ColumnHelper::cast_to_raw<LType>(v1)->immutable_data()[0];
             const auto* data2 = ColumnHelper::cast_to_raw<RType>(v2)->immutable_data().data();
             for (int i = 0; i < size; ++i) {
                 data3[i] = OP::template apply<LCppType, RCppType, ResultCppType>(data1, data2[i]);
@@ -118,15 +313,35 @@ public:
         auto& r3 = result->get_data();
         auto* data3 = r3.data();
 
-        auto data2 = ColumnHelper::cast_to_raw<RType>(v2)->immutable_data()[0];
-        if constexpr (lt_is_string<LType> || lt_is_binary<LType> || lt_is_object_family<LType> ||
-                      lt_is_object_family<RType>) {
+        if constexpr (lt_is_string_or_binary<LType> && lt_is_string_or_binary<RType>) {
+            const auto* col1 = ColumnHelper::cast_to_raw<LType>(v1);
+            const Slice rhs = ColumnHelper::cast_to_raw<RType>(v2)->get_slice(0);
+            const uint8_t* lhs_base = col1->raw_bytes();
+            col1->get_offset().visit_storage([&](const auto& offsets) {
+                const auto* off_ptr = offsets.data();
+                if constexpr (requires {
+                                  OP::template eval_binary_vector_const<ResultCppType>(off_ptr, lhs_base, rhs, size,
+                                                                                       data3);
+                              }) {
+                    OP::template eval_binary_vector_const<ResultCppType>(off_ptr, lhs_base, rhs, size, data3);
+                } else {
+                    for (int i = 0; i < size; ++i) {
+                        const auto off = off_ptr[i];
+                        const Slice lhs(lhs_base + off, off_ptr[i + 1] - off);
+                        data3[i] = OP::template apply<LCppType, RCppType, ResultCppType>(lhs, rhs);
+                    }
+                }
+            });
+        } else if constexpr (lt_is_string_or_binary<LType> || lt_is_string_or_binary<RType> ||
+                             lt_is_object_family<LType> || lt_is_object_family<RType>) {
+            auto data2 = ColumnHelper::cast_to_raw<RType>(v2)->immutable_data()[0];
             const auto data1 = ColumnHelper::cast_to_raw<LType>(v1)->immutable_data();
             for (int i = 0; i < size; ++i) {
                 data3[i] = OP::template apply<LCppType, RCppType, ResultCppType>(data1[i], data2);
             }
         } else {
             // Use raw pointers for auto-vectorization to optimize performance with fixed-length values.
+            auto data2 = ColumnHelper::cast_to_raw<RType>(v2)->immutable_data()[0];
             const auto* data1 = ColumnHelper::cast_to_raw<LType>(v1)->immutable_data().data();
             for (int i = 0; i < size; ++i) {
                 data3[i] = OP::template apply<LCppType, RCppType, ResultCppType>(data1[i], data2);

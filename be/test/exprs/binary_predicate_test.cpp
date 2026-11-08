@@ -18,6 +18,7 @@
 #include <gtest/gtest.h>
 
 #include "column/fixed_length_column.h"
+#include "exprs/binary_function.h"
 #include "exprs/exprs_test_helper.h"
 #include "exprs/mock_vectorized_expr.h"
 #include "runtime/runtime_state.h"
@@ -622,6 +623,43 @@ TEST_F(VectorizedBinaryPredicateStringTest, nullEqExpr) {
     for (int j = 0; j < ptr->size(); ++j) {
         ASSERT_TRUE(ptr->is_null(j));
     }
+}
+
+TEST_F(VectorizedBinaryPredicateStringTest, kernelDirectAndLargeOffsets) {
+    auto col = BinaryColumn::create();
+    col->append("");
+    col->append("a");
+    col->append("abcd");
+    col->append("abcdefgh");
+    col->append("0123456789abcdef");
+    col->append("0123456789abcdef_tail");
+    // Promote AdaptiveOffsets to 64-bit large_storage() without 4GiB allocation
+    col->get_offset().ensure_width_for_value(static_cast<uint64_t>(UINT32_MAX) + 1ULL);
+    ASSERT_TRUE(col->get_offset().is_large());
+
+    ColumnPtr v_col = col;
+    ColumnPtr c_empty = ColumnHelper::create_const_column<TYPE_VARCHAR>("", v_col->size());
+    ColumnPtr c_16 = ColumnHelper::create_const_column<TYPE_VARCHAR>("0123456789abcdef", v_col->size());
+
+    auto eq_empty = VectorizedStrictBinaryFunction<BinaryStringEqNeKernel<false>>::evaluate<TYPE_VARCHAR, TYPE_BOOLEAN>(
+            v_col, c_empty);
+    auto ne_empty = VectorizedStrictBinaryFunction<BinaryStringEqNeKernel<true>>::evaluate<TYPE_VARCHAR, TYPE_BOOLEAN>(
+            v_col, c_empty);
+    auto eq_16 = VectorizedStrictBinaryFunction<BinaryStringEqNeKernel<false>>::evaluate<TYPE_VARCHAR, TYPE_BOOLEAN>(
+            c_16, v_col);
+
+    const auto* d_eq_empty = ColumnHelper::cast_to_raw<TYPE_BOOLEAN>(eq_empty)->immutable_data().data();
+    const auto* d_ne_empty = ColumnHelper::cast_to_raw<TYPE_BOOLEAN>(ne_empty)->immutable_data().data();
+    const auto* d_eq_16 = ColumnHelper::cast_to_raw<TYPE_BOOLEAN>(eq_16)->immutable_data().data();
+
+    EXPECT_EQ(1, d_eq_empty[0]);
+    EXPECT_EQ(0, d_ne_empty[0]);
+    for (int i = 1; i < 6; ++i) {
+        EXPECT_EQ(0, d_eq_empty[i]);
+        EXPECT_EQ(1, d_ne_empty[i]);
+    }
+    EXPECT_EQ(1, d_eq_16[4]);
+    EXPECT_EQ(0, d_eq_16[5]);
 }
 
 class VectorizedBinaryPredicateArrayTest : public ::testing::Test {
