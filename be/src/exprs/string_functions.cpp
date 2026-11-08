@@ -5365,8 +5365,9 @@ static ColumnPtr merge_null_with_src_column(const ColumnPtr& src_col, const Colu
         return src_col->is_constant() ? src_col : ConstColumn::create(src_col, num_rows);
     }
 
-    ColumnPtr unpacked_src =
-            src_col->is_constant() ? ColumnHelper::unpack_and_duplicate_const_column(num_rows, src_col) : src_col;
+    ColumnPtr unpacked_src = src_col->is_constant()
+                                     ? ColumnHelper::unpack_and_duplicate_const_column(num_rows, src_col->clone())
+                                     : src_col;
     if (extra_null_col == nullptr || !extra_null_col->is_nullable() || !extra_null_col->has_null()) {
         return unpacked_src;
     }
@@ -5374,24 +5375,24 @@ static ColumnPtr merge_null_with_src_column(const ColumnPtr& src_col, const Colu
         return ColumnHelper::create_const_null_column(num_rows);
     }
 
-    ColumnPtr unpacked_extra = extra_null_col->is_constant()
-                                       ? ColumnHelper::unpack_and_duplicate_const_column(num_rows, extra_null_col)
-                                       : extra_null_col;
+    ColumnPtr unpacked_extra = extra_null_col->is_constant() ? ColumnHelper::unpack_and_duplicate_const_column(
+                                                                       num_rows, extra_null_col->clone())
+                                                             : extra_null_col;
     const auto* extra_nullable = down_cast<const NullableColumn*>(unpacked_extra.get());
     if (unpacked_src->is_nullable()) {
         const auto* src_nullable = down_cast<const NullableColumn*>(unpacked_src.get());
         NullColumn::MutablePtr merged_null;
         if (src_nullable->has_null()) {
-            merged_null = NullColumn::static_pointer_cast(std::move(*src_nullable->null_column()).mutate());
+            merged_null = NullColumn::static_pointer_cast(src_nullable->null_column()->clone());
             ColumnHelper::or_two_filters(&merged_null->get_data(),
                                          extra_nullable->null_column()->immutable_data().data());
         } else {
-            merged_null = NullColumn::static_pointer_cast(std::move(*extra_nullable->null_column()).mutate());
+            merged_null = NullColumn::static_pointer_cast(extra_nullable->null_column()->clone());
         }
         return NullableColumn::create(src_nullable->data_column(), std::move(merged_null));
     }
     return NullableColumn::create(unpacked_src,
-                                  NullColumn::static_pointer_cast(std::move(*extra_nullable->null_column()).mutate()));
+                                  NullColumn::static_pointer_cast(extra_nullable->null_column()->clone()));
 }
 
 static inline void replace_1byte_simd(uint8_t* dst, const uint8_t* src, size_t len, uint8_t ptn_byte,
@@ -5467,12 +5468,10 @@ static ALWAYS_INLINE void append_unmatched_row_range(BinaryColumn* dst, const ch
     if (null_data == nullptr) {
         const size_t start_byte = static_cast<size_t>(src_offsets[from_row]);
         const size_t end_byte = static_cast<size_t>(src_offsets[to_row]);
-        const size_t dst_base_byte = dst_bytes.size();
+        const uint64_t dst_base_byte = dst_bytes.size();
         append_bytes(dst_bytes, src_base + start_byte, end_byte - start_byte);
-        const ptrdiff_t delta = static_cast<ptrdiff_t>(dst_base_byte) - static_cast<ptrdiff_t>(start_byte);
-        using OffsetT = typename std::decay_t<OffsetsContainer>::value_type;
         for (size_t r = from_row; r < to_row; ++r) {
-            dst_offsets.push_back(static_cast<OffsetT>(static_cast<ptrdiff_t>(src_offsets[r + 1]) + delta));
+            dst_offsets.push_back(dst_base_byte + (static_cast<uint64_t>(src_offsets[r + 1]) - start_byte));
         }
     } else {
         for (size_t r = from_row; r < to_row; ++r) {
@@ -5561,7 +5560,8 @@ static StatusOr<ColumnPtr> replace_const_pattern_and_rpl(const ReplaceState* sta
         if (ptn_len == rpl_len) {
             size_t row = 0;
             while (row < eval_rows) {
-                if (null_data != nullptr && null_data[row]) {
+                if ((null_data != nullptr && null_data[row]) ||
+                    static_cast<size_t>(src_offsets[row + 1] - src_offsets[row]) < ptn_len) {
                     ++row;
                     continue;
                 }
@@ -5574,7 +5574,8 @@ static StatusOr<ColumnPtr> replace_const_pattern_and_rpl(const ReplaceState* sta
                     break;
                 }
                 row = advance_row_to_offset(src_offsets, row, eval_rows, static_cast<size_t>(hit - src_base));
-                if (null_data != nullptr && null_data[row]) {
+                if ((null_data != nullptr && null_data[row]) ||
+                    static_cast<size_t>(src_offsets[row + 1] - src_offsets[row]) < ptn_len) {
                     ++row;
                     continue;
                 }
@@ -5613,12 +5614,20 @@ static StatusOr<ColumnPtr> replace_const_pattern_and_rpl(const ReplaceState* sta
         // Case 1C: Variable-length replacement (ptn_len != rpl_len) via flat-buffer SIMD scan + lazy streaming.
         size_t row = 0;
         while (row < eval_rows) {
-            if (null_data != nullptr && null_data[row]) {
+            size_t scan_row = row;
+            while (scan_row < eval_rows &&
+                   ((null_data != nullptr && null_data[scan_row]) ||
+                    static_cast<size_t>(src_offsets[scan_row + 1] - src_offsets[scan_row]) < ptn_len)) {
+                ++scan_row;
+            }
+            if (scan_row > row) {
                 if (any_match) {
-                    dst->get_offset().push_back(dst->get_bytes().size());
+                    append_unmatched_row_range(dst.get(), src_base, src_offsets, null_data, row, scan_row);
                 }
-                ++row;
-                continue;
+                row = scan_row;
+                if (row >= eval_rows) {
+                    break;
+                }
             }
             const char* const scan_ptr = src_base + src_offsets[row];
             if (static_cast<size_t>(src_end - scan_ptr) < ptn_len) {
@@ -5730,8 +5739,8 @@ static StatusOr<ColumnPtr> replace_const_pattern_and_rpl(const ReplaceState* sta
 
     if (columns[0]->is_nullable()) {
         const auto* src_nullable = down_cast<const NullableColumn*>(columns[0].get());
-        return NullableColumn::create(
-                std::move(dst), NullColumn::static_pointer_cast(std::move(*src_nullable->null_column()).mutate()));
+        return NullableColumn::create(std::move(dst),
+                                      NullColumn::static_pointer_cast(src_nullable->null_column()->clone()));
     }
     return dst;
 }

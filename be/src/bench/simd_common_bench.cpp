@@ -1728,8 +1728,8 @@ static Columns BuildStringReplaceColumns(int mode, int hit_pct, std::string* out
     auto str_col = BinaryColumn::create();
     size_t total_bytes = 0;
     for (size_t i = 0; i < kBatch; ++i) {
-        const bool is_hit = (hit_pct > 0) && ((i * 100 / kBatch) != ((i + 1) * 100 / kBatch) || hit_pct == 100) &&
-                            ((i % (100 / std::max(1, hit_pct))) == 0);
+        const bool is_hit = (hit_pct > 0) && (hit_pct >= 100 || ((i * static_cast<size_t>(hit_pct)) % 100) <
+                                                                        static_cast<size_t>(hit_pct));
         const std::string& s = is_hit ? hit_row : miss_row;
         str_col->append(s);
         total_bytes += s.size();

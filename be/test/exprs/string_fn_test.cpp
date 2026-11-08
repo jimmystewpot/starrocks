@@ -3523,6 +3523,144 @@ PARALLEL_TEST(VecStringFunctionsTest, replaceCoverageAllBranches) {
         EXPECT_EQ("world", res->get(1).get_slice().to_string());
         ASSERT_TRUE(StringFunctions::replace_close(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
     }
+
+    // 5. Shared ConstColumn inputs must not have their internal 1-element data_column() mutated in place
+    //    when merge_null_with_src_column unpacks them on empty-pattern or no-match paths.
+    {
+        for (const char* ptn_cstr : {"", "NO_MATCH"}) {
+            std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+            auto* context = ctx.get();
+
+            auto const_src = ColumnHelper::create_const_column<TYPE_VARCHAR>("immutable_const", 4);
+            auto ptn = ColumnHelper::create_const_column<TYPE_VARCHAR>(ptn_cstr, 4);
+            auto rpl_data = BinaryColumn::create();
+            rpl_data->append("r");
+            auto rpl_null = NullColumn::create(1, 0);
+            rpl_null->get_data()[0] = 0;
+            // Also test non-const nullable repl and const nullable repl
+            auto var_rpl_data = BinaryColumn::create();
+            auto var_rpl_null = NullColumn::create();
+            for (int i = 0; i < 4; ++i) {
+                var_rpl_data->append("r");
+                var_rpl_null->append(i == 2 ? 1 : 0);
+            }
+            auto var_rpl = NullableColumn::create(std::move(var_rpl_data), std::move(var_rpl_null));
+
+            Columns columns{const_src, ptn, var_rpl};
+            context->set_constant_columns(columns);
+            ASSERT_TRUE(StringFunctions::replace_prepare(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL)
+                                .ok());
+            const auto res = StringFunctions::replace(context, columns).value();
+            ASSERT_EQ(res->size(), 4);
+            // The caller's ConstColumn must still have a 1-row internal data_column()!
+            EXPECT_EQ(down_cast<const ConstColumn*>(const_src.get())->data_column()->size(), 1u);
+            EXPECT_FALSE(res->is_null(0));
+            EXPECT_TRUE(res->is_null(2));
+            ASSERT_TRUE(
+                    StringFunctions::replace_close(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+        }
+    }
+
+    // 6. Shared NullableColumn inputs must not have their NullColumn mutated in place or aliased
+    //    when merge_null_with_src_column or replace_const_pattern_and_rpl creates the output NullableColumn.
+    {
+        std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+        auto* context = ctx.get();
+
+        auto src_data = BinaryColumn::create();
+        src_data->append("row0");
+        src_data->append("row1");
+        auto src_null = NullColumn::create();
+        src_null->append(1); // row 0 is null in src
+        src_null->append(0); // row 1 is NOT null in src
+        auto src_nullable = NullableColumn::create(std::move(src_data), std::move(src_null));
+
+        auto ptn = ColumnHelper::create_const_column<TYPE_VARCHAR>("", 2);
+
+        auto rpl_data = BinaryColumn::create();
+        rpl_data->append("x");
+        rpl_data->append("y");
+        auto rpl_null = NullColumn::create();
+        rpl_null->append(0); // row 0 is NOT null in rpl
+        rpl_null->append(1); // row 1 IS null in rpl
+        auto rpl_nullable = NullableColumn::create(std::move(rpl_data), std::move(rpl_null));
+
+        Columns columns{src_nullable, ptn, rpl_nullable};
+        context->set_constant_columns(columns);
+        ASSERT_TRUE(
+                StringFunctions::replace_prepare(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+        const auto res = StringFunctions::replace(context, columns).value();
+        ASSERT_EQ(res->size(), 2);
+        EXPECT_TRUE(res->is_null(0));
+        EXPECT_TRUE(res->is_null(1));
+        // Caller's src_nullable and rpl_nullable must NOT have had their NullColumn mutated or aliased!
+        EXPECT_TRUE(src_nullable->is_null(0));
+        EXPECT_FALSE(src_nullable->is_null(1));
+        EXPECT_FALSE(rpl_nullable->is_null(0));
+        EXPECT_TRUE(rpl_nullable->is_null(1));
+        const auto* res_nullable = down_cast<const NullableColumn*>(res.get());
+        EXPECT_NE(res_nullable->null_column().get(), src_nullable->null_column().get());
+        EXPECT_NE(res_nullable->null_column().get(), rpl_nullable->null_column().get());
+
+        // Also when src is NullableColumn with has_null() == false and rpl has nulls:
+        auto src_no_null_data = BinaryColumn::create();
+        src_no_null_data->append("a");
+        src_no_null_data->append("b");
+        auto src_no_null = NullableColumn::create(std::move(src_no_null_data), NullColumn::create(2, 0));
+        Columns columns_no_null{src_no_null, ptn, rpl_nullable};
+        const auto res_no_null = StringFunctions::replace(context, columns_no_null).value();
+        const auto* res_no_null_nullable = down_cast<const NullableColumn*>(res_no_null.get());
+        EXPECT_NE(res_no_null_nullable->null_column().get(), rpl_nullable->null_column().get());
+
+        ASSERT_TRUE(StringFunctions::replace_close(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+    }
+
+    // 7. Adversarial short rows (< ptn_len) with long repetitive pattern must skip flat-buffer searches
+    //    both when no row matches (zero-copy) and after an initial matching row (any_match == true).
+    {
+        const std::string short_row(100, 'a');
+        const std::string long_ptn(65536, 'a');
+        auto str = BinaryColumn::create();
+        for (int i = 0; i < 4096; ++i) {
+            str->append(short_row);
+        }
+        ColumnPtr str_col = str;
+
+        auto str_with_match = BinaryColumn::create();
+        str_with_match->append(long_ptn);
+        for (int i = 1; i < 4096; ++i) {
+            str_with_match->append(short_row);
+        }
+        ColumnPtr str_match_col = str_with_match;
+
+        for (const std::string& rpl_str : {std::string(65536, 'b'), std::string("short_rpl")}) {
+            std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+            auto* context = ctx.get();
+            auto ptn = ColumnHelper::create_const_column<TYPE_VARCHAR>(long_ptn, 4096);
+            auto rpl = ColumnHelper::create_const_column<TYPE_VARCHAR>(rpl_str, 4096);
+            Columns columns{str_col, ptn, rpl};
+            context->set_constant_columns(columns);
+            ASSERT_TRUE(StringFunctions::replace_prepare(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL)
+                                .ok());
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto res = StringFunctions::replace(context, columns).value();
+            const auto elapsed_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
+                            .count();
+            EXPECT_EQ(res.get(), str_col.get());
+            EXPECT_LT(elapsed_ms, 50) << "Expected fast short-row skip without cross-row straddle scanning";
+
+            Columns match_columns{str_match_col, ptn, rpl};
+            const auto res_match = StringFunctions::replace(context, match_columns).value();
+            ASSERT_EQ(res_match->size(), 4096);
+            EXPECT_EQ(rpl_str, res_match->get(0).get_slice().to_string());
+            EXPECT_EQ(short_row, res_match->get(1).get_slice().to_string());
+            EXPECT_EQ(short_row, res_match->get(4095).get_slice().to_string());
+
+            ASSERT_TRUE(
+                    StringFunctions::replace_close(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+        }
+    }
 }
 
 PARALLEL_TEST(VecStringFunctionsTest, moneyFormatDouble) {
