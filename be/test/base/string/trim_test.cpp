@@ -397,4 +397,76 @@ TEST(SkipByteSetSimdTest, BoundaryLengthsAlignmentsAndUtf8Interior) {
     }
 }
 
+TEST(SkipCharAndByteSetFastPathTest, CleanOneSpaceAndInternalSpacesBoundaries) {
+    const ByteSet ws_set = ByteSet::from_bytes(" \t\r\n\v\f");
+
+    // Single-char and two-char boundary cases
+    const std::string_view single_clean = "x";
+    EXPECT_EQ(single_clean.data(),
+              skip_leading_char<true>(single_clean.data(), single_clean.data() + single_clean.size(), ' '));
+    EXPECT_EQ(single_clean.data() + 1,
+              skip_trailing_char<true>(single_clean.data(), single_clean.data() + single_clean.size(), ' '));
+    EXPECT_EQ(single_clean.data(),
+              skip_leading_byteset<true>(single_clean.data(), single_clean.data() + single_clean.size(), ws_set));
+    EXPECT_EQ(single_clean.data() + 1,
+              skip_trailing_byteset<true>(single_clean.data(), single_clean.data() + single_clean.size(), ws_set));
+
+    const std::string_view single_space = " ";
+    EXPECT_EQ(single_space.data() + 1,
+              skip_leading_char<true>(single_space.data(), single_space.data() + single_space.size(), ' '));
+    EXPECT_EQ(single_space.data(),
+              skip_trailing_char<true>(single_space.data(), single_space.data() + single_space.size(), ' '));
+    EXPECT_EQ(single_space.data() + 1,
+              skip_leading_byteset<true>(single_space.data(), single_space.data() + single_space.size(), ws_set));
+    EXPECT_EQ(single_space.data(),
+              skip_trailing_byteset<true>(single_space.data(), single_space.data() + single_space.size(), ws_set));
+
+    // Strings with only internal spaces across short (<16B), medium (16-64B), and long (>128B)
+    const std::string internal_cases[] = {
+            "a b",
+            "hello   world",
+            "ClickBench   Title   With   Many   Internal   Spaces   Only",
+            std::string(64, 'a') + "     " + std::string(96, 'b'),
+    };
+    for (const std::string& s : internal_cases) {
+        const char* b = s.data();
+        const char* e = b + s.size();
+        EXPECT_EQ(b, skip_leading_char<true>(b, e, ' '));
+        EXPECT_EQ(e, skip_trailing_char<true>(b, e, ' '));
+        EXPECT_EQ(b, skip_leading_byteset<true>(b, e, ws_set));
+        EXPECT_EQ(e, skip_trailing_byteset<true>(b, e, ws_set));
+        EXPECT_EQ(std::string_view(s), trim_spaces(s));
+
+        // 1 leading space only
+        const std::string lead1 = " " + s;
+        EXPECT_EQ(lead1.data() + 1, skip_leading_char<true>(lead1.data(), lead1.data() + lead1.size(), ' '));
+        EXPECT_EQ(lead1.data() + lead1.size(),
+                  skip_trailing_char<true>(lead1.data(), lead1.data() + lead1.size(), ' '));
+        EXPECT_EQ(lead1.data() + 1, skip_leading_byteset<true>(lead1.data(), lead1.data() + lead1.size(), ws_set));
+        EXPECT_EQ(lead1.data() + lead1.size(),
+                  skip_trailing_byteset<true>(lead1.data(), lead1.data() + lead1.size(), ws_set));
+        EXPECT_EQ(std::string_view(s), trim_spaces(lead1));
+
+        // 1 trailing space only
+        const std::string trail1 = s + " ";
+        EXPECT_EQ(trail1.data(), skip_leading_char<true>(trail1.data(), trail1.data() + trail1.size(), ' '));
+        EXPECT_EQ(trail1.data() + trail1.size() - 1,
+                  skip_trailing_char<true>(trail1.data(), trail1.data() + trail1.size(), ' '));
+        EXPECT_EQ(trail1.data(), skip_leading_byteset<true>(trail1.data(), trail1.data() + trail1.size(), ws_set));
+        EXPECT_EQ(trail1.data() + trail1.size() - 1,
+                  skip_trailing_byteset<true>(trail1.data(), trail1.data() + trail1.size(), ws_set));
+        EXPECT_EQ(std::string_view(s), trim_spaces(trail1));
+
+        // 2 leading + 2 trailing spaces
+        const std::string both2 = "  " + s + "  ";
+        EXPECT_EQ(both2.data() + 2, skip_leading_char<true>(both2.data(), both2.data() + both2.size(), ' '));
+        EXPECT_EQ(both2.data() + both2.size() - 2,
+                  skip_trailing_char<true>(both2.data(), both2.data() + both2.size(), ' '));
+        EXPECT_EQ(both2.data() + 2, skip_leading_byteset<true>(both2.data(), both2.data() + both2.size(), ws_set));
+        EXPECT_EQ(both2.data() + both2.size() - 2,
+                  skip_trailing_byteset<true>(both2.data(), both2.data() + both2.size(), ws_set));
+        EXPECT_EQ(std::string_view(s), trim_spaces(both2));
+    }
+}
+
 } // namespace starrocks

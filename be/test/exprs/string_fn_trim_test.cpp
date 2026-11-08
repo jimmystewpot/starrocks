@@ -535,4 +535,93 @@ TEST_F(StringFunctionTrimTest, trimMultiCharLargeAsciiSetAndEmbeddedNul) {
         ASSERT_OK(StringFunctions::trim_close(ctx.get(), FunctionContext::FRAGMENT_LOCAL));
     }
 }
+
+TEST_F(StringFunctionTrimTest, trimCleanAndMixedColumnFastPathTest) {
+    // 1. 100% clean column (including empty string, single-char string, and internal spaces)
+    {
+        auto str_col = BinaryColumn::create();
+        std::vector<std::string> expected;
+        for (int i = 0; i < 4096; ++i) {
+            std::string s;
+            if (i % 64 == 0) {
+                s = "";
+            } else if (i % 64 == 1) {
+                s = "x";
+            } else {
+                s = "ClickBench Title " + std::to_string(i) + " with internal spaces";
+            }
+            str_col->append(s);
+            expected.push_back(s);
+        }
+        Columns single_cols{str_col};
+        std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+        ctx->set_constant_columns(single_cols);
+        ASSERT_OK(StringFunctions::trim_prepare(ctx.get(), FunctionContext::FRAGMENT_LOCAL));
+
+        ColumnPtr trim_res = StringFunctions::trim(ctx.get(), single_cols).value();
+        ColumnPtr ltrim_res = StringFunctions::ltrim(ctx.get(), single_cols).value();
+        ColumnPtr rtrim_res = StringFunctions::rtrim(ctx.get(), single_cols).value();
+        // Clean column fast-path should return the unmodified column directly without copying.
+        EXPECT_EQ(str_col.get(), trim_res.get());
+        EXPECT_EQ(str_col.get(), ltrim_res.get());
+        EXPECT_EQ(str_col.get(), rtrim_res.get());
+        auto trim_col = ColumnHelper::cast_to<TYPE_VARCHAR>(trim_res);
+        for (int i = 0; i < 4096; ++i) {
+            ASSERT_EQ(expected[i], trim_col->get_slice(i).to_string()) << "row " << i;
+        }
+        ASSERT_OK(StringFunctions::trim_close(ctx.get(), FunctionContext::FRAGMENT_LOCAL));
+    }
+
+    // 2. Mixed column: first 500 rows clean, followed by 1-space, 2-space, all-space, and 32-space rows
+    {
+        auto str_col = BinaryColumn::create();
+        std::vector<std::string> expected_trim;
+        std::vector<std::string> expected_ltrim;
+        std::vector<std::string> expected_rtrim;
+        for (int i = 0; i < 1024; ++i) {
+            std::string body = "Title_" + std::to_string(i) + "_internal space";
+            if (i < 500) {
+                str_col->append(body);
+                expected_trim.push_back(body);
+                expected_ltrim.push_back(body);
+                expected_rtrim.push_back(body);
+            } else if (i % 4 == 0) {
+                str_col->append(" " + body);
+                expected_trim.push_back(body);
+                expected_ltrim.push_back(body);
+                expected_rtrim.push_back(" " + body);
+            } else if (i % 4 == 1) {
+                str_col->append(body + " ");
+                expected_trim.push_back(body);
+                expected_ltrim.push_back(body + " ");
+                expected_rtrim.push_back(body);
+            } else if (i % 4 == 2) {
+                str_col->append("   ");
+                expected_trim.emplace_back("");
+                expected_ltrim.emplace_back("");
+                expected_rtrim.emplace_back("");
+            } else {
+                std::string pad(32, ' ');
+                str_col->append(pad + body + pad);
+                expected_trim.push_back(body);
+                expected_ltrim.push_back(body + pad);
+                expected_rtrim.push_back(pad + body);
+            }
+        }
+        Columns cols{str_col};
+        std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+        ctx->set_constant_columns(cols);
+        ASSERT_OK(StringFunctions::trim_prepare(ctx.get(), FunctionContext::FRAGMENT_LOCAL));
+
+        auto trim_col = ColumnHelper::cast_to<TYPE_VARCHAR>(StringFunctions::trim(ctx.get(), cols).value());
+        auto ltrim_col = ColumnHelper::cast_to<TYPE_VARCHAR>(StringFunctions::ltrim(ctx.get(), cols).value());
+        auto rtrim_col = ColumnHelper::cast_to<TYPE_VARCHAR>(StringFunctions::rtrim(ctx.get(), cols).value());
+        for (size_t i = 0; i < 1024; ++i) {
+            ASSERT_EQ(expected_trim[i], trim_col->get_slice(i).to_string()) << "row " << i;
+            ASSERT_EQ(expected_ltrim[i], ltrim_col->get_slice(i).to_string()) << "row " << i;
+            ASSERT_EQ(expected_rtrim[i], rtrim_col->get_slice(i).to_string()) << "row " << i;
+        }
+        ASSERT_OK(StringFunctions::trim_close(ctx.get(), FunctionContext::FRAGMENT_LOCAL));
+    }
+}
 } // namespace starrocks
