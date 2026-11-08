@@ -373,4 +373,166 @@ TEST_F(StringFunctionTrimTest, trimStringPrepareErrorTest) {
         EXPECT_EQ("Invalid argument: The second parameter should not be null", st.to_string());
     }
 }
+
+TEST_F(StringFunctionTrimTest, trimMultiCharSimdBoundaryLengthsAndUtf8Interior) {
+    const std::string kWs = " \t\r\n\v\f";
+    auto make_ws = [&](size_t len, size_t seed) {
+        std::string out(len, ' ');
+        for (size_t i = 0; i < len; ++i) {
+            out[i] = kWs[(seed + i) % kWs.size()];
+        }
+        return out;
+    };
+
+    auto str_col = BinaryColumn::create();
+    std::vector<std::string> expected_trim;
+    std::vector<std::string> expected_ltrim;
+    std::vector<std::string> expected_rtrim;
+
+    for (int j = 0; j < 512; ++j) {
+        size_t lead_len = static_cast<size_t>(j % 96);
+        size_t trail_len = static_cast<size_t>((j * 7) % 96);
+        std::string lead = make_ws(lead_len, static_cast<size_t>(j));
+        std::string trail = make_ws(trail_len, static_cast<size_t>(j * 13));
+        std::string payload = "你好_abc_" + std::to_string(j) + "_🙂🐶";
+        str_col->append(lead + payload + trail);
+        expected_trim.push_back(payload);
+        expected_ltrim.push_back(payload + trail);
+        expected_rtrim.push_back(lead + payload);
+    }
+
+    const size_t boundary_ws_lengths[] = {0, 1, 15, 16, 17, 31, 32, 33, 64};
+    for (size_t idx = 0; idx < sizeof(boundary_ws_lengths) / sizeof(boundary_ws_lengths[0]); ++idx) {
+        size_t len = boundary_ws_lengths[idx];
+        str_col->append(make_ws(len, idx * 17));
+        expected_trim.emplace_back();
+        expected_ltrim.emplace_back();
+        expected_rtrim.emplace_back();
+    }
+
+    const size_t total_rows = str_col->size();
+    ColumnPtr remove_col = ColumnHelper::create_const_column<TYPE_VARCHAR>(Slice(kWs), total_rows);
+    Columns columns{str_col, remove_col};
+
+    std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+    ctx->set_constant_columns(columns);
+    ASSERT_OK(StringFunctions::trim_prepare(ctx.get(), FunctionContext::FRAGMENT_LOCAL));
+
+    ColumnPtr trim_res = StringFunctions::trim(ctx.get(), columns).value();
+    ColumnPtr ltrim_res = StringFunctions::ltrim(ctx.get(), columns).value();
+    ColumnPtr rtrim_res = StringFunctions::rtrim(ctx.get(), columns).value();
+    ASSERT_EQ(total_rows, trim_res->size());
+    ASSERT_EQ(total_rows, ltrim_res->size());
+    ASSERT_EQ(total_rows, rtrim_res->size());
+
+    auto trim_col = ColumnHelper::cast_to<TYPE_VARCHAR>(trim_res);
+    auto ltrim_col = ColumnHelper::cast_to<TYPE_VARCHAR>(ltrim_res);
+    auto rtrim_col = ColumnHelper::cast_to<TYPE_VARCHAR>(rtrim_res);
+    for (size_t i = 0; i < total_rows; ++i) {
+        ASSERT_EQ(expected_trim[i], trim_col->get_slice(i).to_string()) << "row " << i;
+        ASSERT_EQ(expected_ltrim[i], ltrim_col->get_slice(i).to_string()) << "row " << i;
+        ASSERT_EQ(expected_rtrim[i], rtrim_col->get_slice(i).to_string()) << "row " << i;
+    }
+
+    ASSERT_OK(StringFunctions::trim_close(ctx.get(), FunctionContext::FRAGMENT_LOCAL));
+}
+
+TEST_F(StringFunctionTrimTest, trimMultiCharLargeAsciiSetAndEmbeddedNul) {
+    const std::string kLargeSet = "+-*/=_0123456789@#$%";
+    ASSERT_EQ(20u, kLargeSet.size());
+    auto make_pad = [&](size_t len, size_t seed) {
+        std::string out(len, '+');
+        for (size_t i = 0; i < len; ++i) {
+            out[i] = kLargeSet[(seed + i) % kLargeSet.size()];
+        }
+        return out;
+    };
+
+    auto verify_batch = [&](bool simd_batch) {
+        constexpr size_t kRows = 256;
+        auto str_col = BinaryColumn::create();
+        std::vector<std::string> expected_trim;
+        std::vector<std::string> expected_ltrim;
+        std::vector<std::string> expected_rtrim;
+
+        for (size_t j = 0; j < kRows; ++j) {
+            size_t lead_len = simd_batch ? (21 + (j % 48)) : (j % 6);
+            size_t trail_len = simd_batch ? (21 + ((j * 5) % 48)) : ((j * 3) % 6);
+            std::string lead = make_pad(lead_len, j);
+            std::string trail = make_pad(trail_len, j * 11);
+            std::string payload =
+                    "core_123_+-*/_" + std::to_string(j) + "_" + std::string(1, static_cast<char>('a' + (j % 26)));
+            str_col->append(lead + payload + trail);
+            expected_trim.push_back(payload);
+            expected_ltrim.push_back(payload + trail);
+            expected_rtrim.push_back(lead + payload);
+        }
+
+        ColumnPtr remove_col = ColumnHelper::create_const_column<TYPE_VARCHAR>(Slice(kLargeSet), kRows);
+        Columns columns{str_col, remove_col};
+
+        std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+        ctx->set_constant_columns(columns);
+        ASSERT_OK(StringFunctions::trim_prepare(ctx.get(), FunctionContext::FRAGMENT_LOCAL));
+
+        auto trim_col = ColumnHelper::cast_to<TYPE_VARCHAR>(StringFunctions::trim(ctx.get(), columns).value());
+        auto ltrim_col = ColumnHelper::cast_to<TYPE_VARCHAR>(StringFunctions::ltrim(ctx.get(), columns).value());
+        auto rtrim_col = ColumnHelper::cast_to<TYPE_VARCHAR>(StringFunctions::rtrim(ctx.get(), columns).value());
+        for (size_t i = 0; i < kRows; ++i) {
+            ASSERT_EQ(expected_trim[i], trim_col->get_slice(i).to_string()) << "simd=" << simd_batch << " row=" << i;
+            ASSERT_EQ(expected_ltrim[i], ltrim_col->get_slice(i).to_string()) << "simd=" << simd_batch << " row=" << i;
+            ASSERT_EQ(expected_rtrim[i], rtrim_col->get_slice(i).to_string()) << "simd=" << simd_batch << " row=" << i;
+        }
+        ASSERT_OK(StringFunctions::trim_close(ctx.get(), FunctionContext::FRAGMENT_LOCAL));
+    };
+
+    // Scalar ByteSet path (< 8 trimmed chars/row) and SIMD nibble-LUT path (> 20 trimmed chars/row)
+    verify_batch(false);
+    verify_batch(true);
+
+    // Embedded NUL in both remove_col and input strings (exercising both scalar and SIMD paths)
+    {
+        constexpr size_t kRows = 128;
+        const std::string nul_space("\0 ", 2);
+        const std::string payload("a\0b", 3);
+        auto str_col = BinaryColumn::create();
+        std::vector<std::string> expected_trim;
+        std::vector<std::string> expected_ltrim;
+        std::vector<std::string> expected_rtrim;
+
+        for (size_t j = 0; j < kRows; ++j) {
+            size_t lead_len = (j == 0) ? 3 : (16 + (j % 32));
+            size_t trail_len = (j == 0) ? 3 : (16 + ((j * 3) % 32));
+            std::string lead(lead_len, '\0');
+            for (size_t i = 0; i < lead_len; ++i) {
+                lead[i] = ((i + j) & 1) ? ' ' : '\0';
+            }
+            std::string trail(trail_len, '\0');
+            for (size_t i = 0; i < trail_len; ++i) {
+                trail[i] = ((i + j) & 1) ? '\0' : ' ';
+            }
+            str_col->append(Slice(lead + payload + trail));
+            expected_trim.push_back(payload);
+            expected_ltrim.push_back(payload + trail);
+            expected_rtrim.push_back(lead + payload);
+        }
+
+        ColumnPtr remove_col = ColumnHelper::create_const_column<TYPE_VARCHAR>(Slice(nul_space), kRows);
+        Columns columns{str_col, remove_col};
+
+        std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context());
+        ctx->set_constant_columns(columns);
+        ASSERT_OK(StringFunctions::trim_prepare(ctx.get(), FunctionContext::FRAGMENT_LOCAL));
+
+        auto trim_col = ColumnHelper::cast_to<TYPE_VARCHAR>(StringFunctions::trim(ctx.get(), columns).value());
+        auto ltrim_col = ColumnHelper::cast_to<TYPE_VARCHAR>(StringFunctions::ltrim(ctx.get(), columns).value());
+        auto rtrim_col = ColumnHelper::cast_to<TYPE_VARCHAR>(StringFunctions::rtrim(ctx.get(), columns).value());
+        for (size_t i = 0; i < kRows; ++i) {
+            ASSERT_EQ(expected_trim[i], trim_col->get_slice(i).to_string()) << "row " << i;
+            ASSERT_EQ(expected_ltrim[i], ltrim_col->get_slice(i).to_string()) << "row " << i;
+            ASSERT_EQ(expected_rtrim[i], rtrim_col->get_slice(i).to_string()) << "row " << i;
+        }
+        ASSERT_OK(StringFunctions::trim_close(ctx.get(), FunctionContext::FRAGMENT_LOCAL));
+    }
+}
 } // namespace starrocks
