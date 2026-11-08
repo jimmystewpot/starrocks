@@ -520,8 +520,7 @@ requires(!lt_is_date<SlotType>) Status ChunkPredicateBuilder<E, Type>::normalize
     };
 
     auto normalize_in_pred = [&]<LogicalType MappingType, template <typename> typename Decoder, typename... Args>(
-                                     const size_t i, const Expr* root_expr, Args&&... args)
-                                     ->Status {
+                                     const size_t i, const Expr* root_expr, Args&&... args) -> Status {
         const Expr* l = root_expr->get_child(0);
 
         if (const auto ltype = l->type().type;
@@ -811,9 +810,8 @@ Status ChunkPredicateBuilder<E, Type>::normalize_join_runtime_filter(const SlotD
     const auto& global_dicts = get_query_global_dicts(_opts.runtime_state);
     const auto global_dict_iter = SlotType == TYPE_VARCHAR ? global_dicts.find(slot.id()) : global_dicts.end();
 
-    auto process = [&]<LogicalType MappingType, template <typename> typename Decoder, typename... Args>(Args &&
-                                                                                                        ... args)
-                           ->Status {
+    auto process = [&]<LogicalType MappingType, template <typename> typename Decoder, typename... Args>(
+                           Args&&... args) -> Status {
         // in runtime filter
         for (size_t i = 0; i < _exprs.size(); i++) {
             if (_normalized_exprs[i]) {
@@ -919,6 +917,11 @@ Status ChunkPredicateBuilder<E, Type>::normalize_join_runtime_filter(const SlotD
                 rt_ranger_params.add_unarrived_rf(desc, &slot, _opts.driver_sequence);
                 continue;
             }
+            if (desc->is_topn_filter()) {
+                // Top-N filters are mutable (rf_version increases as the heap tightens), so register
+                // arrived Top-N filters with RuntimeScanRangePruner as well.
+                rt_ranger_params.add_unarrived_rf(desc, &slot, _opts.driver_sequence);
+            }
             // an arrived join filter that passes every row filters nothing. always_true() alone does not tell it: a
             // top-n filter is always true but has bounds.
             if (rf->always_true() && rf->is_pass_all()) {
@@ -976,8 +979,7 @@ Status ChunkPredicateBuilder<E, Type>::normalize_not_in_or_not_equal_predicate(
     };
 
     auto normalize_in_pred = [&]<LogicalType MappingType, template <typename> typename Decoder, typename... Args>(
-                                     const size_t i, const Expr* root_expr, Args&&... args)
-                                     ->Status {
+                                     const size_t i, const Expr* root_expr, Args&&... args) -> Status {
         const Expr* l = root_expr->get_child(0);
         if (const auto ltype = l->type().type;
             !l->is_slotref() || (ltype != slot.type().type && ltype != MappingType && !ignore_cast(slot, *l))) {
@@ -1329,7 +1331,10 @@ Status ChunkPredicateBuilder<E, Type>::_get_column_predicates(PredicateParser* p
             if (slot_desc == nullptr) {
                 continue;
             }
-            if (desc->is_stream_build_filter()) {
+            const bool enable_topn_pushdown =
+                    config::enable_topn_runtime_filter_storage_pushdown &&
+                    (_opts.runtime_state == nullptr || _opts.runtime_state->enable_join_runtime_filter_pushdown());
+            if (desc->is_stream_build_filter() && (!desc->is_topn_filter() || !enable_topn_pushdown)) {
                 continue;
             }
 
@@ -1541,7 +1546,10 @@ StatusOr<RuntimeFilterPredicates> ScanConjunctsManager::get_runtime_filter_predi
         if (slot_desc == nullptr) {
             continue;
         }
-        if (desc->is_stream_build_filter()) {
+        const bool enable_topn_pushdown =
+                config::enable_topn_runtime_filter_storage_pushdown &&
+                (_opts.runtime_state == nullptr || _opts.runtime_state->enable_join_runtime_filter_pushdown());
+        if (desc->is_stream_build_filter() && (!desc->is_topn_filter() || !enable_topn_pushdown)) {
             continue;
         }
         // If the runtime filter's partition-by-exprs's size is greater than 1, skip to push it down to storage engine.
