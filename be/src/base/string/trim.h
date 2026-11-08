@@ -59,7 +59,10 @@ struct ByteSet {
         exact_nibble_lut = true;
     }
 
-    constexpr void add(uint8_t b) noexcept { bitmap[b >> 6] |= (1ULL << (b & 63)); }
+    constexpr void add(uint8_t b) noexcept {
+        bitmap[b >> 6] |= (1ULL << (b & 63));
+        exact_nibble_lut = false;
+    }
 
     constexpr bool contains(uint8_t b) const noexcept { return ((bitmap[b >> 6] >> (b & 63)) & 1ULL) != 0; }
 
@@ -252,8 +255,8 @@ inline const char* skip_leading_byteset(const char* begin, const char* end, cons
         if (set.exact_nibble_lut) {
 #if defined(__AVX2__)
             if (static_cast<size_t>(end - p) >= 16) {
-                const __m128i low128 = _mm_load_si128(reinterpret_cast<const __m128i*>(set.low_nibble_lut));
-                const __m128i high128 = _mm_load_si128(reinterpret_cast<const __m128i*>(set.high_nibble_lut));
+                const __m128i low128 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(set.low_nibble_lut));
+                const __m128i high128 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(set.high_nibble_lut));
                 if (static_cast<size_t>(end - p) >= 32) {
                     const __m256i low_lut = _mm256_broadcastsi128_si256(low128);
                     const __m256i high_lut = _mm256_broadcastsi128_si256(high128);
@@ -289,8 +292,8 @@ inline const char* skip_leading_byteset(const char* begin, const char* end, cons
             }
 #elif defined(__SSSE3__)
             if (static_cast<size_t>(end - p) >= 16) {
-                const __m128i low128 = _mm_load_si128(reinterpret_cast<const __m128i*>(set.low_nibble_lut));
-                const __m128i high128 = _mm_load_si128(reinterpret_cast<const __m128i*>(set.high_nibble_lut));
+                const __m128i low128 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(set.low_nibble_lut));
+                const __m128i high128 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(set.high_nibble_lut));
                 const __m128i mask_0f = _mm_set1_epi8(0x0F);
                 const __m128i zero128 = _mm_setzero_si128();
                 do {
@@ -340,8 +343,8 @@ inline const char* skip_trailing_byteset(const char* begin, const char* end, con
         if (set.exact_nibble_lut) {
 #if defined(__AVX2__)
             if (static_cast<size_t>(p - begin) >= 16) {
-                const __m128i low128 = _mm_load_si128(reinterpret_cast<const __m128i*>(set.low_nibble_lut));
-                const __m128i high128 = _mm_load_si128(reinterpret_cast<const __m128i*>(set.high_nibble_lut));
+                const __m128i low128 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(set.low_nibble_lut));
+                const __m128i high128 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(set.high_nibble_lut));
                 if (static_cast<size_t>(p - begin) >= 32) {
                     const __m256i low_lut = _mm256_broadcastsi128_si256(low128);
                     const __m256i high_lut = _mm256_broadcastsi128_si256(high128);
@@ -377,8 +380,8 @@ inline const char* skip_trailing_byteset(const char* begin, const char* end, con
             }
 #elif defined(__SSSE3__)
             if (static_cast<size_t>(p - begin) >= 16) {
-                const __m128i low128 = _mm_load_si128(reinterpret_cast<const __m128i*>(set.low_nibble_lut));
-                const __m128i high128 = _mm_load_si128(reinterpret_cast<const __m128i*>(set.high_nibble_lut));
+                const __m128i low128 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(set.low_nibble_lut));
+                const __m128i high128 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(set.high_nibble_lut));
                 const __m128i mask_0f = _mm_set1_epi8(0x0F);
                 const __m128i zero128 = _mm_setzero_si128();
                 do {

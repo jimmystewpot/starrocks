@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <string_view>
 
@@ -101,6 +102,19 @@ TEST(ByteSetTest, EmptyAndSingleByte) {
         EXPECT_FALSE(cleared.contains(byte)) << "b=" << b;
         EXPECT_FALSE(cleared.nibble_matches(byte)) << "b=" << b;
     }
+
+    // Mutating a ByteSet via add() must invalidate exact_nibble_lut until finalize_lut() is called,
+    // so SIMD and scalar paths remain consistent even if a caller mutates after construction.
+    ByteSet mutated = ByteSet::from_bytes(" ");
+    mutated.add(static_cast<uint8_t>('\t'));
+    EXPECT_FALSE(mutated.exact_nibble_lut);
+    const std::string tabs(32, '\t');
+    EXPECT_EQ(tabs.data() + tabs.size(), skip_leading_byteset<true>(tabs.data(), tabs.data() + tabs.size(), mutated));
+    EXPECT_EQ(tabs.data(), skip_trailing_byteset<true>(tabs.data(), tabs.data() + tabs.size(), mutated));
+    mutated.finalize_lut();
+    EXPECT_TRUE(mutated.exact_nibble_lut);
+    EXPECT_EQ(tabs.data() + tabs.size(), skip_leading_byteset<true>(tabs.data(), tabs.data() + tabs.size(), mutated));
+    EXPECT_EQ(tabs.data(), skip_trailing_byteset<true>(tabs.data(), tabs.data() + tabs.size(), mutated));
 }
 
 TEST(ByteSetTest, AsciiSubsetsHaveZeroFalsePositives) {
@@ -232,8 +246,11 @@ TEST(SkipCharSimdTest, BoundaryLengthsAndAlignments) {
     }
 
     for (size_t len = 0; len <= 96; ++len) {
-        std::string all_spaces(len, ' ');
-        std::string_view res = trim_spaces(all_spaces);
+        auto all_spaces = std::make_unique<char[]>(len);
+        if (len > 0) {
+            std::memset(all_spaces.get(), ' ', len);
+        }
+        std::string_view res = trim_spaces(std::string_view(all_spaces.get(), len));
         ASSERT_TRUE(res.empty()) << "len=" << len;
         ASSERT_NE(nullptr, res.data()) << "len=" << len;
     }
@@ -355,19 +372,23 @@ TEST(SkipByteSetSimdTest, BoundaryLengthsAlignmentsAndUtf8Interior) {
 
     // Tight heap allocations (exact size 0..96) so ASAN detects any 1-byte OOB vector read
     for (size_t len = 0; len <= 96; ++len) {
-        std::string tight_all(len, ' ');
-        const char* b = tight_all.data();
-        const char* e = b + tight_all.size();
+        auto tight_all = std::make_unique<char[]>(len);
+        if (len > 0) {
+            std::memset(tight_all.get(), ' ', len);
+        }
+        const char* b = tight_all.get();
+        const char* e = b + len;
         ASSERT_EQ(e, skip_leading_char<true>(b, e, ' '));
         ASSERT_EQ(b, skip_trailing_char<true>(b, e, ' '));
         ASSERT_EQ(e, skip_leading_byteset<true>(b, e, ws_set));
         ASSERT_EQ(b, skip_trailing_byteset<true>(b, e, ws_set));
 
         if (len > 0) {
-            std::string tight_mid(len, ' ');
+            auto tight_mid = std::make_unique<char[]>(len);
+            std::memset(tight_mid.get(), ' ', len);
             tight_mid[len / 2] = 'x';
-            const char* bm = tight_mid.data();
-            const char* em = bm + tight_mid.size();
+            const char* bm = tight_mid.get();
+            const char* em = bm + len;
             ASSERT_EQ(bm + (len / 2), skip_leading_char<true>(bm, em, ' '));
             ASSERT_EQ(bm + (len / 2) + 1, skip_trailing_char<true>(bm, em, ' '));
             ASSERT_EQ(bm + (len / 2), skip_leading_byteset<true>(bm, em, ws_set));
