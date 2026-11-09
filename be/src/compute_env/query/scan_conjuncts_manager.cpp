@@ -285,7 +285,13 @@ StatusOr<ExprContext*> BoxedExprContext::expr_context(ObjectPool* obj_pool, Runt
 template <BoxedExprType E, CompoundNodeType Type>
 ChunkPredicateBuilder<E, Type>::ChunkPredicateBuilder(const ScanConjunctsManagerOptions& opts, std::vector<E> exprs,
                                                       bool is_root_builder)
-        : _opts(opts), _exprs(std::move(exprs)), _is_root_builder(is_root_builder), _normalized_exprs(_exprs.size()) {}
+        : _opts(opts),
+          _exprs(std::move(exprs)),
+          _is_root_builder(is_root_builder),
+          _enable_topn_filter_pushdown(
+                  config::enable_topn_runtime_filter_storage_pushdown &&
+                  (_opts.runtime_state == nullptr || _opts.runtime_state->enable_join_runtime_filter_pushdown())),
+          _normalized_exprs(_exprs.size()) {}
 
 template <BoxedExprType E, CompoundNodeType Type>
 StatusOr<bool> ChunkPredicateBuilder<E, Type>::parse_conjuncts() {
@@ -520,7 +526,8 @@ requires(!lt_is_date<SlotType>) Status ChunkPredicateBuilder<E, Type>::normalize
     };
 
     auto normalize_in_pred = [&]<LogicalType MappingType, template <typename> typename Decoder, typename... Args>(
-                                     const size_t i, const Expr* root_expr, Args&&... args) -> Status {
+                                     const size_t i, const Expr* root_expr, Args&&... args)
+                                     ->Status {
         const Expr* l = root_expr->get_child(0);
 
         if (const auto ltype = l->type().type;
@@ -810,8 +817,9 @@ Status ChunkPredicateBuilder<E, Type>::normalize_join_runtime_filter(const SlotD
     const auto& global_dicts = get_query_global_dicts(_opts.runtime_state);
     const auto global_dict_iter = SlotType == TYPE_VARCHAR ? global_dicts.find(slot.id()) : global_dicts.end();
 
-    auto process = [&]<LogicalType MappingType, template <typename> typename Decoder, typename... Args>(
-                           Args&&... args) -> Status {
+    auto process = [&]<LogicalType MappingType, template <typename> typename Decoder, typename... Args>(Args &&
+                                                                                                        ... args)
+                           ->Status {
         // in runtime filter
         for (size_t i = 0; i < _exprs.size(); i++) {
             if (_normalized_exprs[i]) {
@@ -979,7 +987,8 @@ Status ChunkPredicateBuilder<E, Type>::normalize_not_in_or_not_equal_predicate(
     };
 
     auto normalize_in_pred = [&]<LogicalType MappingType, template <typename> typename Decoder, typename... Args>(
-                                     const size_t i, const Expr* root_expr, Args&&... args) -> Status {
+                                     const size_t i, const Expr* root_expr, Args&&... args)
+                                     ->Status {
         const Expr* l = root_expr->get_child(0);
         if (const auto ltype = l->type().type;
             !l->is_slotref() || (ltype != slot.type().type && ltype != MappingType && !ignore_cast(slot, *l))) {
@@ -1331,10 +1340,14 @@ Status ChunkPredicateBuilder<E, Type>::_get_column_predicates(PredicateParser* p
             if (slot_desc == nullptr) {
                 continue;
             }
-            const bool enable_topn_pushdown =
-                    config::enable_topn_runtime_filter_storage_pushdown &&
-                    (_opts.runtime_state == nullptr || _opts.runtime_state->enable_join_runtime_filter_pushdown());
-            if (desc->is_stream_build_filter() && (!desc->is_topn_filter() || !enable_topn_pushdown)) {
+            if (desc->is_stream_build_filter() && (!desc->is_topn_filter() || !_enable_topn_filter_pushdown)) {
+                continue;
+            }
+            // If the runtime filter's partition-by-exprs's size is greater than 1, skip to push it down to storage engine.
+            if (desc->num_partition_by_exprs() > 1) {
+                continue;
+            }
+            if (!parser->can_pushdown(slot_desc)) {
                 continue;
             }
 
@@ -1546,10 +1559,8 @@ StatusOr<RuntimeFilterPredicates> ScanConjunctsManager::get_runtime_filter_predi
         if (slot_desc == nullptr) {
             continue;
         }
-        const bool enable_topn_pushdown =
-                config::enable_topn_runtime_filter_storage_pushdown &&
-                (_opts.runtime_state == nullptr || _opts.runtime_state->enable_join_runtime_filter_pushdown());
-        if (desc->is_stream_build_filter() && (!desc->is_topn_filter() || !enable_topn_pushdown)) {
+        if (desc->is_stream_build_filter() &&
+            (!desc->is_topn_filter() || !_root_builder.enable_topn_filter_pushdown())) {
             continue;
         }
         // If the runtime filter's partition-by-exprs's size is greater than 1, skip to push it down to storage engine.

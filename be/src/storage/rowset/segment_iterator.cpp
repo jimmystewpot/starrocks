@@ -427,7 +427,7 @@ private:
     void _collect_offset_only_columns();
     void _apply_offset_only_columns();
     void _mark_offset_only_chunk_columns(Chunk* chunk) const;
-    bool _prune_by_dict_runtime_filter_bounds();
+    inline ALWAYS_INLINE bool _prune_by_dict_runtime_filter_bounds();
 
     StatusOr<size_t> trigger_sample_if_necessary(vector<rowid_t>* rowid);
 
@@ -612,6 +612,7 @@ private:
 
     bool _inited = false;
     bool _one_time_setup_done = false;
+    bool _has_dict_runtime_filters = false;
 
     std::unordered_map<ColumnId, ColumnAccessPath*> _column_access_paths;
     std::unordered_map<ColumnId, ColumnAccessPath*> _predicate_column_access_paths;
@@ -1154,6 +1155,7 @@ Status SegmentIterator::_init_reused_scan() {
     _non_expr_pred_tree = PredicateTree{};
     _expr_pred_tree = PredicateTree{};
     _runtime_filter_preds = RuntimeFilterPredicates{};
+    _has_dict_runtime_filters = false;
     _column_to_runtime_filters_map.clear();
     _context_list[0].reset();
     _context_list[1].reset();
@@ -1859,8 +1861,11 @@ Status SegmentIterator::_get_row_ranges_by_row_ids(std::vector<int64_t>* result_
     return Status::OK();
 }
 
-Status SegmentIterator::_try_to_update_ranges_by_runtime_filter(bool force) {
+inline Status SegmentIterator::_try_to_update_ranges_by_runtime_filter(bool force) {
     if (_prune_by_dict_runtime_filter_bounds()) {
+        return Status::OK();
+    }
+    if (LIKELY(!_opts.runtime_range_pruner.has_runtime_filters())) {
         return Status::OK();
     }
     return _opts.runtime_range_pruner.update_range_if_arrived(
@@ -2194,6 +2199,7 @@ void SegmentIterator::_init_column_predicates() {
     _expr_pred_tree = PredicateTree::create(std::move(expr_pred_root));
     _non_expr_pred_tree = PredicateTree::create(std::move(non_expr_pred_root));
     _runtime_filter_preds = _opts.runtime_filter_preds;
+    _has_dict_runtime_filters = _opts.enable_join_runtime_filter_pushdown && _runtime_filter_preds.has_dict_filters();
 }
 
 namespace {
@@ -2307,11 +2313,12 @@ void SegmentIterator::_mark_offset_only_chunk_columns(Chunk* chunk) const {
     }
 }
 
-bool SegmentIterator::_prune_by_dict_runtime_filter_bounds() {
-    if (!_opts.enable_join_runtime_filter_pushdown || _runtime_filter_preds.empty()) {
+inline ALWAYS_INLINE bool SegmentIterator::_prune_by_dict_runtime_filter_bounds() {
+    if (LIKELY(!_has_dict_runtime_filters)) {
         return false;
     }
-    Status st = _runtime_filter_preds.refresh_dict_filters();
+    int64_t* rf_eval_timer_ns = _opts.stats != nullptr ? &_opts.stats->rf_cond_evaluate_ns : nullptr;
+    Status st = _runtime_filter_preds.refresh_dict_filters(rf_eval_timer_ns);
     if (!st.ok()) {
         return false;
     }
@@ -2449,8 +2456,8 @@ StatusOr<size_t> SegmentIterator::_sample_predicate_columns(vector<rowid_t>* row
     // Filter the entire chunk (including all columns and rowid) based on merged selection
     // _selection already contains the merged result, use it directly
     // This removes rows that don't pass all predicates
-    size_t filtered_chunk_size = 0;
-    {
+    size_t filtered_chunk_size = chunk_size;
+    if (!use_merged_selection) {
         SCOPED_RAW_TIMER(&_opts.stats->vec_cond_chunk_copy_ns);
         filtered_chunk_size = _filter_chunk_by_selection(chunk, rowid, 0, chunk_size);
     }
@@ -3431,7 +3438,7 @@ StatusOr<size_t> SegmentIterator::_predicate_evaluate_late_materialize_read_firs
     while ((chunk_start < return_chunk_threshold) && _range_iter.has_more()) {
         if (chunk_start == 0) {
             RETURN_IF_ERROR(_try_to_update_ranges_by_runtime_filter(false));
-            if (_prune_by_dict_runtime_filter_bounds() || !_range_iter.has_more()) {
+            if (!_range_iter.has_more()) {
                 break;
             }
         }
@@ -3565,7 +3572,7 @@ StatusOr<size_t> SegmentIterator::_predicate_evaluate_without_late_materialize(v
     while ((chunk_start < return_chunk_threshold) & _range_iter.has_more()) {
         if (chunk_start == 0) {
             RETURN_IF_ERROR(_try_to_update_ranges_by_runtime_filter(false));
-            if (_prune_by_dict_runtime_filter_bounds() || !_range_iter.has_more()) {
+            if (!_range_iter.has_more()) {
                 break;
             }
         }
@@ -4364,14 +4371,26 @@ void SegmentIterator::_build_context_for_predicate(ScanContext* ctx) {
 
     for (const auto& pair : column_predicate_map) {
         ctx->_predicate_order.emplace_back(pair.first);
-        std::vector<const ColumnPredicate*> preds;
-        preds.reserve(pair.second.size());
+        size_t valid_count = 0;
         for (const auto* pred : pair.second) {
             if (pred != nullptr && !pred->is_index_filter_only() && pred->type() != PredicateType::kPlaceHolder) {
-                preds.emplace_back(pred);
+                ++valid_count;
             }
         }
-        ctx->_column_predicate_map.emplace(pair.first, std::move(preds));
+        if (LIKELY(valid_count == pair.second.size())) {
+            ctx->_column_predicate_map.emplace(pair.first, pair.second);
+        } else if (valid_count == 0) {
+            ctx->_column_predicate_map.emplace(pair.first, ColumnPredicates{});
+        } else {
+            ColumnPredicates preds;
+            preds.reserve(valid_count);
+            for (const auto* pred : pair.second) {
+                if (pred != nullptr && !pred->is_index_filter_only() && pred->type() != PredicateType::kPlaceHolder) {
+                    preds.emplace_back(pred);
+                }
+            }
+            ctx->_column_predicate_map.emplace(pair.first, std::move(preds));
+        }
     }
 
     // if column predicate is always true for string column or already used by bitmap index
@@ -4483,7 +4502,9 @@ Status SegmentIterator::_rewrite_predicates() {
         // but for JSON extended column, it might be a JsonExtractColumnIterator, so we need to fallback to the orignal predicate
         ColumnPredicateRewriter rewriter(
                 _column_iterators, _schema, _predicate_need_rewrite, _predicate_columns, _scan_range,
-                _opts.enable_join_runtime_filter_pushdown ? &_opts.runtime_filter_preds : nullptr);
+                (_opts.enable_join_runtime_filter_pushdown && !_opts.runtime_filter_preds.empty())
+                        ? &_opts.runtime_filter_preds
+                        : nullptr);
         auto st = (rewriter.rewrite_predicate(&_obj_pool, _opts.pred_tree));
         if (st.is_not_supported()) {
             VLOG(2) << "not supported predicate rewrite: " << _opts.pred_tree.root().debug_string() << " " << st;
@@ -4493,7 +4514,7 @@ Status SegmentIterator::_rewrite_predicates() {
             VLOG(2) << "rewrite_predicates: " << _opts.pred_tree.root().debug_string();
         }
     }
-    if (_opts.enable_join_runtime_filter_pushdown) {
+    if (_opts.enable_join_runtime_filter_pushdown && !_opts.runtime_filter_preds.empty()) {
         RETURN_IF_ERROR(RuntimeFilterPredicatesRewriter::rewrite(&_obj_pool, _opts.runtime_filter_preds,
                                                                  _column_iterators, _schema));
     }
@@ -4518,10 +4539,11 @@ Status SegmentIterator::_rewrite_predicates() {
 }
 
 Status SegmentIterator::_decode_dict_codes(ScanContext* ctx) {
-    SCOPED_RAW_TIMER(&_opts.stats->decode_dict_ns);
-    if (_opts.enable_join_runtime_filter_pushdown && !_runtime_filter_preds.empty()) {
-        RETURN_IF_ERROR(_runtime_filter_preds.refresh_dict_filters());
+    if (UNLIKELY(_has_dict_runtime_filters)) {
+        int64_t* rf_eval_timer_ns = _opts.stats != nullptr ? &_opts.stats->rf_cond_evaluate_ns : nullptr;
+        RETURN_IF_ERROR(_runtime_filter_preds.refresh_dict_filters(rf_eval_timer_ns));
     }
+    SCOPED_RAW_TIMER(&_opts.stats->decode_dict_ns);
     DCHECK_NE(ctx->_read_chunk, ctx->_dict_chunk);
     if (ctx->_read_chunk->num_rows() == 0) {
         ctx->_dict_chunk->set_num_rows(0);
@@ -5260,6 +5282,7 @@ void SegmentIterator::close() {
     }
     _one_time_setup_done = false;
     _inited = false;
+    _has_dict_runtime_filters = false;
 }
 
 // put the field that has predicated on it ahead of those without one, for handle late
