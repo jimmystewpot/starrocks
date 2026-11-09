@@ -483,6 +483,10 @@ __attribute__((target("avx2"))) size_t detail::compress_avx2_w4(uint32_t* dst, c
             }
             result += kBatchNums;
         } else {
+            // Unlike compress_avx2_w8 (which splits 32 elements into 8 x 4-lane sub-groups and benefits
+            // from a sparse popcount fallback), 4-byte compaction packs 8 lanes per 256-bit YMM register
+            // (only 4 sub-groups per 32-row batch). Skipping empty 8-lane sub-groups (`sub_mask == 0`)
+            // directly is faster than adding a batch-level popcount branch across 1%..99% selectivities.
             for (int g = 0; g < 4; ++g) {
                 uint32_t sub_mask = (mask >> (g * 8)) & 0xffu;
                 if (sub_mask == 0) {

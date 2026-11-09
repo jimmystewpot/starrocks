@@ -769,7 +769,7 @@ static void check_element_width_patterns(GenFn gen_fn) {
             std::vector<T> src;
             std::vector<T> dst;
             std::vector<uint8_t> sel;
-            size_t out = starrocks::filter_range(dst.data(), src.data(), sel, 0, 0);
+            size_t out = filter_range(dst.data(), src.data(), sel, 0, 0);
             EXPECT_EQ(0, out);
             continue;
         }
@@ -808,7 +808,7 @@ static void check_element_width_patterns(GenFn gen_fn) {
 
             // Separate buffer
             std::vector<T> dst(n);
-            size_t out_sz = starrocks::filter_range(dst.data(), src.data(), selector, 0, n);
+            size_t out_sz = filter_range(dst.data(), src.data(), selector, 0, n);
             ASSERT_EQ(expected.size(), out_sz);
             for (size_t i = 0; i < out_sz; ++i) {
                 ASSERT_TRUE(expected[i] == dst[i]);
@@ -816,7 +816,7 @@ static void check_element_width_patterns(GenFn gen_fn) {
 
             // In-place
             std::vector<T> in_place = src;
-            size_t ip_sz = starrocks::filter_range(in_place.data(), in_place.data(), selector, 0, n);
+            size_t ip_sz = filter_range(in_place.data(), in_place.data(), selector, 0, n);
             ASSERT_EQ(expected.size(), ip_sz);
             for (size_t i = 0; i < ip_sz; ++i) {
                 ASSERT_TRUE(expected[i] == in_place[i]);
@@ -1169,7 +1169,7 @@ static void check_exact_capacity_asan_for_type() {
                 // Poison memory region strictly past `to`
                 ASAN_POISON_MEMORY_REGION(dst_buf.data() + to, kRedzone * sizeof(T));
 
-                size_t out_sz = starrocks::filter_range(dst_buf.data(), src.data(), selector, from, to);
+                size_t out_sz = filter_range(dst_buf.data(), src.data(), selector, from, to);
                 ASSERT_EQ(from + expected.size(), out_sz)
                         << "from=" << from << " to=" << to << " case=" << selectivity_case;
 
@@ -1939,6 +1939,92 @@ PARALLEL_TEST(SimdFilterTest, x86_64_avx2_dispatch_entrypoint) {
                                static_cast<uint64_t>(i ^ 0xdeadbeefcafebabeull)};
             },
             Elem16B{0xCAFEBABE12345678ull, 0x87654321FEEDC0DEull});
+}
+
+// Verify that out-of-place callers (such as AppendWithMaskVisitor) that allocate only
+// `std::min(to, returned_size + kFilterSimdStorePadBytes / sizeof(T))` elements never
+// experience a buffer overrun across any subrange offset, batch length, or mask density.
+PARALLEL_TEST(SimdFilterTest, out_of_place_padded_capacity_asan) {
+    if (!__builtin_cpu_supports("avx2")) {
+        GTEST_SKIP() << "CPU does not support AVX2";
+    }
+
+    auto test_type = [](auto dummy) {
+        using T = decltype(dummy);
+        constexpr size_t kPadElems = SIMD::Filter::kFilterSimdStorePadBytes / sizeof(T);
+        constexpr size_t kAvx2VecElems = 32 / sizeof(T);
+
+        for (size_t from : {size_t(0), size_t(1), size_t(7), size_t(16), size_t(31), size_t(32)}) {
+            for (size_t count = 0; count <= 96; ++count) {
+                size_t to = from + count;
+                std::vector<T> src(to);
+                for (size_t i = 0; i < to; ++i) {
+                    src[i] = static_cast<T>(i * 131 + 17);
+                }
+
+                for (int pat = 0; pat < 8; ++pat) {
+                    std::vector<uint8_t> sel(to, 0);
+                    size_t selected = 0;
+                    for (size_t i = from; i < to; ++i) {
+                        size_t rel = i - from;
+                        bool keep = false;
+                        switch (pat) {
+                        case 0:
+                            keep = false;
+                            break;
+                        case 1:
+                            keep = true;
+                            break;
+                        case 2:
+                            keep = (rel == 0);
+                            break;
+                        case 3:
+                            keep = (rel + 1 == count);
+                            break;
+                        case 4:
+                            keep = (rel == 31);
+                            break;
+                        case 5:
+                            keep = ((rel & 7) == 7);
+                            break;
+                        case 6:
+                            keep = ((rel & 3) == 3);
+                            break;
+                        case 7:
+                            keep = (((rel * 17 + 5) % 11) < 3);
+                            break;
+                        }
+                        if (keep) {
+                            sel[i] = 1;
+                            ++selected;
+                        }
+                    }
+
+                    // 1. Top-level filter_range with exact kFilterSimdStorePadBytes padded capacity
+                    {
+                        size_t tight_cap = std::min(to, from + selected + kPadElems);
+                        std::vector<T> dst(tight_cap);
+                        size_t ret = SIMD::Filter::filter_range(dst.data(), src.data(), sel.data(), from, to);
+                        ASSERT_EQ(from + selected, ret);
+                    }
+
+                    // 2. Direct AVX2 dispatch with tight 1-vector (32B) padded capacity
+                    if constexpr (sizeof(T) == 4 || sizeof(T) == 8) {
+                        size_t avx2_cap = std::min(to, from + selected + (kAvx2VecElems - 1));
+                        std::vector<T> dst(avx2_cap);
+                        size_t ret = SIMD::Filter::detail::filter_range_avx2(dst.data(), src.data(), sizeof(T),
+                                                                             sel.data(), from, to);
+                        ASSERT_EQ(from + selected, ret);
+                    }
+                }
+            }
+        }
+    };
+
+    test_type(int8_t{0});
+    test_type(int16_t{0});
+    test_type(int32_t{0});
+    test_type(int64_t{0});
 }
 
 #endif // __x86_64__

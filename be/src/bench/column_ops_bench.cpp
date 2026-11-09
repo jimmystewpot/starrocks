@@ -838,6 +838,8 @@ BENCHMARK(BM_CountZero_32Bit)->Apply(GenerateCountZeroArgs);
 // SIMD filter_range stream compaction microbenchmarks (AVX2)
 // =====================================================================
 
+=======
+>>>>>>> origin/feat/x86-filter-avx2-permute
 template <typename T, size_t (*Kernel)(T*, const T*, const uint8_t*, size_t, size_t)>
 static void BM_SimdFilterKernel(benchmark::State& state) {
     if (!__builtin_cpu_supports("avx2")) {
@@ -870,8 +872,11 @@ static void BM_SimdFilterKernel(benchmark::State& state) {
 }
 
 static void SimdFilterKernelArgs(benchmark::Benchmark* b) {
+    // cluster = 0 is random per-element; 7, 13, and 16 test clustered runs that cross 4/8-lane sub-group
+    // and 32-row batch boundaries (avoiding cluster = 32 aligned to from = 0, where every 32-row batch is
+    // trivially all-zero or all-one).
     for (int cluster : {0, 7, 13, 16}) {
-        for (int sel : {10, 20, 30, 40, 50, 60, 70, 80, 90}) {
+        for (int sel : {0, 1, 5, 10, 20, 25, 30, 40, 50, 60, 70, 75, 80, 90, 99, 100}) {
             b->Args({sel, cluster});
         }
     }
