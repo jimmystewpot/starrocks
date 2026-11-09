@@ -639,6 +639,43 @@ static_assert(SerializedKeyFixedSize4AggHashMap<PhmapSeed1>::max_fixed_size == s
 static_assert(SerializedKeyFixedSize8AggHashMap<PhmapSeed1>::max_fixed_size == sizeof(SliceKey8));
 static_assert(SerializedKeyFixedSize16AggHashMap<PhmapSeed1>::max_fixed_size == sizeof(SliceKey16));
 
+TEST(HashMapTest, ArchAwarePrefetchGateAndDistance) {
+    const double saved_ratio = config::agg_prefetch_l2_ratio;
+    const int32_t saved_dist = config::agg_hash_map_prefetch_dist;
+    DeferOp restore([&]() {
+        config::agg_prefetch_l2_ratio = saved_ratio;
+        config::agg_hash_map_prefetch_dist = saved_dist;
+    });
+
+#if defined(__x86_64__)
+    EXPECT_DOUBLE_EQ(2.0, kArchPrefetchL2Scale);
+    EXPECT_EQ(8u, kArchDefaultAggPrefetchDist);
+#else
+    EXPECT_DOUBLE_EQ(1.0, kArchPrefetchL2Scale);
+    EXPECT_EQ(16u, kArchDefaultAggPrefetchDist);
+#endif
+
+    // Default initialization sets arch-tuned distance, while explicit overrides (including 16 and 0) are respected.
+    EXPECT_EQ(kArchDefaultAggPrefetchDist, agg_hash_map_default_prefetch_dist());
+    config::agg_hash_map_prefetch_dist = 16;
+    EXPECT_EQ(16u, agg_hash_map_default_prefetch_dist());
+    config::agg_hash_map_prefetch_dist = 12;
+    EXPECT_EQ(12u, agg_hash_map_default_prefetch_dist());
+    config::agg_hash_map_prefetch_dist = 0;
+    EXPECT_EQ(0u, agg_hash_map_default_prefetch_dist());
+    config::agg_hash_map_prefetch_dist = -5;
+    EXPECT_EQ(0u, agg_hash_map_default_prefetch_dist());
+
+    // L2 gate scales by kArchPrefetchL2Scale at ratio 1.0, and preserves 0.0 (force prefetch) and 1e9 (force noprefetch).
+    config::agg_prefetch_l2_ratio = 0.0;
+    EXPECT_EQ(0u, agg_prefetch_min_bytes());
+    config::agg_prefetch_l2_ratio = 1.0;
+    const size_t min_at_one = agg_prefetch_min_bytes();
+    EXPECT_GT(min_at_one, 0u);
+    config::agg_prefetch_l2_ratio = 2.0;
+    EXPECT_EQ(min_at_one * 2, agg_prefetch_min_bytes());
+}
+
 TEST(HashMapTest, FixedSizeSoALayoutAndSubWidthTransitionAllKeyWidths) {
     constexpr int kChunkRows = 64;
     const double saved_ratio = config::agg_prefetch_l2_ratio;
@@ -653,7 +690,9 @@ TEST(HashMapTest, FixedSizeSoALayoutAndSubWidthTransitionAllKeyWidths) {
     {
         SerializedKeyFixedSize16AggHashMap<PhmapSeed1> map16(kChunkRows, &statis);
         ASSERT_EQ(static_cast<size_t>(kChunkRows), map16.keys.size());
-        ASSERT_EQ(static_cast<size_t>(kChunkRows), map16.hashes.size());
+        static_assert(![](auto* m) {
+            return requires { m->hashes; };
+        }(static_cast<SerializedKeyFixedSize16AggHashMap<PhmapSeed1>*>(nullptr)));
         for (int i = 0; i < kChunkRows; ++i) {
             EXPECT_EQ(0u, reinterpret_cast<uintptr_t>(&map16.keys[i]) % alignof(SliceKey16)) << "row " << i;
             if (i + 1 < kChunkRows) {
@@ -736,6 +775,71 @@ TEST(HashMapTest, FixedSizeSoALayoutAndSubWidthTransitionAllKeyWidths) {
         map16.build_hash_map(
                 kChunkRows, cols16, &pool, [&](const auto&) { return pool.allocate(8); }, &agg_states);
         EXPECT_EQ(static_cast<size_t>(kChunkRows), map16.hash_map.size());
+    }
+
+    // 4. Prefetch boundary chunk sizes (0, 1, 7 < __prefetch_dist) and missed-row agg_states[i] == nullptr clearing.
+    {
+        SerializedKeyFixedSize8AggHashMap<PhmapSeed1> map8(kChunkRows, &statis);
+        map8.has_null_column = false;
+        map8.fixed_byte_size = 8;
+        config::agg_prefetch_l2_ratio = 0.0;
+
+        auto make_cols8 = [](int count, int32_t base) {
+            auto c0 = Int32Column::create();
+            auto c1 = Int32Column::create();
+            for (int i = 0; i < count; ++i) {
+                c0->append(base + i);
+                c1->append(base * 2 + i);
+            }
+            return Columns{c0, c1};
+        };
+
+        Columns empty_cols = make_cols8(0, 0);
+        map8.build_hash_map(
+                0, empty_cols, &pool, [&](const auto&) { return pool.allocate(8); }, &agg_states);
+        EXPECT_EQ(0u, map8.hash_map.size());
+
+        Columns one_col = make_cols8(1, 100);
+        map8.build_hash_map(
+                1, one_col, &pool, [&](const auto&) { return pool.allocate(8); }, &agg_states);
+        EXPECT_EQ(1u, map8.hash_map.size());
+        EXPECT_NE(nullptr, agg_states[0]);
+
+        Columns seven_cols = make_cols8(7, 200);
+        map8.build_hash_map(
+                7, seven_cols, &pool, [&](const auto&) { return pool.allocate(8); }, &agg_states);
+        EXPECT_EQ(8u, map8.hash_map.size());
+        for (int i = 0; i < 7; ++i) {
+            EXPECT_NE(nullptr, agg_states[i]);
+        }
+
+        // Populate first half of a full chunk [0, kChunkRows / 2), then probe all kChunkRows via
+        // build_hash_map_with_selection where rows [kChunkRows / 2, kChunkRows) miss.
+        SerializedKeyFixedSize8AggHashMap<PhmapSeed1> probe_map(kChunkRows, &statis);
+        probe_map.has_null_column = false;
+        probe_map.fixed_byte_size = 8;
+        Columns build_half = make_cols8(kChunkRows / 2, 1000);
+        probe_map.build_hash_map(
+                kChunkRows / 2, build_half, &pool, [&](const auto&) { return pool.allocate(8); }, &agg_states);
+        ASSERT_EQ(static_cast<size_t>(kChunkRows / 2), probe_map.hash_map.size());
+
+        Columns probe_all = make_cols8(kChunkRows, 1000);
+        Filter not_founds;
+        probe_map.build_hash_map_with_selection(
+                kChunkRows, probe_all, &pool,
+                [&](const auto&) -> AggDataPtr {
+                    ADD_FAILURE() << "allocate_func should not be called in build_hash_map_with_selection";
+                    return nullptr;
+                },
+                &agg_states, &not_founds);
+        for (int i = 0; i < kChunkRows / 2; ++i) {
+            EXPECT_EQ(0, not_founds[i]) << "row " << i;
+            EXPECT_NE(nullptr, agg_states[i]) << "row " << i;
+        }
+        for (int i = kChunkRows / 2; i < kChunkRows; ++i) {
+            EXPECT_EQ(1, not_founds[i]) << "row " << i;
+            EXPECT_EQ(nullptr, agg_states[i]) << "row " << i;
+        }
     }
 }
 
