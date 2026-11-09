@@ -153,8 +153,12 @@ public:
 
     virtual bool supports_read_by_rowids() const { return false; }
 
+    virtual void set_offset_only(bool v) { _offset_only = v; }
+    bool is_offset_only() const { return _offset_only; }
+
 protected:
     std::shared_ptr<PageHandle> _page_handle;
+    bool _offset_only = false;
 };
 
 } // namespace starrocks

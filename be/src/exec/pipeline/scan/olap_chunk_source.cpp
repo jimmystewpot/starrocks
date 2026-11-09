@@ -407,6 +407,67 @@ Status OlapChunkSource::_init_reader_params(const std::vector<std::unique_ptr<Ol
         RETURN_IF_ERROR(not_pushdown_predicate_rewriter.rewrite_predicate(&_obj_pool, _non_pushdown_pred_tree));
     }
 
+    const bool reader_supports_offset_only = tablet_reader_supports_offset_only(
+            _tablet->keys_type(), _params.skip_aggregation, _params.sorted_by_keys_per_tablet);
+    if (reader_supports_offset_only) {
+        for (auto* expr : _scan_node->get_heavy_expr_ctxs()) {
+            if (expr != nullptr && expr->root() != nullptr) {
+                expr->root()->for_each_slot_id([&conjuncts_slot_ids](SlotId id) { conjuncts_slot_ids.insert(id); });
+            }
+        }
+        auto collect_rf_slots = [&conjuncts_slot_ids](const RuntimeFilterProbeCollector* collector) {
+            if (collector == nullptr) {
+                return;
+            }
+            for (const auto& [rf_id, rf_desc] : collector->descriptors()) {
+                if (rf_desc == nullptr) {
+                    continue;
+                }
+                if (rf_desc->probe_expr_ctx() != nullptr && rf_desc->probe_expr_ctx()->root() != nullptr) {
+                    rf_desc->probe_expr_ctx()->root()->for_each_slot_id(
+                            [&conjuncts_slot_ids](SlotId id) { conjuncts_slot_ids.insert(id); });
+                }
+                if (rf_desc->partition_by_expr_contexts() != nullptr) {
+                    for (auto* part_ctx : *rf_desc->partition_by_expr_contexts()) {
+                        if (part_ctx != nullptr && part_ctx->root() != nullptr) {
+                            part_ctx->root()->for_each_slot_id(
+                                    [&conjuncts_slot_ids](SlotId id) { conjuncts_slot_ids.insert(id); });
+                        }
+                    }
+                }
+            }
+        };
+        collect_rf_slots(&_scan_node->runtime_filter_collector());
+        if (_scan_op != nullptr && _scan_op->get_factory() != nullptr) {
+            collect_rf_slots(_scan_op->get_factory()->get_runtime_bloom_filters());
+        }
+        const auto& offset_only_slots = _scan_node->offset_only_slots();
+        const auto& non_pushdown_cids = _non_pushdown_pred_tree.column_ids();
+        for (auto* slot : *_slots) {
+            if (!slot->is_materialized() || slot->type().type != TYPE_VARCHAR) {
+                continue;
+            }
+            if (conjuncts_slot_ids.contains(slot->id())) {
+                continue;
+            }
+            int32_t fid = _tablet_schema->field_index(slot->col_name());
+            if (fid < 0) {
+                continue;
+            }
+            const auto cid = static_cast<uint32_t>(fid);
+            if (non_pushdown_cids.contains(cid)) {
+                continue;
+            }
+            if (_params.global_dictmaps != nullptr && _params.global_dictmaps->contains(cid)) {
+                continue;
+            }
+            if (offset_only_slots.contains(slot->id()) || _unused_output_column_ids.contains(cid)) {
+                _offset_only_column_ids.insert(cid);
+            }
+        }
+    }
+    _params.offset_only_column_ids = &_offset_only_column_ids;
+
     // A predicate evaluated above the segment iterator means the iterator cannot fold it into the ANN
     // candidate. Preserve that fact so the vector filter resolver can apply the configured underfill
     // fallback policy. Two sources: (1) this scan's own non-pushdown conjuncts; (2) a row-filtering

@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <utility>
 
+#include "column/binary_column.h"
 #include "column/chunk.h"
 #include "column/column_helper.h"
 #include "column/json_column.h"
@@ -57,6 +58,12 @@ bool check_json_schema_compatibility(const Chunk* one, const Chunk* two) {
             // never hit
             DCHECK_EQ(a1->is_json(), a2->is_json());
             return false;
+        } else if (a1->is_binary() && a2->is_binary()) {
+            const auto* bin1 = down_cast<const BinaryColumn*>(a1);
+            const auto* bin2 = down_cast<const BinaryColumn*>(a2);
+            if (bin1->is_offset_only() != bin2->is_offset_only()) {
+                return false;
+            }
         }
     }
 
@@ -77,6 +84,7 @@ Status ChunkAccumulator::push(ChunkPtr&& chunk) {
                 // Schema mismatch, output current chunk and create a new one
                 _output.emplace_back(std::move(_tmp_chunk));
                 _tmp_chunk = chunk->clone_empty(_desired_size);
+                need_rows = std::min(_desired_size, remain_rows);
                 TRY_CATCH_BAD_ALLOC(_tmp_chunk->append(*chunk, start, need_rows));
             } else {
                 TRY_CATCH_BAD_ALLOC(_tmp_chunk->append(*chunk, start, need_rows));

@@ -158,6 +158,13 @@ public:
     void reserve_col(size_t n, Column* column) override;
     bool supports_read_by_rowids() const override { return true; }
 
+    void set_offset_only(bool v) override {
+        PageDecoder::set_offset_only(v);
+        if (_data_page_decoder != nullptr && _encoding_type == PLAIN_ENCODING) {
+            _data_page_decoder->set_offset_only(v);
+        }
+    }
+
 private:
     Slice _data;
     std::unique_ptr<PageDecoder> _data_page_decoder;

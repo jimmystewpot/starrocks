@@ -45,6 +45,7 @@
 #include "column/chunk_factory.h"
 #include "column/datum_tuple.h"
 #include "common/config_exec_fwd.h"
+#include "common/config_rowset_fwd.h"
 #include "common/logging.h"
 #include "fs/fs_memory.h"
 #include "gutil/strings/substitute.h"
@@ -60,6 +61,7 @@
 #include "storage/tablet_schema.h"
 #include "storage/tablet_schema_helper.h"
 #include "storage_primitive/chunk_iterator.h"
+#include "storage_primitive/column_predicate.h"
 
 namespace starrocks {
 
@@ -770,6 +772,602 @@ TEST_F(SegmentReaderWriterTest, TestCheckColumnUniqueIdUniqueness) {
             << "Expected InternalError, got: " << st.code() << ", message: " << st.message();
     EXPECT_EQ(st.message(), "Duplicate column id found in tablet schema")
             << "Error message should indicate duplicate column id in tablet schema.";
+}
+
+TEST_F(SegmentReaderWriterTest, TestOffsetOnlyVarcharScan) {
+    constexpr size_t kNumRows = 2048;
+
+    TabletSchemaPB pb;
+    pb.set_keys_type(DUP_KEYS);
+    pb.set_num_short_key_columns(1);
+    auto* c0 = pb.add_column();
+    c0->set_unique_id(1);
+    c0->set_name("counter_id");
+    c0->set_type("INT");
+    c0->set_is_key(true);
+    c0->set_is_nullable(false);
+    c0->set_length(4);
+    c0->set_index_length(4);
+    c0->set_aggregation("NONE");
+
+    auto* c1 = pb.add_column();
+    c1->set_unique_id(2);
+    c1->set_name("url");
+    c1->set_type("VARCHAR");
+    c1->set_is_key(false);
+    c1->set_is_nullable(false);
+    c1->set_length(65535);
+    c1->set_aggregation("NONE");
+
+    auto tablet_schema = TabletSchema::create(pb);
+    auto schema = ChunkHelper::convert_schema(tablet_schema);
+
+    static int seg_id = 0;
+    std::string filename = strings::Substitute("$0/offset_only_$1.dat", kSegmentDir, seg_id++);
+    ASSIGN_OR_ABORT(auto wfile, _fs->new_writable_file(filename));
+    SegmentWriterOptions writer_opts;
+    SegmentWriter writer(std::move(wfile), 0, tablet_schema, writer_opts);
+    ASSERT_OK(writer.init());
+
+    std::vector<std::string> urls(kNumRows);
+    std::vector<int32_t> expected_counters;
+    std::vector<uint32_t> expected_lengths;
+    auto write_chunk = ChunkFactory::new_chunk(schema, kNumRows);
+    for (size_t rid = 0; rid < kNumRows; ++rid) {
+        int32_t counter_id = static_cast<int32_t>(rid);
+        if (rid % 10 == 0) {
+            urls[rid] = "";
+        } else {
+            urls[rid] = "https://starrocks.io/clickbench/q27/row_" + std::to_string(rid) + "_" +
+                        std::string(16 + (rid % 48), 'u');
+            expected_counters.push_back(counter_id);
+            expected_lengths.push_back(static_cast<uint32_t>(urls[rid].size()));
+        }
+        auto cols = write_chunk->columns();
+        cols[0]->as_mutable_ptr()->append_datum(Datum(counter_id));
+        cols[1]->as_mutable_ptr()->append_datum(Datum(Slice(urls[rid])));
+    }
+    ASSERT_OK(writer.append_chunk(*write_chunk));
+    uint64_t file_size = 0, index_size = 0, footer_position = 0;
+    ASSERT_OK(writer.finalize(&file_size, &index_size, &footer_position));
+
+    ASSIGN_OR_ABORT(auto segment, Segment::open(_fs, FileInfo{filename}, 0, tablet_schema));
+    ASSERT_EQ(kNumRows, segment->num_rows());
+
+    // Case 1: URL is projected as an offset-only column (e.g. SELECT CounterID, AVG(length(URL)) WHERE URL <> '')
+    {
+        std::unique_ptr<ColumnPredicate> ne_empty_pred(new_column_ne_predicate(get_type_info(TYPE_VARCHAR), 1, ""));
+        PredicateAndNode root;
+        root.add_child(PredicateColumnNode{ne_empty_pred.get()});
+
+        SegmentReadOptions seg_options;
+        seg_options.fs = _fs;
+        OlapReaderStatistics stats;
+        seg_options.stats = &stats;
+        seg_options.pred_tree_for_zone_map = PredicateTree::create(std::move(root));
+        PredicateAndNode eval_root;
+        eval_root.add_child(PredicateColumnNode{ne_empty_pred.get()});
+        seg_options.pred_tree = PredicateTree::create(std::move(eval_root));
+
+        std::unordered_set<uint32_t> offset_only_cids = {1};
+        seg_options.offset_only_column_ids = &offset_only_cids;
+
+        ASSIGN_OR_ABORT(auto seg_iter, segment->new_iterator(schema, seg_options));
+        auto read_chunk = ChunkFactory::new_chunk(schema, 512);
+
+        std::vector<int32_t> actual_counters;
+        std::vector<uint32_t> actual_lengths;
+        while (true) {
+            read_chunk->reset();
+            Status st = seg_iter->get_next(read_chunk.get());
+            if (st.is_end_of_file()) {
+                break;
+            }
+            ASSERT_OK(st);
+            auto* counter_col = down_cast<const Int32Column*>(read_chunk->get_column_by_index(0).get());
+            auto* url_col = ColumnHelper::get_binary_column(read_chunk->get_column_raw_ptr_by_index(1));
+            ASSERT_TRUE(url_col->is_offset_only());
+            ASSERT_EQ(0u, url_col->get_immutable_bytes().size());
+
+            const auto& offsets = url_col->get_offset();
+            for (size_t i = 0; i < read_chunk->num_rows(); ++i) {
+                actual_counters.push_back(counter_col->get_data()[i]);
+                actual_lengths.push_back(offsets[i + 1] - offsets[i]);
+            }
+        }
+        seg_iter->close();
+
+        ASSERT_EQ(expected_counters, actual_counters);
+        ASSERT_EQ(expected_lengths, actual_lengths);
+    }
+
+    // Case 2: URL is in unused_output_column_ids (e.g. SELECT CounterID, COUNT(*) WHERE URL <> '')
+    {
+        std::unique_ptr<ColumnPredicate> ne_empty_pred(new_column_ne_predicate(get_type_info(TYPE_VARCHAR), 1, ""));
+        PredicateAndNode eval_root;
+        eval_root.add_child(PredicateColumnNode{ne_empty_pred.get()});
+
+        SegmentReadOptions seg_options;
+        seg_options.fs = _fs;
+        OlapReaderStatistics stats;
+        seg_options.stats = &stats;
+        seg_options.pred_tree = PredicateTree::create(std::move(eval_root));
+
+        std::unordered_set<uint32_t> unused_cids = {1};
+        seg_options.unused_output_column_ids = &unused_cids;
+
+        ASSIGN_OR_ABORT(auto seg_iter, segment->new_iterator(schema, seg_options));
+        auto read_chunk = ChunkFactory::new_chunk(schema, 512);
+
+        std::vector<int32_t> actual_counters;
+        while (true) {
+            read_chunk->reset();
+            Status st = seg_iter->get_next(read_chunk.get());
+            if (st.is_end_of_file()) {
+                break;
+            }
+            ASSERT_OK(st);
+            auto* counter_col = down_cast<const Int32Column*>(read_chunk->get_column_by_index(0).get());
+            for (size_t i = 0; i < read_chunk->num_rows(); ++i) {
+                actual_counters.push_back(counter_col->get_data()[i]);
+            }
+        }
+        seg_iter->close();
+
+        ASSERT_EQ(expected_counters, actual_counters);
+    }
+}
+
+TEST_F(SegmentReaderWriterTest, TestOffsetOnlyRecycledChunkAcrossSegments) {
+    constexpr size_t kNumRows = 1200;
+
+    TabletSchemaPB pb;
+    pb.set_keys_type(DUP_KEYS);
+    pb.set_num_short_key_columns(1);
+    auto* c0 = pb.add_column();
+    c0->set_unique_id(1);
+    c0->set_name("counter_id");
+    c0->set_type("INT");
+    c0->set_is_key(true);
+    c0->set_is_nullable(false);
+    c0->set_length(4);
+    c0->set_index_length(4);
+    c0->set_aggregation("NONE");
+
+    auto* c1 = pb.add_column();
+    c1->set_unique_id(2);
+    c1->set_name("url");
+    c1->set_type("VARCHAR");
+    c1->set_is_key(false);
+    c1->set_is_nullable(false);
+    c1->set_length(65535);
+    c1->set_aggregation("NONE");
+
+    auto tablet_schema = TabletSchema::create(pb);
+    auto schema = ChunkHelper::convert_schema(tablet_schema);
+
+    auto write_segment = [&](int seg_idx, std::vector<std::string>* urls_out) -> std::shared_ptr<Segment> {
+        static int seg_id = 0;
+        std::string filename = strings::Substitute("$0/offset_only_recycled_$1_$2.dat", kSegmentDir, seg_idx, seg_id++);
+        ASSIGN_OR_ABORT(auto wfile, _fs->new_writable_file(filename));
+        SegmentWriterOptions writer_opts;
+        SegmentWriter writer(std::move(wfile), seg_idx, tablet_schema, writer_opts);
+        CHECK_OK(writer.init());
+
+        urls_out->resize(kNumRows);
+        auto write_chunk = ChunkFactory::new_chunk(schema, kNumRows);
+        for (size_t rid = 0; rid < kNumRows; ++rid) {
+            int32_t counter_id = static_cast<int32_t>(rid);
+            (*urls_out)[rid] = "https://starrocks.io/seg_" + std::to_string(seg_idx) + "/row_" + std::to_string(rid) +
+                               "_" + std::string(16 + (rid % 32), 'x');
+            auto cols = write_chunk->columns();
+            cols[0]->as_mutable_ptr()->append_datum(Datum(counter_id));
+            cols[1]->as_mutable_ptr()->append_datum(Datum(Slice((*urls_out)[rid])));
+        }
+        CHECK_OK(writer.append_chunk(*write_chunk));
+        uint64_t file_size = 0, index_size = 0, footer_position = 0;
+        CHECK_OK(writer.finalize(&file_size, &index_size, &footer_position));
+        ASSIGN_OR_ABORT(auto segment, Segment::open(_fs, FileInfo{filename}, seg_idx, tablet_schema));
+        return segment;
+    };
+
+    std::vector<std::string> urls0;
+    std::vector<std::string> urls1;
+    auto seg0 = write_segment(0, &urls0);
+    auto seg1 = write_segment(1, &urls1);
+
+    SegmentReadOptions seg_options0;
+    seg_options0.fs = _fs;
+    OlapReaderStatistics stats0;
+    seg_options0.stats = &stats0;
+    seg_options0.chunk_size = 512;
+    std::unordered_set<uint32_t> offset_only_cids = {1};
+    seg_options0.offset_only_column_ids = &offset_only_cids;
+    ASSIGN_OR_ABORT(auto seg_iter0, seg0->new_iterator(schema, seg_options0));
+
+    SegmentReadOptions seg_options1;
+    seg_options1.fs = _fs;
+    OlapReaderStatistics stats1;
+    seg_options1.stats = &stats1;
+    seg_options1.chunk_size = 512;
+    seg_options1.offset_only_column_ids = nullptr;
+    ASSIGN_OR_ABORT(auto seg_iter1, seg1->new_iterator(schema, seg_options1));
+
+    auto read_chunk = ChunkFactory::new_chunk(schema, 512);
+
+    size_t rows_seg0 = 0;
+    while (true) {
+        read_chunk->reset();
+        Status st = seg_iter0->get_next(read_chunk.get());
+        if (st.is_end_of_file()) {
+            break;
+        }
+        ASSERT_OK(st);
+        auto* url_col = ColumnHelper::get_binary_column(read_chunk->get_column_raw_ptr_by_index(1));
+        ASSERT_TRUE(url_col->is_offset_only());
+        rows_seg0 += read_chunk->num_rows();
+    }
+    seg_iter0->close();
+    ASSERT_EQ(kNumRows, rows_seg0);
+
+    // At the end of seg_iter0, read_chunk holds a BinaryColumn with is_offset_only() == true.
+    ASSERT_TRUE(ColumnHelper::get_binary_column(read_chunk->get_column_raw_ptr_by_index(1))->is_offset_only());
+
+    size_t rows_seg1 = 0;
+    while (true) {
+        read_chunk->reset();
+        Status st = seg_iter1->get_next(read_chunk.get());
+        if (st.is_end_of_file()) {
+            break;
+        }
+        ASSERT_OK(st);
+        auto* url_col = ColumnHelper::get_binary_column(read_chunk->get_column_raw_ptr_by_index(1));
+        ASSERT_FALSE(url_col->is_offset_only());
+        for (size_t i = 0; i < read_chunk->num_rows(); ++i) {
+            ASSERT_EQ(urls1[rows_seg1 + i], url_col->get_slice(i).to_string());
+        }
+        rows_seg1 += read_chunk->num_rows();
+    }
+    seg_iter1->close();
+    ASSERT_EQ(kNumRows, rows_seg1);
+}
+
+TEST_F(SegmentReaderWriterTest, TestOffsetOnlyNullableDictAndFallbackScan) {
+    TabletSchemaPB pb;
+    pb.set_keys_type(DUP_KEYS);
+    pb.set_num_short_key_columns(1);
+    auto* c0 = pb.add_column();
+    c0->set_unique_id(1);
+    c0->set_name("counter_id");
+    c0->set_type("INT");
+    c0->set_is_key(true);
+    c0->set_is_nullable(false);
+    c0->set_length(4);
+    c0->set_index_length(4);
+    c0->set_aggregation("NONE");
+
+    auto* c1 = pb.add_column();
+    c1->set_unique_id(2);
+    c1->set_name("url");
+    c1->set_type("VARCHAR");
+    c1->set_is_key(false);
+    c1->set_is_nullable(true);
+    c1->set_length(65535);
+    c1->set_aggregation("NONE");
+
+    auto tablet_schema = TabletSchema::create(pb);
+    auto schema = ChunkHelper::convert_schema(tablet_schema);
+
+    auto compare_nullable_offset_only_vs_eager = [](const Column* offset_col, const Column* eager_col) {
+        offset_col->check_or_die();
+        eager_col->check_or_die();
+
+        const auto* offset_null = down_cast<const NullableColumn*>(offset_col);
+        const auto* eager_null = down_cast<const NullableColumn*>(eager_col);
+        ASSERT_EQ(eager_null->size(), offset_null->size());
+        ASSERT_EQ(eager_null->has_null(), offset_null->has_null());
+
+        const auto& offset_null_flags = offset_null->immutable_null_column_data();
+        const auto& eager_null_flags = eager_null->immutable_null_column_data();
+        ASSERT_EQ(eager_null_flags.size(), offset_null_flags.size());
+
+        const auto* offset_bin = down_cast<const BinaryColumn*>(offset_null->data_column().get());
+        const auto* eager_bin = down_cast<const BinaryColumn*>(eager_null->data_column().get());
+        ASSERT_TRUE(offset_bin->is_offset_only());
+        ASSERT_FALSE(eager_bin->is_offset_only());
+        ASSERT_EQ(0u, offset_bin->get_immutable_bytes().size());
+
+        const auto offset_offsets = offset_bin->get_offset();
+        const auto eager_offsets = eager_bin->get_offset();
+        ASSERT_EQ(offset_null->size() + 1, offset_offsets.size());
+
+        for (size_t i = 0; i < offset_null->size(); ++i) {
+            ASSERT_EQ(eager_null_flags[i], offset_null_flags[i]) << "null flag mismatch at row " << i;
+            if (offset_null_flags[i] == 0) {
+                uint32_t offset_len = offset_offsets[i + 1] - offset_offsets[i];
+                uint32_t eager_len = eager_offsets[i + 1] - eager_offsets[i];
+                ASSERT_EQ(eager_len, offset_len) << "non-null length mismatch at row " << i;
+                ASSERT_EQ(eager_bin->get_slice(i).size, offset_len) << "slice size mismatch at row " << i;
+            }
+        }
+    };
+
+    const auto orig_speculate_size = config::dictionary_speculate_min_chunk_size;
+    const auto orig_dict_page_size = config::dictionary_page_size;
+    DeferOp restore_configs([&]() {
+        config::dictionary_speculate_min_chunk_size = orig_speculate_size;
+        config::dictionary_page_size = orig_dict_page_size;
+    });
+
+    // 1. Build a pure dictionary-encoded nullable segment (all_page_dict_encoded() == true).
+    std::shared_ptr<Segment> dict_only_seg;
+    constexpr size_t kDictSegRows = 256;
+    {
+        config::dictionary_speculate_min_chunk_size = 64;
+        config::dictionary_page_size = 256 * 1024;
+
+        static int seg_id = 0;
+        std::string filename = strings::Substitute("$0/offset_only_nullable_dict_$1.dat", kSegmentDir, seg_id++);
+        ASSIGN_OR_ABORT(auto wfile, _fs->new_writable_file(filename));
+        SegmentWriterOptions writer_opts;
+        SegmentWriter writer(std::move(wfile), 0, tablet_schema, writer_opts);
+        ASSERT_OK(writer.init());
+
+        const std::vector<std::string> dict_pool = {
+                "https://starrocks.io/a",
+                "https://starrocks.io/beta_longer_path",
+                "x",
+                "https://starrocks.io/gamma/1234567890_abcdef",
+        };
+        auto chunk = ChunkFactory::new_chunk(schema, kDictSegRows);
+        for (size_t rid = 0; rid < kDictSegRows; ++rid) {
+            auto cols = chunk->columns();
+            cols[0]->as_mutable_ptr()->append_datum(Datum(static_cast<int32_t>(rid)));
+            if (rid % 7 == 0) {
+                cols[1]->as_mutable_ptr()->append_datum(Datum()); // NULL
+            } else if (rid % 5 == 0) {
+                cols[1]->as_mutable_ptr()->append_datum(Datum(Slice(""))); // empty
+            } else {
+                const std::string& val = dict_pool[rid % dict_pool.size()];
+                cols[1]->as_mutable_ptr()->append_datum(Datum(Slice(val)));
+            }
+        }
+        ASSERT_OK(writer.append_chunk(*chunk));
+        uint64_t file_size = 0, index_size = 0, footer_position = 0;
+        ASSERT_OK(writer.finalize(&file_size, &index_size, &footer_position));
+        ASSIGN_OR_ABORT(dict_only_seg, Segment::open(_fs, FileInfo{filename}, 0, tablet_schema));
+        ASSERT_EQ(kDictSegRows, dict_only_seg->num_rows());
+    }
+
+    // 2. Build a dictionary-to-plain fallback nullable segment (all_page_dict_encoded() == false).
+    // Chunk 0 (64 rows) has low cardinality so StringColumnWriter selects DICT_ENCODING, and its dictionary entries
+    // exceed the 64-byte dict_page_size so page 0 finishes and transitions BinaryDictPageBuilder to PLAIN_ENCODING.
+    // Chunk 1 (128 rows) is then encoded in PLAIN_ENCODING on page 1.
+    std::shared_ptr<Segment> fallback_seg;
+    constexpr size_t kFallbackChunk0Rows = 64;
+    constexpr size_t kFallbackChunk1Rows = 128;
+    constexpr size_t kFallbackSegRows = kFallbackChunk0Rows + kFallbackChunk1Rows;
+    {
+        config::dictionary_speculate_min_chunk_size = 64;
+        config::dictionary_page_size = 64;
+
+        static int seg_id = 0;
+        std::string filename = strings::Substitute("$0/offset_only_nullable_fallback_$1.dat", kSegmentDir, seg_id++);
+        ASSIGN_OR_ABORT(auto wfile, _fs->new_writable_file(filename));
+        SegmentWriterOptions writer_opts;
+        SegmentWriter writer(std::move(wfile), 1, tablet_schema, writer_opts);
+        ASSERT_OK(writer.init());
+
+        const std::vector<std::string> page0_dict_entries = {
+                "https://starrocks.io/dict_page0_entry_one_11111",
+                "https://starrocks.io/dict_page0_entry_two_22222",
+                "https://starrocks.io/dict_page0_entry_three_33333",
+        };
+        auto chunk0 = ChunkFactory::new_chunk(schema, kFallbackChunk0Rows);
+        for (size_t rid = 0; rid < kFallbackChunk0Rows; ++rid) {
+            auto cols = chunk0->columns();
+            cols[0]->as_mutable_ptr()->append_datum(Datum(static_cast<int32_t>(rid)));
+            if (rid % 6 == 0) {
+                cols[1]->as_mutable_ptr()->append_datum(Datum()); // NULL
+            } else if (rid % 5 == 0) {
+                cols[1]->as_mutable_ptr()->append_datum(Datum(Slice(""))); // empty
+            } else {
+                const std::string& val = page0_dict_entries[rid % page0_dict_entries.size()];
+                cols[1]->as_mutable_ptr()->append_datum(Datum(Slice(val)));
+            }
+        }
+        ASSERT_OK(writer.append_chunk(*chunk0));
+
+        std::vector<std::string> page1_strings(kFallbackChunk1Rows);
+        auto chunk1 = ChunkFactory::new_chunk(schema, kFallbackChunk1Rows);
+        for (size_t i = 0; i < kFallbackChunk1Rows; ++i) {
+            size_t rid = kFallbackChunk0Rows + i;
+            auto cols = chunk1->columns();
+            cols[0]->as_mutable_ptr()->append_datum(Datum(static_cast<int32_t>(rid)));
+            if (rid % 7 == 0) {
+                cols[1]->as_mutable_ptr()->append_datum(Datum()); // NULL
+            } else if (rid % 4 == 0) {
+                cols[1]->as_mutable_ptr()->append_datum(Datum(Slice(""))); // empty
+            } else {
+                page1_strings[i] = "https://starrocks.io/plain_fallback_row_" + std::to_string(rid) + "_" +
+                                   std::string(1 + (rid % 23), 'p');
+                cols[1]->as_mutable_ptr()->append_datum(Datum(Slice(page1_strings[i])));
+            }
+        }
+        ASSERT_OK(writer.append_chunk(*chunk1));
+
+        uint64_t file_size = 0, index_size = 0, footer_position = 0;
+        ASSERT_OK(writer.finalize(&file_size, &index_size, &footer_position));
+        ASSIGN_OR_ABORT(fallback_seg, Segment::open(_fs, FileInfo{filename}, 1, tablet_schema));
+        ASSERT_EQ(kFallbackSegRows, fallback_seg->num_rows());
+    }
+
+    auto verify_segment = [&](const std::shared_ptr<Segment>& seg, bool expect_all_dict_encoded) {
+        const size_t total_rows = seg->num_rows();
+
+        // Check ColumnIterator encoding state and exercise direct ColumnIterator SparseRange & row-ID reads.
+        {
+            ColumnIteratorOptions iter_opts;
+            OlapReaderStatistics stats;
+            iter_opts.stats = &stats;
+            iter_opts.check_dict_encoding = true;
+            ASSIGN_OR_ABORT(auto read_file, _fs->new_random_access_file(seg->file_name()));
+            iter_opts.read_file = read_file.get();
+
+            ASSIGN_OR_ABORT(auto eager_col_iter, seg->new_column_iterator(tablet_schema->column(1), nullptr));
+            ASSIGN_OR_ABORT(auto offset_col_iter, seg->new_column_iterator(tablet_schema->column(1), nullptr));
+            ASSERT_OK(eager_col_iter->init(iter_opts));
+            offset_col_iter->set_offset_only(true);
+            ASSERT_OK(offset_col_iter->init(iter_opts));
+
+            ASSERT_EQ(expect_all_dict_encoded, eager_col_iter->all_page_dict_encoded());
+            ASSERT_EQ(expect_all_dict_encoded, offset_col_iter->all_page_dict_encoded());
+
+            // Multi-range SparseRange<> with gaps crossing page boundaries.
+            SparseRange<> sparse_range;
+            sparse_range.add(Range<>(0, 19));
+            sparse_range.add(Range<>(27, 73));
+            sparse_range.add(Range<>(95, static_cast<rowid_t>(total_rows - 5)));
+
+            auto eager_sparse_col = ChunkFactory::column_from_field_type(TYPE_VARCHAR, true);
+            auto offset_sparse_col = ChunkFactory::column_from_field_type(TYPE_VARCHAR, true);
+            ASSERT_OK(eager_col_iter->seek_to_first());
+            ASSERT_OK(offset_col_iter->seek_to_first());
+            ASSERT_OK(eager_col_iter->next_batch(sparse_range, eager_sparse_col.get()));
+            ASSERT_OK(offset_col_iter->next_batch(sparse_range, offset_sparse_col.get()));
+            compare_nullable_offset_only_vs_eager(offset_sparse_col.get(), eager_sparse_col.get());
+
+            // Row-ID reads (fetch_values_by_rowid) spanning NULL, empty, and non-empty rows across pages.
+            std::vector<rowid_t> rowids;
+            for (rowid_t r = 0; r < static_cast<rowid_t>(total_rows); r += 3) {
+                rowids.push_back(r);
+            }
+            auto eager_rowid_col = ChunkFactory::column_from_field_type(TYPE_VARCHAR, true);
+            auto offset_rowid_col = ChunkFactory::column_from_field_type(TYPE_VARCHAR, true);
+            ASSERT_OK(eager_col_iter->fetch_values_by_rowid(rowids.data(), rowids.size(), eager_rowid_col.get()));
+            ASSERT_OK(offset_col_iter->fetch_values_by_rowid(rowids.data(), rowids.size(), offset_rowid_col.get()));
+            compare_nullable_offset_only_vs_eager(offset_rowid_col.get(), eager_rowid_col.get());
+        }
+
+        // Compare full segment scans (unfiltered and predicate-filtered) between offset-only and eager decoding.
+        std::vector<std::unique_ptr<ColumnPredicate>> preds;
+        preds.emplace_back(nullptr); // unfiltered
+        preds.emplace_back(new_column_ne_predicate(get_type_info(TYPE_VARCHAR), 1, ""));
+        preds.emplace_back(new_column_eq_predicate(get_type_info(TYPE_VARCHAR), 1, ""));
+        preds.emplace_back(new_column_null_predicate(get_type_info(TYPE_VARCHAR), 1, false));
+        preds.emplace_back(new_column_null_predicate(get_type_info(TYPE_VARCHAR), 1, true));
+        // Predicate on counter_id (col 0) to trigger late materialization of nullable url (col 1).
+        preds.emplace_back(new_column_ge_predicate(get_type_info(TYPE_INT), 0, "15"));
+
+        struct RowRecord {
+            int32_t counter_id;
+            uint8_t is_null;
+            uint32_t length;
+            bool operator==(const RowRecord& other) const {
+                return counter_id == other.counter_id && is_null == other.is_null && length == other.length;
+            }
+        };
+
+        auto run_scan = [&](const ColumnPredicate* pred, bool offset_only, bool url_unused,
+                            std::vector<RowRecord>* out_rows) {
+            SegmentReadOptions seg_options;
+            seg_options.fs = _fs;
+            OlapReaderStatistics stats;
+            seg_options.stats = &stats;
+            seg_options.chunk_size = 37; // Force multiple chunks straddling page boundaries.
+
+            if (pred != nullptr) {
+                PredicateAndNode zone_root;
+                zone_root.add_child(PredicateColumnNode{pred});
+                seg_options.pred_tree_for_zone_map = PredicateTree::create(std::move(zone_root));
+
+                PredicateAndNode eval_root;
+                eval_root.add_child(PredicateColumnNode{pred});
+                seg_options.pred_tree = PredicateTree::create(std::move(eval_root));
+            }
+
+            std::unordered_set<uint32_t> offset_only_cids = {1};
+            if (offset_only) {
+                seg_options.offset_only_column_ids = &offset_only_cids;
+            }
+            std::unordered_set<uint32_t> unused_cids = {1};
+            if (url_unused) {
+                seg_options.unused_output_column_ids = &unused_cids;
+            }
+
+            ASSIGN_OR_ABORT(auto seg_iter, seg->new_iterator(schema, seg_options));
+            auto read_chunk = ChunkFactory::new_chunk(schema, 37);
+
+            while (true) {
+                read_chunk->reset();
+                Status st = seg_iter->get_next(read_chunk.get());
+                if (st.is_end_of_file()) {
+                    break;
+                }
+                ASSERT_OK(st);
+                read_chunk->check_or_die();
+
+                const auto* counter_col = down_cast<const Int32Column*>(read_chunk->get_column_by_index(0).get());
+                if (url_unused) {
+                    for (size_t i = 0; i < read_chunk->num_rows(); ++i) {
+                        out_rows->push_back(RowRecord{counter_col->get_data()[i], 0, 0});
+                    }
+                    continue;
+                }
+
+                const auto* url_nullable = down_cast<const NullableColumn*>(read_chunk->get_column_by_index(1).get());
+                const auto* url_bin = down_cast<const BinaryColumn*>(url_nullable->data_column().get());
+                const auto& null_flags = url_nullable->immutable_null_column_data();
+                const auto offsets = url_bin->get_offset();
+
+                if (offset_only) {
+                    ASSERT_TRUE(url_bin->is_offset_only());
+                    ASSERT_EQ(0u, url_bin->get_immutable_bytes().size());
+                } else {
+                    ASSERT_FALSE(url_bin->is_offset_only());
+                }
+
+                for (size_t i = 0; i < read_chunk->num_rows(); ++i) {
+                    uint8_t is_null = null_flags[i];
+                    uint32_t len = 0;
+                    if (is_null == 0) {
+                        len = offsets[i + 1] - offsets[i];
+                        if (!offset_only) {
+                            ASSERT_EQ(url_bin->get_slice(i).size, len);
+                        }
+                    }
+                    out_rows->push_back(RowRecord{counter_col->get_data()[i], is_null, len});
+                }
+            }
+            seg_iter->close();
+        };
+
+        for (const auto& pred_ptr : preds) {
+            std::vector<RowRecord> eager_rows;
+            std::vector<RowRecord> offset_rows;
+            run_scan(pred_ptr.get(), false, false, &eager_rows);
+            run_scan(pred_ptr.get(), true, false, &offset_rows);
+            ASSERT_FALSE(eager_rows.empty());
+            ASSERT_EQ(eager_rows.size(), offset_rows.size());
+            for (size_t i = 0; i < eager_rows.size(); ++i) {
+                ASSERT_EQ(eager_rows[i].counter_id, offset_rows[i].counter_id) << "row " << i;
+                ASSERT_EQ(eager_rows[i].is_null, offset_rows[i].is_null) << "row " << i;
+                ASSERT_EQ(eager_rows[i].length, offset_rows[i].length) << "row " << i;
+            }
+
+            if (pred_ptr != nullptr && pred_ptr->column_id() == 1) {
+                std::vector<RowRecord> unused_rows;
+                run_scan(pred_ptr.get(), false, true, &unused_rows);
+                ASSERT_EQ(eager_rows.size(), unused_rows.size());
+                for (size_t i = 0; i < eager_rows.size(); ++i) {
+                    ASSERT_EQ(eager_rows[i].counter_id, unused_rows[i].counter_id) << "row " << i;
+                }
+            }
+        }
+    };
+
+    verify_segment(dict_only_seg, true);
+    verify_segment(fallback_seg, false);
 }
 
 } // namespace starrocks

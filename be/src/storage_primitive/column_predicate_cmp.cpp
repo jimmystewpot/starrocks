@@ -722,6 +722,73 @@ public:
     BinaryColumnEqPredicate(const TypeInfoPtr& type_info, ColumnId id, ValueType value)
             : Base(PredicateType::kEQ, type_info, id, value) {}
 
+    template <typename Op>
+    void t_evaluate_empty(const Column* column, uint8_t* selection, uint16_t from, uint16_t to) const {
+        if (!Base::_zero_padded_str.empty()) {
+            Base::template t_evaluate<Op>(column, selection, from, to);
+            return;
+        }
+        const BinaryColumn* binary_column = ColumnHelper::get_binary_column(column);
+        auto* sel = selection;
+        binary_column->get_offset().visit_storage([&](const auto& offsets) {
+            const auto* offset_data = offsets.data();
+            if (!column->has_null()) {
+                for (size_t i = from; i < to; i++) {
+                    sel[i] = Op::apply(sel[i], static_cast<uint8_t>(offset_data[i + 1] == offset_data[i]));
+                }
+            } else {
+                const uint8_t* is_null = down_cast<const NullableColumn*>(column)->immutable_null_column_data().data();
+                for (size_t i = from; i < to; i++) {
+                    sel[i] = Op::apply(sel[i],
+                                       static_cast<uint8_t>((!is_null[i]) & (offset_data[i + 1] == offset_data[i])));
+                }
+            }
+        });
+    }
+
+    Status evaluate(const Column* column, uint8_t* selection, uint16_t from, uint16_t to) const override {
+        t_evaluate_empty<ColumnPredicateAssignOp>(column, selection, from, to);
+        return Status::OK();
+    }
+
+    Status evaluate_and(const Column* column, uint8_t* selection, uint16_t from, uint16_t to) const override {
+        t_evaluate_empty<ColumnPredicateAndOp>(column, selection, from, to);
+        return Status::OK();
+    }
+
+    Status evaluate_or(const Column* column, uint8_t* selection, uint16_t from, uint16_t to) const override {
+        t_evaluate_empty<ColumnPredicateOrOp>(column, selection, from, to);
+        return Status::OK();
+    }
+
+    StatusOr<uint16_t> evaluate_branchless(const Column* column, uint16_t* sel, uint16_t sel_size) const override {
+        if (!Base::_zero_padded_str.empty()) {
+            return Base::evaluate_branchless(column, sel, sel_size);
+        }
+        const BinaryColumn* binary_column = ColumnHelper::get_binary_column(column);
+        return binary_column->get_offset().visit_storage([&](const auto& offsets) -> StatusOr<uint16_t> {
+            const auto* offset_data = offsets.data();
+            uint16_t new_size = 0;
+            if (!column->has_null()) {
+                for (uint16_t i = 0; i < sel_size; ++i) {
+                    uint16_t data_idx = sel[i];
+                    auto len = offset_data[data_idx + 1] - offset_data[data_idx];
+                    sel[new_size] = data_idx;
+                    new_size += (len == 0);
+                }
+            } else {
+                const uint8_t* is_null = down_cast<const NullableColumn*>(column)->immutable_null_column_data().data();
+                for (uint16_t i = 0; i < sel_size; ++i) {
+                    uint16_t data_idx = sel[i];
+                    auto len = offset_data[data_idx + 1] - offset_data[data_idx];
+                    sel[new_size] = data_idx;
+                    new_size += (!is_null[data_idx]) & (len == 0);
+                }
+            }
+            return new_size;
+        });
+    }
+
     bool zone_map_filter(const ZoneMapDetail& detail) const override {
         const auto& min = detail.min_or_null_value();
         const auto& max = detail.max_value();
@@ -969,6 +1036,45 @@ public:
     BinaryColumnNePredicate(const TypeInfoPtr& type_info, ColumnId id, ValueType value)
             : Base(PredicateType::kNE, type_info, id, value), _is_empty_string(value.empty()) {}
 
+    template <typename Op>
+    void t_evaluate_empty(const Column* column, uint8_t* selection, uint16_t from, uint16_t to) const {
+        if (!_is_empty_string || !Base::_zero_padded_str.empty()) {
+            Base::template t_evaluate<Op>(column, selection, from, to);
+            return;
+        }
+        const BinaryColumn* binary_column = ColumnHelper::get_binary_column(column);
+        auto* sel = selection;
+        binary_column->get_offset().visit_storage([&](const auto& offsets) {
+            const auto* offset_data = offsets.data();
+            if (!column->has_null()) {
+                for (size_t i = from; i < to; i++) {
+                    sel[i] = Op::apply(sel[i], static_cast<uint8_t>(offset_data[i + 1] != offset_data[i]));
+                }
+            } else {
+                const uint8_t* is_null = down_cast<const NullableColumn*>(column)->immutable_null_column_data().data();
+                for (size_t i = from; i < to; i++) {
+                    sel[i] = Op::apply(sel[i],
+                                       static_cast<uint8_t>((!is_null[i]) & (offset_data[i + 1] != offset_data[i])));
+                }
+            }
+        });
+    }
+
+    Status evaluate(const Column* column, uint8_t* selection, uint16_t from, uint16_t to) const override {
+        t_evaluate_empty<ColumnPredicateAssignOp>(column, selection, from, to);
+        return Status::OK();
+    }
+
+    Status evaluate_and(const Column* column, uint8_t* selection, uint16_t from, uint16_t to) const override {
+        t_evaluate_empty<ColumnPredicateAndOp>(column, selection, from, to);
+        return Status::OK();
+    }
+
+    Status evaluate_or(const Column* column, uint8_t* selection, uint16_t from, uint16_t to) const override {
+        t_evaluate_empty<ColumnPredicateOrOp>(column, selection, from, to);
+        return Status::OK();
+    }
+
     bool zone_map_filter(const ZoneMapDetail& detail) const override { return true; }
 
     bool support_bitmap_filter() const override { return false; }
@@ -993,7 +1099,7 @@ public:
 
     // Optimized evaluate_branchless for empty string comparison
     StatusOr<uint16_t> evaluate_branchless(const Column* column, uint16_t* sel, uint16_t sel_size) const override {
-        if (!_is_empty_string) {
+        if (!_is_empty_string || !Base::_zero_padded_str.empty()) {
             // For non-empty string, use base class implementation
             return Base::evaluate_branchless(column, sel, sel_size);
         }

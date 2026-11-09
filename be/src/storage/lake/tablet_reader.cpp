@@ -850,6 +850,10 @@ Status TabletReader::init_rowset_read_options(const TabletReaderParams& params, 
     options->tablet_schema = _tablet_schema;
     options->global_dictmaps = params.global_dictmaps;
     options->unused_output_column_ids = params.unused_output_column_ids;
+    options->offset_only_column_ids =
+            tablet_reader_supports_offset_only(keys_type, params.skip_aggregation, params.sorted_by_keys_per_tablet)
+                    ? params.offset_only_column_ids
+                    : nullptr;
     options->runtime_range_pruner = params.runtime_range_pruner;
     options->lake_io_opts = params.lake_io_opts;
     options->enable_join_runtime_filter_pushdown = params.enable_join_runtime_filter_pushdown;

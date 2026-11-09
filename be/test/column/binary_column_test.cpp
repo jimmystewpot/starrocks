@@ -19,6 +19,7 @@
 #include <algorithm>
 
 #include "base/testutil/parallel_test.h"
+#include "column/append_with_mask.h"
 #include "column/column_helper.h"
 #include "column/const_column.h"
 #include "column/nullable_column.h"
@@ -991,6 +992,172 @@ PARALLEL_TEST(BinaryColumnCompactKeyTest, test_legacy_serialize_still_uses_four_
     auto dst = BinaryColumn::create();
     ASSERT_EQ(buf + written, dst->deserialize_and_append(buf));
     ASSERT_EQ(Slice("hello"), dst->get_slice(0));
+}
+
+// NOLINTNEXTLINE
+PARALLEL_TEST(BinaryColumnTest, test_offset_only_invariants_and_safety) {
+    auto col = BinaryColumn::create();
+    col->set_offset_only(true);
+    ASSERT_TRUE(col->is_offset_only());
+
+    col->reserve(16, 1024);
+    ASSERT_EQ(0u, col->get_immutable_bytes().size());
+
+    col->append(Slice("https://starrocks.io/docs/clickbench"));
+    col->append_string("");
+    col->append_string("short");
+    std::vector<Slice> batch = {Slice("alpha"), Slice(""), Slice("beta_gamma")};
+    ASSERT_TRUE(col->append_strings(batch.data(), batch.size()));
+    col->append_default(2);
+
+    ASSERT_EQ(8u, col->size());
+    ASSERT_EQ(0u, col->get_immutable_bytes().size());
+    col->check_or_die();
+
+    const auto& offsets = col->get_offset();
+    const std::vector<uint32_t> expected_lengths = {36, 0, 5, 5, 0, 10, 0, 0};
+    for (size_t i = 0; i < expected_lengths.size(); ++i) {
+        ASSERT_EQ(expected_lengths[i], offsets[i + 1] - offsets[i]) << "i=" << i;
+    }
+
+    // Accessing slice or byte payload on an offset-only column must throw a clear runtime_error.
+    EXPECT_THROW(col->get_slice(0), std::runtime_error);
+    EXPECT_THROW(col->get_bytes(), std::runtime_error);
+    BinaryColumn::Container slices;
+    EXPECT_THROW(col->build_slices(slices), std::runtime_error);
+    EXPECT_THROW(col->get_german_strings(), std::runtime_error);
+
+    // Clone and clone_empty preserve offset-only mode and lengths without allocating bytes.
+    auto empty_clone = BinaryColumn::static_pointer_cast(col->clone_empty());
+    ASSERT_TRUE(empty_clone->is_offset_only());
+    ASSERT_EQ(0u, empty_clone->size());
+
+    auto full_clone = BinaryColumn::static_pointer_cast(col->clone());
+    ASSERT_TRUE(full_clone->is_offset_only());
+    ASSERT_EQ(col->size(), full_clone->size());
+    ASSERT_EQ(0u, full_clone->get_immutable_bytes().size());
+    full_clone->check_or_die();
+    for (size_t i = 0; i < expected_lengths.size(); ++i) {
+        ASSERT_EQ(expected_lengths[i], full_clone->get_offset()[i + 1] - full_clone->get_offset()[i]);
+    }
+
+    // remove_first_n_values and resize on offset-only column.
+    full_clone->remove_first_n_values(2);
+    ASSERT_EQ(6u, full_clone->size());
+    ASSERT_EQ(0u, full_clone->get_offset()[0]);
+    ASSERT_EQ(5u, full_clone->get_offset()[1] - full_clone->get_offset()[0]);
+    full_clone->resize(3);
+    ASSERT_EQ(3u, full_clone->size());
+    ASSERT_EQ(0u, full_clone->get_immutable_bytes().size());
+    full_clone->check_or_die();
+
+    // assign on offset-only column.
+    full_clone->assign(5, 0);
+    ASSERT_EQ(5u, full_clone->size());
+    for (size_t i = 0; i < 5; ++i) {
+        ASSERT_EQ(5u, full_clone->get_offset()[i + 1] - full_clone->get_offset()[i]);
+    }
+    full_clone->check_or_die();
+}
+
+// NOLINTNEXTLINE
+PARALLEL_TEST(BinaryColumnTest, test_offset_only_append_selective_and_filter_range) {
+    constexpr size_t kNumRows = 257;
+    auto normal_src = BinaryColumn::create();
+    std::vector<uint32_t> lengths(kNumRows);
+    for (size_t i = 0; i < kNumRows; ++i) {
+        lengths[i] = (i % 7 == 0) ? 0 : static_cast<uint32_t>(1 + (i * 13) % 97);
+        normal_src->append_string(std::string(lengths[i], 'x'));
+    }
+
+    auto offset_col = BinaryColumn::create();
+    offset_col->set_offset_only(true);
+    offset_col->append(*normal_src, 0, kNumRows);
+    ASSERT_EQ(kNumRows, offset_col->size());
+    ASSERT_EQ(0u, offset_col->get_immutable_bytes().size());
+    offset_col->check_or_die();
+
+    // Test append_selective from offset-only column into another offset-only column.
+    std::vector<uint32_t> indexes = {0, 1, 7, 14, 63, 64, 128, 255, 256};
+    auto selective_dst = BinaryColumn::create();
+    selective_dst->set_offset_only(true);
+    selective_dst->append_selective(*offset_col, indexes.data(), 0, static_cast<uint32_t>(indexes.size()));
+    ASSERT_EQ(indexes.size(), selective_dst->size());
+    ASSERT_EQ(0u, selective_dst->get_immutable_bytes().size());
+    selective_dst->check_or_die();
+    for (size_t i = 0; i < indexes.size(); ++i) {
+        uint32_t actual_len = selective_dst->get_offset()[i + 1] - selective_dst->get_offset()[i];
+        ASSERT_EQ(lengths[indexes[i]], actual_len) << "i=" << i;
+    }
+
+    // Test filter_range across SIMD boundaries (non-empty strings only, like WHERE URL <> '').
+    Filter filter(kNumRows, 0);
+    std::vector<uint32_t> expected_filtered_lengths;
+    for (size_t i = 0; i < kNumRows; ++i) {
+        if (lengths[i] > 0) {
+            filter[i] = 1;
+            expected_filtered_lengths.push_back(lengths[i]);
+        }
+    }
+
+    auto mask_dst = BinaryColumn::create();
+    mask_dst->set_offset_only(true);
+    ASSERT_TRUE(append_with_mask<true>(mask_dst.get(), *offset_col, filter.data(), kNumRows).ok());
+    ASSERT_EQ(expected_filtered_lengths.size(), mask_dst->size());
+    ASSERT_EQ(0u, mask_dst->get_immutable_bytes().size());
+    mask_dst->check_or_die();
+    for (size_t i = 0; i < expected_filtered_lengths.size(); ++i) {
+        uint32_t actual_len = mask_dst->get_offset()[i + 1] - mask_dst->get_offset()[i];
+        ASSERT_EQ(expected_filtered_lengths[i], actual_len) << "i=" << i;
+    }
+
+    size_t new_size = offset_col->filter_range(filter, 0, kNumRows);
+    ASSERT_EQ(expected_filtered_lengths.size(), new_size);
+    ASSERT_EQ(expected_filtered_lengths.size(), offset_col->size());
+    ASSERT_EQ(0u, offset_col->get_immutable_bytes().size());
+    offset_col->check_or_die();
+    for (size_t i = 0; i < new_size; ++i) {
+        uint32_t actual_len = offset_col->get_offset()[i + 1] - offset_col->get_offset()[i];
+        ASSERT_EQ(expected_filtered_lengths[i], actual_len) << "i=" << i;
+    }
+}
+
+// NOLINTNEXTLINE
+PARALLEL_TEST(BinaryColumnTest, AppendWithMaskRejectsOffsetOnlyIntoNonEmptyMaterialized) {
+    auto src = BinaryColumn::create();
+    src->set_offset_only(true);
+    src->append_string("abc");
+    ASSERT_TRUE(src->is_offset_only());
+    ASSERT_EQ(1u, src->size());
+
+    const uint8_t mask[1] = {1};
+
+    // Appending an offset-only source into a non-empty materialized destination must fail
+    // without flipping the destination to offset-only (which would violate check_or_die()).
+    auto non_empty_dst = BinaryColumn::create();
+    non_empty_dst->append_string("hello");
+    ASSERT_FALSE(non_empty_dst->is_offset_only());
+
+    Status st = append_with_mask<true>(non_empty_dst.get(), *src, mask, 1);
+    ASSERT_FALSE(st.ok());
+    ASSERT_TRUE(st.is_internal_error());
+    ASSERT_FALSE(non_empty_dst->is_offset_only());
+    ASSERT_EQ(1u, non_empty_dst->size());
+    ASSERT_EQ(Slice("hello"), non_empty_dst->get_slice(0));
+    non_empty_dst->check_or_die();
+
+    // Appending an offset-only source into an empty materialized destination succeeds
+    // and transitions the destination to offset-only mode.
+    auto empty_dst = BinaryColumn::create();
+    ASSERT_FALSE(empty_dst->is_offset_only());
+    ASSERT_TRUE(empty_dst->empty());
+
+    Status ok_st = append_with_mask<true>(empty_dst.get(), *src, mask, 1);
+    ASSERT_TRUE(ok_st.ok());
+    ASSERT_TRUE(empty_dst->is_offset_only());
+    ASSERT_EQ(1u, empty_dst->size());
+    ASSERT_EQ(3u, empty_dst->get_offset()[1] - empty_dst->get_offset()[0]);
+    empty_dst->check_or_die();
 }
 
 } // namespace starrocks

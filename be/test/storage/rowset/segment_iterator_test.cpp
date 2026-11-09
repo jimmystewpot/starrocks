@@ -23,6 +23,7 @@
 #include <unordered_map>
 
 #include "base/testutil/assert.h"
+#include "base/time/time.h"
 #include "base/utility/defer_op.h"
 #include "column/chunk_factory.h"
 #include "column/column_helper.h"
@@ -2555,6 +2556,196 @@ TEST_F(SegmentIteratorTest, GroupedRowidChildrenPreserveSparseQueryAndOwnershipI
     EXPECT_EQ((std::vector<int64_t>{24}), read_rows());
     opts.rowid_range_option = std::make_shared<SparseRange<>>();
     EXPECT_TRUE(read_rows().empty());
+}
+
+#if defined(ADDRESS_SANITIZER)
+namespace {
+thread_local bool g_tls_count_allocs = false;
+thread_local int64_t g_tls_alloc_count = 0;
+thread_local int64_t g_tls_alloc_bytes = 0;
+
+struct ScopedThreadAllocCounter {
+    ScopedThreadAllocCounter() {
+        g_tls_alloc_count = 0;
+        g_tls_alloc_bytes = 0;
+        g_tls_count_allocs = true;
+    }
+    ~ScopedThreadAllocCounter() { g_tls_count_allocs = false; }
+    int64_t count() const { return g_tls_alloc_count; }
+    int64_t bytes() const { return g_tls_alloc_bytes; }
+};
+} // namespace
+
+extern "C" void __sanitizer_malloc_hook(const volatile void* ptr, size_t size) {
+    if (g_tls_count_allocs && ptr != nullptr) {
+        ++g_tls_alloc_count;
+        g_tls_alloc_bytes += static_cast<int64_t>(size);
+    }
+}
+#endif
+
+TEST_F(SegmentIteratorTest, OffsetOnlyResolutionZeroPerSegmentHeapAllocationsAcrossWideSegments) {
+    const auto saved_late_materialization_ratio = config::late_materialization_ratio;
+    config::late_materialization_ratio = 0;
+    DeferOp restore_late_mat([&]() { config::late_materialization_ratio = saved_late_materialization_ratio; });
+
+    test::TabletSchemaBuilder builder;
+    builder.create(0, false, TYPE_BIGINT, true);
+    for (int32_t cid = 1; cid <= 4; ++cid) {
+        builder.create(cid, true, TYPE_VARCHAR, false).set_length(256);
+    }
+    for (int32_t cid = 5; cid < 105; ++cid) {
+        builder.create(cid, false, TYPE_INT, false);
+    }
+    std::shared_ptr<TabletSchema> schema = builder.build();
+    ASSERT_EQ(105, schema->num_columns());
+    auto read_schema = ChunkHelper::convert_schema(schema);
+
+    constexpr int kNumSegments = 64;
+    constexpr int kRowsPerSegment = 32;
+    std::vector<std::shared_ptr<Segment>> segments;
+    segments.reserve(kNumSegments);
+    for (int seg_idx = 0; seg_idx < kNumSegments; ++seg_idx) {
+        auto chunk = ChunkFactory::new_chunk(read_schema, kRowsPerSegment);
+        for (int row = 0; row < kRowsPerSegment; ++row) {
+            chunk->get_column_by_index(0)->as_mutable_ptr()->append_datum(
+                    Datum(static_cast<int64_t>(seg_idx * kRowsPerSegment + row)));
+            const std::string c1_val =
+                    (row % 2 == 0) ? fmt::format("https://example.com/seg{}/row{}", seg_idx, row) : "";
+            const std::string c2_val = fmt::format("ref_{}_{}", seg_idx, row);
+            const std::string c3_val = fmt::format("title_{}_{}", seg_idx, row);
+            const std::string c4_val = fmt::format("ua_{}_{}", seg_idx, row);
+            chunk->get_column_by_index(1)->as_mutable_ptr()->append_datum(Datum(Slice(c1_val)));
+            chunk->get_column_by_index(2)->as_mutable_ptr()->append_datum(Datum(Slice(c2_val)));
+            chunk->get_column_by_index(3)->as_mutable_ptr()->append_datum(Datum(Slice(c3_val)));
+            chunk->get_column_by_index(4)->as_mutable_ptr()->append_datum(Datum(Slice(c4_val)));
+            chunk->get_column_by_index(5)->as_mutable_ptr()->append_datum(Datum(static_cast<int32_t>(row)));
+            for (int cid = 6; cid < 105; ++cid) {
+                chunk->get_column_by_index(cid)->as_mutable_ptr()->append_datum(Datum(static_cast<int32_t>(row + cid)));
+            }
+        }
+        std::string seg_path = fmt::format("{}/wide_offset_only_seg_{}.dat", kSegmentDir, seg_idx);
+        segments.push_back(test::write_and_open_segment(_fs, seg_path, schema, *chunk, kRowsPerSegment));
+    }
+
+    std::unordered_set<uint32_t> offset_only_cids = {1};
+    std::unordered_set<uint32_t> unused_cids = {1, 2};
+    std::unique_ptr<ColumnPredicate> c1_ne_empty(new_column_ne_predicate(get_type_info(TYPE_VARCHAR), 1, ""));
+    ObjectPool del_pool;
+    auto* del_conjunct = del_pool.add(new ConjunctivePredicates());
+    del_conjunct->add(del_pool.add(new_column_eq_predicate(get_type_info(TYPE_INT), 5, "999999")));
+
+    auto run_multi_segment_scan = [&](bool cache_file_only, bool with_offset_only, int64_t* out_alloc_count,
+                                      int64_t* out_alloc_bytes, int64_t* out_elapsed_ns) -> int64_t {
+        OlapReaderStatistics stats;
+        SegmentReadOptions opts;
+        opts.fs = _fs;
+        opts.stats = &stats;
+#ifdef USE_STAROS
+        opts.reader_type = cache_file_only ? READER_CHECKSUM : READER_QUERY;
+        opts.lake_io_opts.cache_file_only = false;
+#else
+        opts.reader_type = READER_QUERY;
+        opts.lake_io_opts.cache_file_only = cache_file_only;
+#endif
+        if (with_offset_only) {
+            opts.offset_only_column_ids = &offset_only_cids;
+            opts.unused_output_column_ids = &unused_cids;
+
+            PredicateAndNode zone_root;
+            zone_root.add_child(PredicateColumnNode{c1_ne_empty.get()});
+            opts.pred_tree_for_zone_map = PredicateTree::create(std::move(zone_root));
+
+            PredicateAndNode eval_root;
+            eval_root.add_child(PredicateColumnNode{c1_ne_empty.get()});
+            opts.pred_tree = PredicateTree::create(std::move(eval_root));
+
+            opts.delete_predicates.add(*del_conjunct);
+        }
+
+        // Untimed warmup pass over all segments so one-time per-segment index loading (OnceFlag) is warm.
+        {
+            auto warm_chunk = ChunkFactory::new_chunk(read_schema, kRowsPerSegment);
+            for (const auto& warm_seg : segments) {
+                ASSIGN_OR_ABORT(auto warm_iter, warm_seg->new_iterator(read_schema, opts));
+                while (true) {
+                    warm_chunk->reset();
+                    Status st = warm_iter->get_next(warm_chunk.get());
+                    if (st.is_end_of_file()) break;
+                    CHECK_OK(st);
+                }
+                warm_iter->close();
+            }
+        }
+
+        auto out_chunk = ChunkFactory::new_chunk(read_schema, kRowsPerSegment);
+        int64_t total_rows = 0;
+        const int64_t start_ns = MonotonicNanos();
+#if defined(ADDRESS_SANITIZER)
+        ScopedThreadAllocCounter alloc_counter;
+#endif
+        for (const auto& seg : segments) {
+            ASSIGN_OR_ABORT(auto iter, seg->new_iterator(read_schema, opts));
+            while (true) {
+                out_chunk->reset();
+                Status st = iter->get_next(out_chunk.get());
+                if (st.is_end_of_file()) break;
+                CHECK_OK(st);
+                total_rows += out_chunk->num_rows();
+            }
+            iter->close();
+        }
+#if defined(ADDRESS_SANITIZER)
+        *out_alloc_count = alloc_counter.count();
+        *out_alloc_bytes = alloc_counter.bytes();
+#else
+        *out_alloc_count = 0;
+        *out_alloc_bytes = 0;
+#endif
+        *out_elapsed_ns = MonotonicNanos() - start_ns;
+        return total_rows;
+    };
+
+    int64_t allocs_baseline_no_offset_only = 0;
+    int64_t bytes_baseline_no_offset_only = 0;
+    int64_t ns_baseline_no_offset_only = 0;
+    EXPECT_EQ(kNumSegments * kRowsPerSegment,
+              run_multi_segment_scan(true, false, &allocs_baseline_no_offset_only, &bytes_baseline_no_offset_only,
+                                     &ns_baseline_no_offset_only));
+
+    int64_t allocs_query_no_offset_only = 0;
+    int64_t bytes_query_no_offset_only = 0;
+    int64_t ns_query_no_offset_only = 0;
+    EXPECT_EQ(kNumSegments * kRowsPerSegment,
+              run_multi_segment_scan(false, false, &allocs_query_no_offset_only, &bytes_query_no_offset_only,
+                                     &ns_query_no_offset_only));
+
+    int64_t allocs_baseline_with_offset_only = 0;
+    int64_t bytes_baseline_with_offset_only = 0;
+    int64_t ns_baseline_with_offset_only = 0;
+    EXPECT_EQ(kNumSegments * (kRowsPerSegment / 2),
+              run_multi_segment_scan(true, true, &allocs_baseline_with_offset_only, &bytes_baseline_with_offset_only,
+                                     &ns_baseline_with_offset_only));
+
+    int64_t allocs_query_with_offset_only = 0;
+    int64_t bytes_query_with_offset_only = 0;
+    int64_t ns_query_with_offset_only = 0;
+    EXPECT_EQ(kNumSegments * (kRowsPerSegment / 2),
+              run_multi_segment_scan(false, true, &allocs_query_with_offset_only, &bytes_query_with_offset_only,
+                                     &ns_query_with_offset_only));
+
+#if defined(ADDRESS_SANITIZER)
+    EXPECT_LE(allocs_query_no_offset_only, allocs_baseline_no_offset_only)
+            << "Per-segment heap allocations in _collect_offset_only_columns (no offset-only): "
+            << (allocs_query_no_offset_only - allocs_baseline_no_offset_only) / kNumSegments << " allocs/segment ("
+            << (bytes_query_no_offset_only - bytes_baseline_no_offset_only) << " bytes total across " << kNumSegments
+            << " segments)";
+    EXPECT_LE(allocs_query_with_offset_only, allocs_baseline_with_offset_only)
+            << "Per-segment heap allocations in _collect_offset_only_columns (with offset-only): "
+            << (allocs_query_with_offset_only - allocs_baseline_with_offset_only) / kNumSegments << " allocs/segment ("
+            << (bytes_query_with_offset_only - bytes_baseline_with_offset_only) << " bytes total across "
+            << kNumSegments << " segments)";
+#endif
 }
 
 } // namespace starrocks

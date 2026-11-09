@@ -424,6 +424,9 @@ private:
                                           uint16_t to);
 
     void _init_column_predicates();
+    void _collect_offset_only_columns();
+    void _apply_offset_only_columns();
+    void _mark_offset_only_chunk_columns(Chunk* chunk) const;
 
     StatusOr<size_t> trigger_sample_if_necessary(vector<rowid_t>* rowid);
 
@@ -619,6 +622,7 @@ private:
     std::unique_ptr<InvertedIndexContext> _inverted_index_ctx;
 
     bool _enable_predicate_col_late_materialize;
+    bool _has_offset_only_columns = false;
 };
 
 // ScanContext method implementations
@@ -993,6 +997,7 @@ Status SegmentIterator::reset_for_reuse(const SegmentReadOptions& options) {
     _opts.enable_predicate_col_late_materialize = options.enable_predicate_col_late_materialize;
     _opts.global_dictmaps = options.global_dictmaps;
     _opts.unused_output_column_ids = options.unused_output_column_ids;
+    _opts.offset_only_column_ids = options.offset_only_column_ids;
     _opts.is_cancelled = options.is_cancelled;
     _opts.chunk_size = options.chunk_size;
     _chunk_size = options.chunk_size;
@@ -1091,6 +1096,9 @@ Status SegmentIterator::_init_scan_range_and_context() {
         }
     }
 
+    // Collect offset-only eligible VARCHAR columns before _rewrite_predicates() mutates _opts.pred_tree.
+    _collect_offset_only_columns();
+
     // rewrite stage
     // Rewriting predicates using segment dictionary codes. Runs before the vector stage so the
     // residual bitmap there evaluates the rewritten (dict-code) predicates and inherits the
@@ -1110,6 +1118,7 @@ Status SegmentIterator::_init_scan_range_and_context() {
         RETURN_IF_ERROR(_apply_data_sampling());
     }
     _init_column_predicates();
+    _apply_offset_only_columns();
     RETURN_IF_ERROR(_init_context());
 
     // Finalize: turn the filtered range into the form the read loop consumes. Not a function of its
@@ -1131,6 +1140,12 @@ Status SegmentIterator::_init_scan_range_and_context() {
 }
 
 Status SegmentIterator::_init_reused_scan() {
+    _has_offset_only_columns = false;
+    for (auto& iter : _column_iterators) {
+        if (iter != nullptr) {
+            iter->set_offset_only(false);
+        }
+    }
     _scan_range.clear();
     _range_iter = SparseRangeIterator<>();
     _non_expr_pred_tree = PredicateTree{};
@@ -2162,6 +2177,188 @@ void SegmentIterator::_init_column_predicates() {
     _runtime_filter_preds = _opts.runtime_filter_preds;
 }
 
+namespace {
+
+bool is_offset_only_compatible_predicate(const ColumnPredicate* pred) {
+    if (pred == nullptr || pred->is_index_filter_only()) {
+        return true;
+    }
+    if (pred->is_expr_predicate()) {
+        return false;
+    }
+    const PredicateType ptype = pred->type();
+    if (ptype == PredicateType::kIsNull || ptype == PredicateType::kNotNull) {
+        return true;
+    }
+    if ((ptype == PredicateType::kEQ || ptype == PredicateType::kNE) && !pred->value().is_null() &&
+        pred->value().get_slice().empty()) {
+        return true;
+    }
+    return false;
+}
+
+template <CompoundNodeType Type>
+bool are_column_predicates_offset_only_compatible(const PredicateCompoundNode<Type>& node, ColumnId cid) {
+    const auto& col_map = node.col_children_map();
+    if (auto it = col_map.find(cid); it != col_map.end()) {
+        for (const auto& child : it->second) {
+            if (!is_offset_only_compatible_predicate(child.col_pred())) {
+                return false;
+            }
+        }
+    }
+    for (const auto& child : node.compound_children()) {
+        if (!are_column_predicates_offset_only_compatible(child, cid)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+template <CompoundNodeType Type>
+bool predicate_node_contains_column(const PredicateCompoundNode<Type>& node, ColumnId cid) {
+    const auto& col_map = node.col_children_map();
+    if (auto it = col_map.find(cid); it != col_map.end() && !it->second.empty()) {
+        return true;
+    }
+    for (const auto& child : node.compound_children()) {
+        if (predicate_node_contains_column(child, cid)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+void SegmentIterator::_collect_offset_only_columns() {
+    _has_offset_only_columns = false;
+    for (auto& iter : _column_iterators) {
+        if (iter != nullptr) {
+            iter->set_offset_only(false);
+        }
+    }
+    if (_opts.reader_type != READER_QUERY || _opts.lake_io_opts.cache_file_only) {
+        return;
+    }
+    const bool has_offset_only_cids = _opts.offset_only_column_ids != nullptr && !_opts.offset_only_column_ids->empty();
+    const bool has_unused_cids = _opts.unused_output_column_ids != nullptr && !_opts.unused_output_column_ids->empty();
+    if (!has_offset_only_cids && !has_unused_cids && !_is_init_output_schema) {
+        return;
+    }
+
+    const auto& out_fields = output_schema().fields();
+    size_t out_idx = 0;
+    for (const FieldPtr& f : _schema.fields()) {
+        const ColumnId cid = f->id();
+        const bool in_output_schema = (out_idx < out_fields.size() && out_fields[out_idx]->id() == cid);
+        if (in_output_schema) {
+            ++out_idx;
+        }
+        if (f->type()->type() != TYPE_VARCHAR || f->is_virtual()) {
+            continue;
+        }
+        const bool is_unused_output =
+                !in_output_schema || (has_unused_cids && _opts.unused_output_column_ids->contains(cid));
+        const bool is_offset_only_output = has_offset_only_cids && _opts.offset_only_column_ids->contains(cid);
+        if (!is_unused_output && !is_offset_only_output) {
+            continue;
+        }
+        if (cid >= _column_iterators.size() || _column_iterators[cid] == nullptr) {
+            continue;
+        }
+        if (_opts.global_dictmaps != nullptr && _opts.global_dictmaps->contains(cid)) {
+            continue;
+        }
+        if (_column_access_paths.contains(cid) || _predicate_column_access_paths.contains(cid)) {
+            continue;
+        }
+        bool blocked = false;
+        if (_opts.enable_join_runtime_filter_pushdown) {
+            for (const auto* rf_pred : _opts.runtime_filter_preds.rf_predicates()) {
+                if (rf_pred->get_column_id() == cid) {
+                    blocked = true;
+                    break;
+                }
+            }
+        }
+        if (blocked) {
+            continue;
+        }
+        for (auto& conj : _opts.delete_predicates.predicate_list()) {
+            for (const ColumnPredicate* pred : conj.vec_preds()) {
+                if (pred->column_id() == cid) {
+                    blocked = true;
+                    break;
+                }
+            }
+            if (blocked) {
+                break;
+            }
+            for (const ColumnPredicate* pred : conj.non_vec_preds()) {
+                if (pred->column_id() == cid) {
+                    blocked = true;
+                    break;
+                }
+            }
+            if (blocked) {
+                break;
+            }
+        }
+        if (blocked) {
+            continue;
+        }
+        if (!are_column_predicates_offset_only_compatible(_opts.pred_tree.root(), cid)) {
+            continue;
+        }
+        _column_iterators[cid]->set_offset_only(true);
+        _has_offset_only_columns = true;
+    }
+}
+
+void SegmentIterator::_apply_offset_only_columns() {
+    if (!_has_offset_only_columns || _expr_pred_tree.empty()) {
+        return;
+    }
+    bool any_remaining = false;
+    for (const FieldPtr& f : _schema.fields()) {
+        const ColumnId cid = f->id();
+        if (cid >= _column_iterators.size() || _column_iterators[cid] == nullptr ||
+            !_column_iterators[cid]->is_offset_only()) {
+            continue;
+        }
+        if (predicate_node_contains_column(_expr_pred_tree.root(), cid)) {
+            _column_iterators[cid]->set_offset_only(false);
+        } else {
+            any_remaining = true;
+        }
+    }
+    _has_offset_only_columns = any_remaining;
+}
+
+void SegmentIterator::_mark_offset_only_chunk_columns(Chunk* chunk) const {
+    if (chunk == nullptr) {
+        return;
+    }
+    const auto& schema = chunk->schema();
+    if (schema == nullptr) {
+        return;
+    }
+    for (size_t i = 0; i < schema->num_fields() && i < chunk->num_columns(); ++i) {
+        const FieldPtr& f = schema->field(i);
+        const ColumnId cid = f->id();
+        if (f->type()->type() == TYPE_VARCHAR) {
+            const bool is_offset_only = (cid < _column_iterators.size() && _column_iterators[cid] != nullptr &&
+                                         _column_iterators[cid]->is_offset_only());
+            auto* col = chunk->get_column_raw_ptr_by_index(i);
+            if (col->is_binary() ||
+                (col->is_nullable() && down_cast<NullableColumn*>(col)->data_column()->is_binary())) {
+                ColumnHelper::get_binary_column(col)->set_offset_only(is_offset_only);
+            }
+        }
+    }
+}
+
 StatusOr<size_t> SegmentIterator::trigger_sample_if_necessary(vector<rowid_t>* rowid) {
     // Check every 16 chunks if we should trigger sampling based on selectivity
     // if only have one predicate column, do not sample
@@ -3040,6 +3237,13 @@ Status SegmentIterator::_do_get_next(Chunk* result, vector<rowid_t>* rowid) {
     _context->_dict_chunk->reset();
     _context->_final_chunk->reset();
     _context->_adapt_global_dict_chunk->reset();
+    if (UNLIKELY(_has_offset_only_columns)) {
+        _mark_offset_only_chunk_columns(_context->_read_chunk.get());
+        if (_context->_dict_chunk != _context->_read_chunk) {
+            _mark_offset_only_chunk_columns(_context->_dict_chunk.get());
+        }
+        _mark_offset_only_chunk_columns(_context->_final_chunk.get());
+    }
 
     Chunk* chunk = _context->_read_chunk.get();
 
@@ -3702,6 +3906,14 @@ Status SegmentIterator::_switch_context(ScanContext* to) {
                          RuntimeChunkHelper::new_chunk_checked(this->output_schema(), _reserve_chunk_size));
     } else {
         to->_adapt_global_dict_chunk = to->_final_chunk;
+    }
+
+    if (UNLIKELY(_has_offset_only_columns)) {
+        _mark_offset_only_chunk_columns(to->_read_chunk.get());
+        if (to->_dict_chunk != to->_read_chunk) {
+            _mark_offset_only_chunk_columns(to->_dict_chunk.get());
+        }
+        _mark_offset_only_chunk_columns(to->_final_chunk.get());
     }
 
     _context = to;
@@ -4374,6 +4586,13 @@ Status SegmentIterator::_finish_late_materialization(ScanContext* ctx) {
             const FieldPtr& f = _schema.field(i);
             const ColumnId cid = f->id();
             auto* col = ctx->_final_chunk->get_column_raw_ptr_by_index(j);
+            if (col->is_binary() ||
+                (col->is_nullable() && down_cast<NullableColumn*>(col)->data_column()->is_binary())) {
+                const bool is_offset_only = _has_offset_only_columns && cid < _column_iterators.size() &&
+                                            _column_iterators[cid] != nullptr &&
+                                            _column_iterators[cid]->is_offset_only();
+                ColumnHelper::get_binary_column(col)->set_offset_only(is_offset_only);
+            }
             col->reserve(ordinals->size());
             col->resize(0);
 
@@ -4402,7 +4621,18 @@ void SegmentIterator::_build_final_chunk(ScanContext* ctx) {
     // trim all use less columns
     Columns& input_columns = ctx->_dict_chunk->columns();
     for (size_t i = 0; i < ctx->_read_index_map.size(); i++) {
-        ctx->_final_chunk->get_column_by_index(i).swap(input_columns[ctx->_read_index_map[i]]);
+        auto& final_col = ctx->_final_chunk->get_column_by_index(i);
+        if (LIKELY(!_has_offset_only_columns)) {
+            const Column* c = final_col.get();
+            if ((c->is_binary() && down_cast<const BinaryColumn*>(c)->is_offset_only()) ||
+                (c->is_nullable() && down_cast<const NullableColumn*>(c)->data_column()->is_binary() &&
+                 down_cast<const BinaryColumn*>(down_cast<const NullableColumn*>(c)->data_column().get())
+                         ->is_offset_only())) {
+                ColumnHelper::get_binary_column(ctx->_final_chunk->get_column_raw_ptr_by_index(i))
+                        ->set_offset_only(false);
+            }
+        }
+        final_col.swap(input_columns[ctx->_read_index_map[i]]);
     }
     bool may_has_del_row = ctx->_dict_chunk->delete_state() != DEL_NOT_SATISFIED;
     ctx->_final_chunk->set_delete_state(may_has_del_row ? DEL_PARTIAL_SATISFIED : DEL_NOT_SATISFIED);
