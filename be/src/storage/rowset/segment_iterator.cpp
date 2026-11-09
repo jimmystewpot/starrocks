@@ -2290,6 +2290,77 @@ void SegmentIterator::_collect_offset_only_columns() {
             continue;
         }
         if (cid >= _column_iterators.size() || _column_iterators[cid] == nullptr) {
+            continue;
+        }
+        if (_opts.global_dictmaps != nullptr && _opts.global_dictmaps->contains(cid)) {
+            continue;
+        }
+        if (_column_access_paths.contains(cid) || _predicate_column_access_paths.contains(cid)) {
+            continue;
+        }
+        bool blocked = false;
+        if (_opts.enable_join_runtime_filter_pushdown) {
+            for (const auto* rf_pred : _opts.runtime_filter_preds.rf_predicates()) {
+                if (rf_pred->get_column_id() == cid) {
+                    blocked = true;
+                    break;
+                }
+            }
+        }
+        if (blocked) {
+            continue;
+        }
+        for (auto& conj : _opts.delete_predicates.predicate_list()) {
+            for (const ColumnPredicate* pred : conj.vec_preds()) {
+                if (pred->column_id() == cid) {
+                    blocked = true;
+                    break;
+                }
+            }
+            if (blocked) {
+                break;
+            }
+            for (const ColumnPredicate* pred : conj.non_vec_preds()) {
+                if (pred->column_id() == cid) {
+                    blocked = true;
+                    break;
+                }
+            }
+            if (blocked) {
+                break;
+            }
+        }
+        if (blocked) {
+            continue;
+        }
+        if (!are_column_predicates_offset_only_compatible(_opts.pred_tree.root(), cid)) {
+            continue;
+        }
+        _column_iterators[cid]->set_offset_only(true);
+        _has_offset_only_columns = true;
+    }
+}
+
+void SegmentIterator::_apply_offset_only_columns() {
+    if (!_has_offset_only_columns || _expr_pred_tree.empty()) {
+        return;
+    }
+    bool any_remaining = false;
+    for (const FieldPtr& f : _schema.fields()) {
+        const ColumnId cid = f->id();
+        if (cid >= _column_iterators.size() || _column_iterators[cid] == nullptr ||
+            !_column_iterators[cid]->is_offset_only()) {
+            continue;
+        }
+        if (predicate_node_contains_column(_expr_pred_tree.root(), cid)) {
+            _column_iterators[cid]->set_offset_only(false);
+        } else {
+            any_remaining = true;
+        }
+    }
+    _has_offset_only_columns = any_remaining;
+}
+
 void SegmentIterator::_mark_offset_only_chunk_columns(Chunk* chunk) const {
     if (chunk == nullptr) {
         return;
