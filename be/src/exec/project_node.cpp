@@ -59,6 +59,9 @@ bool is_offset_only_compatible_parent_expr(const Expr* parent) {
         return false;
     }
     const auto& fn = parent->fn();
+    if (fn.binary_type != TFunctionBinaryType::BUILTIN) {
+        return false;
+    }
     if (fn.fid == 30120) {
         return true;
     }
@@ -248,6 +251,7 @@ void ProjectNode::_push_down_offset_only_slots() {
         return;
     }
 
+    auto* scan_node = down_cast<OlapScanNode*>(_children[0]);
     std::unordered_map<SlotId, size_t> total_refs;
     std::unordered_map<SlotId, size_t> offset_only_refs;
 
@@ -266,21 +270,30 @@ void ProjectNode::_push_down_offset_only_slots() {
             collect_slot_ref_counts(ctx->root(), nullptr, &total_refs, &offset_only_refs);
         }
     }
-    for (const auto& [rf_id, rf_desc] : _runtime_filter_collector.descriptors()) {
-        if (rf_desc == nullptr) {
-            continue;
+    for (auto* ctx : scan_node->get_heavy_expr_ctxs()) {
+        if (ctx != nullptr && ctx->root() != nullptr) {
+            ctx->root()->for_each_slot_id([&total_refs](SlotId id) { total_refs[id]++; });
         }
-        if (rf_desc->probe_expr_ctx() != nullptr && rf_desc->probe_expr_ctx()->root() != nullptr) {
-            rf_desc->probe_expr_ctx()->root()->for_each_slot_id([&total_refs](SlotId id) { total_refs[id]++; });
-        }
-        if (rf_desc->partition_by_expr_contexts() != nullptr) {
-            for (auto* part_ctx : *rf_desc->partition_by_expr_contexts()) {
-                if (part_ctx != nullptr && part_ctx->root() != nullptr) {
-                    part_ctx->root()->for_each_slot_id([&total_refs](SlotId id) { total_refs[id]++; });
+    }
+    auto collect_rf_slots = [&total_refs](const RuntimeFilterProbeCollector& collector) {
+        for (const auto& [rf_id, rf_desc] : collector.descriptors()) {
+            if (rf_desc == nullptr) {
+                continue;
+            }
+            if (rf_desc->probe_expr_ctx() != nullptr && rf_desc->probe_expr_ctx()->root() != nullptr) {
+                rf_desc->probe_expr_ctx()->root()->for_each_slot_id([&total_refs](SlotId id) { total_refs[id]++; });
+            }
+            if (rf_desc->partition_by_expr_contexts() != nullptr) {
+                for (auto* part_ctx : *rf_desc->partition_by_expr_contexts()) {
+                    if (part_ctx != nullptr && part_ctx->root() != nullptr) {
+                        part_ctx->root()->for_each_slot_id([&total_refs](SlotId id) { total_refs[id]++; });
+                    }
                 }
             }
         }
-    }
+    };
+    collect_rf_slots(_runtime_filter_collector);
+    collect_rf_slots(scan_node->runtime_filter_collector());
 
     std::unordered_set<SlotId> offset_only_slots;
     for (const auto& [slot_id, count] : total_refs) {
@@ -290,7 +303,6 @@ void ProjectNode::_push_down_offset_only_slots() {
     }
 
     if (!offset_only_slots.empty()) {
-        auto* scan_node = down_cast<OlapScanNode*>(_children[0]);
         scan_node->set_offset_only_slots(std::move(offset_only_slots));
     }
 }

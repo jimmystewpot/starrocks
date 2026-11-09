@@ -15,9 +15,14 @@
 #include "runtime/chunk_accumulator.h"
 
 #include <memory>
+#include <vector>
 
+#include "base/testutil/assert.h"
+#include "column/binary_column.h"
 #include "column/chunk.h"
+#include "column/column_helper.h"
 #include "column/fixed_length_column.h"
+#include "column/nullable_column.h"
 #include "gtest/gtest.h"
 
 namespace starrocks {
@@ -29,6 +34,22 @@ ChunkPtr make_chunk(size_t num_rows) {
     auto column = Int32Column::create();
     column->append_default(num_rows);
     chunk->append_column(std::move(column), 0);
+    return chunk;
+}
+
+ChunkPtr make_binary_chunk(size_t num_rows, Slice val, bool offset_only, bool nullable = false) {
+    auto chunk = std::make_shared<Chunk>();
+    auto col = BinaryColumn::create();
+    col->set_offset_only(offset_only);
+    for (size_t i = 0; i < num_rows; ++i) {
+        col->append(val);
+    }
+    if (nullable) {
+        auto null_col = NullColumn::create(num_rows, 0);
+        chunk->append_column(NullableColumn::create(std::move(col), std::move(null_col)), 0);
+    } else {
+        chunk->append_column(std::move(col), 0);
+    }
     return chunk;
 }
 
@@ -75,6 +96,39 @@ TEST(ChunkAccumulatorTest, Accumulator) {
     auto output = accumulator.pull();
     EXPECT_EQ(nullptr, output);
     EXPECT_TRUE(accumulator.reach_limit());
+}
+
+TEST(ChunkAccumulatorTest, MixedOffsetOnlyAndMaterializedBinaryChunks) {
+    constexpr size_t kDesiredSize = 4096;
+
+    for (bool nullable : {false, true}) {
+        ChunkAccumulator accumulator(kDesiredSize);
+        ASSERT_OK(accumulator.push(make_binary_chunk(10, Slice("hello"), /*offset_only=*/false, nullable)));
+        ASSERT_OK(accumulator.push(make_binary_chunk(15, Slice("world"), /*offset_only=*/true, nullable)));
+        ASSERT_OK(accumulator.push(make_binary_chunk(20, Slice("world"), /*offset_only=*/false, nullable)));
+        accumulator.finalize();
+
+        std::vector<ChunkPtr> outputs;
+        size_t total_rows = 0;
+        while (ChunkPtr out = accumulator.pull()) {
+            out->check_or_die();
+            total_rows += out->num_rows();
+            outputs.push_back(std::move(out));
+        }
+
+        ASSERT_EQ(3u, outputs.size());
+        EXPECT_EQ(45u, total_rows);
+
+        const auto* col0 = ColumnHelper::get_data_column(outputs[0]->get_column_by_index(0).get());
+        const auto* col1 = ColumnHelper::get_data_column(outputs[1]->get_column_by_index(0).get());
+        const auto* col2 = ColumnHelper::get_data_column(outputs[2]->get_column_by_index(0).get());
+        EXPECT_EQ(10u, outputs[0]->num_rows());
+        EXPECT_FALSE(down_cast<const BinaryColumn*>(col0)->is_offset_only());
+        EXPECT_EQ(15u, outputs[1]->num_rows());
+        EXPECT_TRUE(down_cast<const BinaryColumn*>(col1)->is_offset_only());
+        EXPECT_EQ(20u, outputs[2]->num_rows());
+        EXPECT_FALSE(down_cast<const BinaryColumn*>(col2)->is_offset_only());
+    }
 }
 
 } // namespace starrocks

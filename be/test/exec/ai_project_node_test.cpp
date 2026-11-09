@@ -27,8 +27,13 @@
 #include "base/testutil/assert.h"
 #include "common/config_exec_fwd.h"
 #include "exec/exec_factory.h"
+#include "exec/olap_scan_node.h"
 #include "exec/pipeline/ai/ai_provider_config_parser.h"
+#include "exec/project_node.h"
 #include "exec_primitive/exec_node.h"
+#include "exprs/column_ref.h"
+#include "exprs/expr.h"
+#include "exprs/expr_context.h"
 #include "gen_cpp/Exprs_types.h"
 #include "gen_cpp/PlanNodes_types.h"
 #include "runtime/descriptor_helper.h"
@@ -481,6 +486,129 @@ TEST_F(AIProjectNodeTest, RejectsMalformedThriftContractsBeforeCreatingATree) {
         EXPECT_EQ(std::string::npos, status.to_string().find(kSecretSentinel));
         EXPECT_EQ(std::string::npos, status.to_string().find(kArbitraryCredentialEnvironment));
     }
+}
+
+class DummyFunctionCallExpr final : public Expr {
+public:
+    explicit DummyFunctionCallExpr(const TExprNode& node) : Expr(node) {}
+    Expr* clone(ObjectPool* pool) const override { return pool->add(new DummyFunctionCallExpr(*this)); }
+    StatusOr<ColumnPtr> evaluate_checked(ExprContext* /*context*/, Chunk* /*ptr*/) override {
+        return Status::NotSupported("dummy expr");
+    }
+};
+
+ExprContext* make_length_call_expr_ctx(ObjectPool* pool, TFunctionBinaryType::type binary_type, int64_t fid,
+                                       SlotId slot_id) {
+    TFunctionName fn_name;
+    fn_name.__set_function_name("length");
+
+    TFunction fn;
+    fn.__set_name(fn_name);
+    fn.__set_binary_type(binary_type);
+    fn.__set_arg_types({varchar_type().to_thrift()});
+    fn.__set_ret_type(TypeDescriptor(TYPE_INT).to_thrift());
+    fn.__set_has_var_args(false);
+    if (fid > 0) {
+        fn.__set_fid(fid);
+    }
+
+    TExprNode call_node;
+    call_node.__set_node_type(TExprNodeType::FUNCTION_CALL);
+    call_node.__set_num_children(1);
+    call_node.__set_type(TypeDescriptor(TYPE_INT).to_thrift());
+    call_node.__set_is_nullable(true);
+    call_node.__set_fn(fn);
+
+    auto* call_expr = pool->add(new DummyFunctionCallExpr(call_node));
+    auto* slot_ref = pool->add(new ColumnRef(varchar_type(), slot_id));
+    call_expr->add_child(slot_ref);
+    return pool->add(new ExprContext(call_expr));
+}
+
+TEST_F(AIProjectNodeTest, ProjectNodeRejectsNonBuiltinUdfNamedLengthForOffsetOnly) {
+    ObjectPool plan_pool;
+    TPlanNode project_tnode = make_base_node(TPlanNodeType::PROJECT_NODE, _tuple_id, 20, 1);
+    TPlanNode scan_tnode = make_base_node(TPlanNodeType::OLAP_SCAN_NODE, _tuple_id, 21, 0);
+    TOlapScanNode olap_scan_tnode;
+    olap_scan_tnode.__set_tuple_id(_tuple_id);
+    scan_tnode.__set_olap_scan_node(olap_scan_tnode);
+
+    // Case A: Builtin length(prompt) marks kPromptSlotId as offset-only.
+    {
+        ProjectNode project(&plan_pool, project_tnode, *_descriptors);
+        auto* scan_node = plan_pool.add(new OlapScanNode(&plan_pool, scan_tnode, *_descriptors));
+        project._children.push_back(scan_node);
+        project._slot_ids.push_back(kAnswerSlotId);
+        project._expr_ctxs.push_back(
+                make_length_call_expr_ctx(&plan_pool, TFunctionBinaryType::BUILTIN, 30120, kPromptSlotId));
+
+        project._push_down_offset_only_slots();
+        EXPECT_EQ(std::unordered_set<SlotId>({kPromptSlotId}), scan_node->offset_only_slots());
+        project.close(&_runtime_state);
+    }
+
+    // Case B: Non-builtin UDFs named length(prompt) must NOT mark kPromptSlotId as offset-only.
+    for (auto binary_type : {TFunctionBinaryType::SRJAR, TFunctionBinaryType::PYTHON, TFunctionBinaryType::HIVE}) {
+        ProjectNode udf_project(&plan_pool, project_tnode, *_descriptors);
+        auto* udf_scan_node = plan_pool.add(new OlapScanNode(&plan_pool, scan_tnode, *_descriptors));
+        udf_project._children.push_back(udf_scan_node);
+        udf_project._slot_ids.push_back(kAnswerSlotId);
+        udf_project._expr_ctxs.push_back(make_length_call_expr_ctx(&plan_pool, binary_type, 0, kPromptSlotId));
+
+        udf_project._push_down_offset_only_slots();
+        EXPECT_TRUE(udf_scan_node->offset_only_slots().empty());
+        udf_project.close(&_runtime_state);
+    }
+}
+
+TEST_F(AIProjectNodeTest, ProjectNodeDisqualifiesScanHeavyExprSlotsFromOffsetOnly) {
+    ObjectPool plan_pool;
+    TPlanNode project_tnode = make_base_node(TPlanNodeType::PROJECT_NODE, _tuple_id, 30, 1);
+    TPlanNode scan_tnode = make_base_node(TPlanNodeType::OLAP_SCAN_NODE, _tuple_id, 31, 0);
+    TOlapScanNode olap_scan_tnode;
+    olap_scan_tnode.__set_tuple_id(_tuple_id);
+    scan_tnode.__set_olap_scan_node(olap_scan_tnode);
+
+    ProjectNode project(&plan_pool, project_tnode, *_descriptors);
+    auto* scan_node = plan_pool.add(new OlapScanNode(&plan_pool, scan_tnode, *_descriptors));
+    project._children.push_back(scan_node);
+    project._slot_ids.push_back(kAnswerSlotId);
+    project._expr_ctxs.push_back(
+            make_length_call_expr_ctx(&plan_pool, TFunctionBinaryType::BUILTIN, 30120, kPromptSlotId));
+
+    std::vector<ExprContext*> heavy_expr_ctxs{
+            make_length_call_expr_ctx(&plan_pool, TFunctionBinaryType::SRJAR, 0, kPromptSlotId)};
+    scan_node->set_heavy_expr_ctxs(heavy_expr_ctxs);
+
+    project._push_down_offset_only_slots();
+    EXPECT_TRUE(scan_node->offset_only_slots().empty());
+    project.close(&_runtime_state);
+}
+
+TEST_F(AIProjectNodeTest, ProjectNodeDisqualifiesChildScanRuntimeFilterSlotsFromOffsetOnly) {
+    ObjectPool plan_pool;
+    TPlanNode project_tnode = make_base_node(TPlanNodeType::PROJECT_NODE, _tuple_id, 40, 1);
+    TPlanNode scan_tnode = make_base_node(TPlanNodeType::OLAP_SCAN_NODE, _tuple_id, 41, 0);
+    TOlapScanNode olap_scan_tnode;
+    olap_scan_tnode.__set_tuple_id(_tuple_id);
+    scan_tnode.__set_olap_scan_node(olap_scan_tnode);
+
+    ProjectNode project(&plan_pool, project_tnode, *_descriptors);
+    auto* scan_node = plan_pool.add(new OlapScanNode(&plan_pool, scan_tnode, *_descriptors));
+    project._children.push_back(scan_node);
+    project._slot_ids.push_back(kAnswerSlotId);
+    project._expr_ctxs.push_back(
+            make_length_call_expr_ctx(&plan_pool, TFunctionBinaryType::BUILTIN, 30120, kPromptSlotId));
+
+    auto* probe_slot_ref = plan_pool.add(new ColumnRef(varchar_type(), kPromptSlotId));
+    auto* probe_expr_ctx = plan_pool.add(new ExprContext(probe_slot_ref));
+    auto* rf_desc = plan_pool.add(new RuntimeFilterProbeDescriptor());
+    ASSERT_OK(rf_desc->init(100, probe_expr_ctx));
+    scan_node->runtime_filter_collector().add_descriptor(rf_desc);
+
+    project._push_down_offset_only_slots();
+    EXPECT_TRUE(scan_node->offset_only_slots().empty());
+    project.close(&_runtime_state);
 }
 
 } // namespace

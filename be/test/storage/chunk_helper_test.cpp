@@ -347,4 +347,50 @@ TEST_F(ChunkPipelineAccumulatorTest, test_owner_info) {
     }
 }
 
+TEST_F(ChunkPipelineAccumulatorTest, MixedOffsetOnlyAndMaterializedBinaryChunks) {
+    auto make_mixed_binary_chunk = [](size_t num_rows, Slice val, bool offset_only) {
+        auto chunk = std::make_shared<Chunk>();
+        auto col0 = BinaryColumn::create();
+        col0->set_offset_only(offset_only);
+        auto col1 = BinaryColumn::create();
+        col1->set_offset_only(offset_only);
+        for (size_t i = 0; i < num_rows; ++i) {
+            col0->append(val);
+            col1->append(val);
+        }
+        chunk->append_column(std::move(col0), 0);
+        chunk->append_column(NullableColumn::create(std::move(col1), NullColumn::create(num_rows, 0)), 1);
+        return chunk;
+    };
+
+    ChunkPipelineAccumulator accumulator;
+    accumulator.push(make_mixed_binary_chunk(10, Slice("hello"), /*offset_only=*/false));
+    ASSERT_FALSE(accumulator.has_output());
+
+    accumulator.push(make_mixed_binary_chunk(15, Slice("world"), /*offset_only=*/true));
+    ASSERT_TRUE(accumulator.has_output());
+    auto out0 = std::move(accumulator.pull());
+    ASSERT_NE(nullptr, out0);
+    out0->check_or_die();
+    EXPECT_EQ(10u, out0->num_rows());
+    EXPECT_FALSE(down_cast<const BinaryColumn*>(out0->get_column_by_index(0).get())->is_offset_only());
+
+    accumulator.push(make_mixed_binary_chunk(20, Slice("starrocks"), /*offset_only=*/false));
+    ASSERT_TRUE(accumulator.has_output());
+    auto out1 = std::move(accumulator.pull());
+    ASSERT_NE(nullptr, out1);
+    out1->check_or_die();
+    EXPECT_EQ(15u, out1->num_rows());
+    EXPECT_TRUE(down_cast<const BinaryColumn*>(out1->get_column_by_index(0).get())->is_offset_only());
+
+    accumulator.finalize();
+    ASSERT_TRUE(accumulator.has_output());
+    auto out2 = std::move(accumulator.pull());
+    ASSERT_NE(nullptr, out2);
+    out2->check_or_die();
+    EXPECT_EQ(20u, out2->num_rows());
+    EXPECT_FALSE(down_cast<const BinaryColumn*>(out2->get_column_by_index(0).get())->is_offset_only());
+    ASSERT_FALSE(accumulator.has_output());
+}
+
 } // namespace starrocks

@@ -1374,4 +1374,42 @@ PARALLEL_TEST(BinaryColumnTest, test_offset_only_append_selective_and_filter_ran
     }
 }
 
+// NOLINTNEXTLINE
+PARALLEL_TEST(BinaryColumnTest, AppendWithMaskRejectsOffsetOnlyIntoNonEmptyMaterialized) {
+    auto src = BinaryColumn::create();
+    src->set_offset_only(true);
+    src->append_string("abc");
+    ASSERT_TRUE(src->is_offset_only());
+    ASSERT_EQ(1u, src->size());
+
+    const uint8_t mask[1] = {1};
+
+    // Appending an offset-only source into a non-empty materialized destination must fail
+    // without flipping the destination to offset-only (which would violate check_or_die()).
+    auto non_empty_dst = BinaryColumn::create();
+    non_empty_dst->append_string("hello");
+    ASSERT_FALSE(non_empty_dst->is_offset_only());
+
+    Status st = append_with_mask<true>(non_empty_dst.get(), *src, mask, 1);
+    ASSERT_FALSE(st.ok());
+    ASSERT_TRUE(st.is_internal_error());
+    ASSERT_FALSE(non_empty_dst->is_offset_only());
+    ASSERT_EQ(1u, non_empty_dst->size());
+    ASSERT_EQ(Slice("hello"), non_empty_dst->get_slice(0));
+    non_empty_dst->check_or_die();
+
+    // Appending an offset-only source into an empty materialized destination succeeds
+    // and transitions the destination to offset-only mode.
+    auto empty_dst = BinaryColumn::create();
+    ASSERT_FALSE(empty_dst->is_offset_only());
+    ASSERT_TRUE(empty_dst->empty());
+
+    Status ok_st = append_with_mask<true>(empty_dst.get(), *src, mask, 1);
+    ASSERT_TRUE(ok_st.ok());
+    ASSERT_TRUE(empty_dst->is_offset_only());
+    ASSERT_EQ(1u, empty_dst->size());
+    ASSERT_EQ(3u, empty_dst->get_offset()[1] - empty_dst->get_offset()[0]);
+    empty_dst->check_or_die();
+}
+
 } // namespace starrocks

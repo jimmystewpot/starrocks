@@ -410,6 +410,37 @@ Status OlapChunkSource::_init_reader_params(const std::vector<std::unique_ptr<Ol
     const bool reader_supports_offset_only = tablet_reader_supports_offset_only(
             _tablet->keys_type(), _params.skip_aggregation, _params.sorted_by_keys_per_tablet);
     if (reader_supports_offset_only) {
+        for (auto* expr : _scan_node->get_heavy_expr_ctxs()) {
+            if (expr != nullptr && expr->root() != nullptr) {
+                expr->root()->for_each_slot_id([&conjuncts_slot_ids](SlotId id) { conjuncts_slot_ids.insert(id); });
+            }
+        }
+        auto collect_rf_slots = [&conjuncts_slot_ids](const RuntimeFilterProbeCollector* collector) {
+            if (collector == nullptr) {
+                return;
+            }
+            for (const auto& [rf_id, rf_desc] : collector->descriptors()) {
+                if (rf_desc == nullptr) {
+                    continue;
+                }
+                if (rf_desc->probe_expr_ctx() != nullptr && rf_desc->probe_expr_ctx()->root() != nullptr) {
+                    rf_desc->probe_expr_ctx()->root()->for_each_slot_id(
+                            [&conjuncts_slot_ids](SlotId id) { conjuncts_slot_ids.insert(id); });
+                }
+                if (rf_desc->partition_by_expr_contexts() != nullptr) {
+                    for (auto* part_ctx : *rf_desc->partition_by_expr_contexts()) {
+                        if (part_ctx != nullptr && part_ctx->root() != nullptr) {
+                            part_ctx->root()->for_each_slot_id(
+                                    [&conjuncts_slot_ids](SlotId id) { conjuncts_slot_ids.insert(id); });
+                        }
+                    }
+                }
+            }
+        };
+        collect_rf_slots(&_scan_node->runtime_filter_collector());
+        if (_scan_op != nullptr && _scan_op->get_factory() != nullptr) {
+            collect_rf_slots(_scan_op->get_factory()->get_runtime_bloom_filters());
+        }
         const auto& offset_only_slots = _scan_node->offset_only_slots();
         const auto& non_pushdown_cids = _non_pushdown_pred_tree.column_ids();
         for (auto* slot : *_slots) {
