@@ -15,6 +15,7 @@
 #pragma once
 
 #include <any>
+#include <bit>
 #include <limits>
 
 #include "base/container/fixed_hash_map.h"
@@ -76,11 +77,6 @@ inline size_t agg_hash_map_default_prefetch_dist() {
         this->hash_set.prefetch_hash(hashes[i + __prefetch_dist]);  \
     }
 
-#define AGG_STRING_HASH_SET_PREFETCH_HASH_VAL()                     \
-    if (__prefetch_dist != 0 && i + __prefetch_dist < chunk_size) { \
-        this->hash_set.prefetch(cache[i + __prefetch_dist]);        \
-    }
-
 // Key of the slice agg hash maps and sets. It is exactly sizeof(Slice): `size` is narrowed to 32 bits and the freed
 // 4 bytes cache the key's crc, so a rehash never walks the key bytes again. The size of the map/set slot and of the
 // agg state prefix (which holds a copy of the key, see AllocateState) stay unchanged, and SliceAggHashSet /
@@ -138,7 +134,13 @@ struct SliceWithHash32Hash {
 template <PhmapSeed seed>
 struct SliceWithHash32Equal {
     ALWAYS_INLINE bool operator()(const SliceWithHash32<seed>& x, const SliceWithHash32<seed>& y) const {
-        return x.hash == y.hash && memequal(x.data, x.real_size(), y.data, y.real_size());
+        if (x.hash != y.hash) {
+            return false;
+        }
+        if (LIKELY(x.size == y.size && x.size != SliceWithHash32<seed>::kEscape)) {
+            return memequal(x.data, x.size, y.data, x.size);
+        }
+        return memequal(x.data, x.real_size(), y.data, y.real_size());
     }
 };
 
@@ -228,6 +230,7 @@ struct AggHashSet {
     using HHashSetType = HashSet;
     HashSet hash_set;
     AggStatistics* agg_stat;
+    raw::RawVector<size_t> _prefetch_hash_ring;
 
     ////// Common Methods ////////
     void build_hash_set(size_t chunk_size, const Columns& key_columns, MemPool* pool) {
@@ -251,6 +254,50 @@ struct AggHashSet {
             this->hash_set.lazy_emplace(key, [&](const auto& ctor) { ctor(persist_agg_slice_key(key, pool)); });
         } else {
             (*not_founds)[i] = !this->hash_set.contains(key);
+        }
+    }
+
+    template <bool compute_and_allocate>
+    ALWAYS_INLINE void probe_or_insert_slice_key_with_hash(const typename HashSet::key_type& key, size_t hashval,
+                                                           MemPool* pool, Filter* not_founds, size_t i) {
+        if constexpr (compute_and_allocate) {
+            this->hash_set.lazy_emplace_with_hash(key, hashval,
+                                                  [&](const auto& ctor) { ctor(persist_agg_slice_key(key, pool)); });
+        } else {
+            (*not_founds)[i] = this->hash_set.find(key, hashval) == this->hash_set.end();
+        }
+    }
+
+    template <bool compute_and_allocate>
+    ALWAYS_INLINE void probe_slice_cache_prefetch(size_t chunk_size,
+                                                  const typename HashSet::key_type* __restrict cache_ptr, MemPool* pool,
+                                                  Filter* not_founds) {
+        constexpr size_t kStackRingCap = 64;
+        size_t stack_ring[kStackRingCap];
+        const size_t dist = agg_hash_map_default_prefetch_dist();
+        const size_t preload = std::min(dist, chunk_size);
+        size_t ring_cap = kStackRingCap;
+        size_t* __restrict hash_ring = stack_ring;
+        if (UNLIKELY(preload >= kStackRingCap)) {
+            ring_cap = std::bit_ceil(preload + 1);
+            _prefetch_hash_ring.resize(ring_cap);
+            hash_ring = _prefetch_hash_ring.data();
+        }
+        const size_t ring_mask = ring_cap - 1;
+        for (size_t j = 0; j < preload; ++j) {
+            hash_ring[j] = this->hash_set.hash_function()(cache_ptr[j]);
+        }
+        for (size_t i = 0; i < chunk_size; ++i) {
+            if (i + dist < chunk_size) {
+                const size_t next_hash = this->hash_set.hash_function()(cache_ptr[i + dist]);
+                hash_ring[(i + dist) & ring_mask] = next_hash;
+                if (LIKELY(dist != 0)) {
+                    this->hash_set.prefetch_hash(next_hash);
+                }
+            }
+            const size_t hashval = hash_ring[i & ring_mask];
+            this->template probe_or_insert_slice_key_with_hash<compute_and_allocate>(cache_ptr[i], hashval, pool,
+                                                                                     not_founds, i);
         }
     }
 };
@@ -491,21 +538,16 @@ struct AggHashSetOfOneStringKey : public AggHashSet<HashSet, AggHashSetOfOneStri
                                             Filter* not_founds) {
         const auto* column = down_cast<const BinaryColumn*>(key_columns[0].get());
         const uint8_t* base = column->raw_bytes();
-        cache.clear();
-        cache.reserve(chunk_size);
+        cache.resize(chunk_size);
+        KeyType* __restrict cache_ptr = cache.data();
         column->get_offset().visit_storage([&](const auto& offsets) {
             const auto* off = offsets.data();
             for (size_t i = 0; i < chunk_size; ++i) {
                 const Slice s(base + off[i], off[i + 1] - off[i]);
-                cache.push_back(make_agg_slice_key<KeyType>(s, &_escape_pool));
+                cache_ptr[i] = make_agg_slice_key<KeyType>(s, &_escape_pool);
             }
         });
-
-        const size_t __prefetch_dist = agg_hash_map_default_prefetch_dist();
-        for (size_t i = 0; i < chunk_size; ++i) {
-            AGG_STRING_HASH_SET_PREFETCH_HASH_VAL();
-            this->template probe_or_insert_slice_key<compute_and_allocate>(cache[i], pool, not_founds, i);
-        }
+        this->template probe_slice_cache_prefetch<compute_and_allocate>(chunk_size, cache_ptr, pool, not_founds);
         reset_agg_escape_pool(&_escape_pool);
     }
 
@@ -592,20 +634,16 @@ struct AggHashSetOfOneNullableStringKey : public AggHashSet<HashSet, AggHashSetO
         const auto* data_column = down_cast<const BinaryColumn*>(nullable_column->data_column().get());
         const uint8_t* base = data_column->raw_bytes();
 
-        cache.clear();
-        cache.reserve(chunk_size);
+        cache.resize(chunk_size);
+        KeyType* __restrict cache_ptr = cache.data();
         data_column->get_offset().visit_storage([&](const auto& offsets) {
             const auto* off = offsets.data();
             for (size_t i = 0; i < chunk_size; ++i) {
                 const Slice s(base + off[i], off[i + 1] - off[i]);
-                cache.push_back(make_agg_slice_key<KeyType>(s, &_escape_pool));
+                cache_ptr[i] = make_agg_slice_key<KeyType>(s, &_escape_pool);
             }
         });
-        const size_t __prefetch_dist = agg_hash_map_default_prefetch_dist();
-        for (size_t i = 0; i < chunk_size; ++i) {
-            AGG_STRING_HASH_SET_PREFETCH_HASH_VAL();
-            this->template probe_or_insert_slice_key<compute_and_allocate>(cache[i], pool, not_founds, i);
-        }
+        this->template probe_slice_cache_prefetch<compute_and_allocate>(chunk_size, cache_ptr, pool, not_founds);
         reset_agg_escape_pool(&_escape_pool);
     }
 
@@ -692,17 +730,12 @@ struct AggHashSetOfSerializedKey : public AggHashSet<HashSet, AggHashSetOfSerial
 
     template <bool compute_and_allocate>
     ALWAYS_NOINLINE void build_set_prefetch(size_t chunk_size, MemPool* pool, Filter* not_founds) {
-        cache.clear();
-        cache.reserve(chunk_size);
+        cache.resize(chunk_size);
+        KeyType* __restrict cache_ptr = cache.data();
         for (size_t i = 0; i < chunk_size; ++i) {
-            cache.push_back(make_agg_slice_key<KeyType>(_key_buffer.key(i), &_escape_pool));
+            cache_ptr[i] = make_agg_slice_key<KeyType>(_key_buffer.key(i), &_escape_pool);
         }
-
-        const size_t __prefetch_dist = agg_hash_map_default_prefetch_dist();
-        for (size_t i = 0; i < chunk_size; ++i) {
-            AGG_STRING_HASH_SET_PREFETCH_HASH_VAL();
-            this->template probe_or_insert_slice_key<compute_and_allocate>(cache[i], pool, not_founds, i);
-        }
+        this->template probe_slice_cache_prefetch<compute_and_allocate>(chunk_size, cache_ptr, pool, not_founds);
         reset_agg_escape_pool(&_escape_pool);
     }
 

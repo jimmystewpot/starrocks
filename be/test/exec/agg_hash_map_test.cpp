@@ -2235,6 +2235,11 @@ TEST(SliceWithHash32Test, NullableAndNonNullableSelectionAndLimitPaths) {
             for (int i = 0; i < kRows; ++i) {
                 EXPECT_EQ(0, agg->_streaming_selection[i]);
             }
+            const int32_t prev_dist = config::agg_hash_map_prefetch_dist;
+            config::agg_hash_map_prefetch_dist = 64;
+            agg->build_hash_set(kRows);
+            agg->build_hash_set_with_selection(kRows);
+            config::agg_hash_map_prefetch_dist = prev_dist;
         }
 
         for (auto null_str_type :
@@ -2336,6 +2341,150 @@ TEST(SliceWithHash32Test, NullableAndNonNullableSelectionAndLimitPaths) {
         // 10 non-null groups in the hash table + 1 null group out-of-table = 11 total groups in variant.size().
         EXPECT_EQ(11u, agg_limit->_hash_map_variant.size());
     }
+}
+
+namespace {
+struct CountingSliceWithHash32Hash {
+    static inline size_t call_count = 0;
+    size_t operator()(const SliceWithHash32<PhmapSeed1>& s) const {
+        ++call_count;
+        return SliceWithHash32Hash<PhmapSeed1>()(s);
+    }
+};
+
+struct RecordingSliceHashSet : public phmap::flat_hash_set<SliceWithHash32<PhmapSeed1>, CountingSliceWithHash32Hash,
+                                                           SliceWithHash32Equal<PhmapSeed1>> {
+    using Base = phmap::flat_hash_set<SliceWithHash32<PhmapSeed1>, CountingSliceWithHash32Hash,
+                                      SliceWithHash32Equal<PhmapSeed1>>;
+    using Base::Base;
+
+    std::vector<size_t> prefetched_hashes;
+
+    void prefetch_hash(size_t hashval) const {
+        const_cast<RecordingSliceHashSet*>(this)->prefetched_hashes.push_back(hashval);
+        Base::prefetch_hash(hashval);
+    }
+};
+} // namespace
+
+TEST(SliceWithHash32Test, EqualShortCircuitsOnSizeMismatchBeforeReadingData) {
+    using Key = SliceWithHash32<PhmapSeed1>;
+    SliceWithHash32Equal<PhmapSeed1> equal;
+
+    // Identical 32-bit hash, different size fields, null payload pointers:
+    // SliceWithHash32Equal must reject on size mismatch before reading payload bytes.
+    Key k12(nullptr, 12, 0xCAFEBABEU);
+    Key k16(nullptr, 16, 0xCAFEBABEU);
+    uint64_t escaped_header = 24;
+    Key k_escaped(reinterpret_cast<const char*>(&escaped_header) + Key::kEscapeHeader, Key::kEscape, 0xCAFEBABEU);
+
+    EXPECT_FALSE(equal(k12, k16));
+    EXPECT_FALSE(equal(k16, k12));
+    EXPECT_FALSE(equal(k12, k_escaped));
+    EXPECT_FALSE(equal(k_escaped, k12));
+}
+
+TEST(SliceWithHash32Test, PrefetchRingHandlesBoundaryDistancesAndChunkSizes) {
+    using Key = SliceWithHash32<PhmapSeed1>;
+    using SetWrapper = AggHashSetOfOneStringKey<RecordingSliceHashSet>;
+
+    const int32_t saved_dist = config::agg_hash_map_prefetch_dist;
+    DeferOp restore([&]() { config::agg_hash_map_prefetch_dist = saved_dist; });
+
+    RuntimeProfile profile("test");
+    AggStatistics statistics(&profile);
+    MemPool pool;
+
+    for (int32_t dist : {0, 1, 16, 32, 63, 64, 128}) {
+        config::agg_hash_map_prefetch_dist = dist;
+        const size_t udist = static_cast<size_t>(dist);
+        for (size_t chunk_size : {size_t(0), size_t(1), size_t(7), size_t(16), size_t(64), size_t(100), size_t(200)}) {
+            SetWrapper wrapper(chunk_size, &statistics);
+            wrapper.hash_set.reserve(chunk_size * 2);
+            std::vector<std::string> raw_keys(chunk_size);
+            std::vector<Key> cache(chunk_size);
+            for (size_t i = 0; i < chunk_size; ++i) {
+                raw_keys[i] = "url_key_dist_" + std::to_string(dist) + "_row_" + std::to_string(i);
+                cache[i] = Key(Slice(raw_keys[i]));
+            }
+
+            const size_t expected_prefetches = (udist > 0 && chunk_size > udist) ? (chunk_size - udist) : 0;
+
+            CountingSliceWithHash32Hash::call_count = 0;
+            wrapper.hash_set.prefetched_hashes.clear();
+            wrapper.probe_slice_cache_prefetch<true>(chunk_size, cache.data(), &pool, nullptr);
+            EXPECT_EQ(chunk_size, CountingSliceWithHash32Hash::call_count)
+                    << "dist=" << dist << " chunk_size=" << chunk_size;
+            EXPECT_EQ(chunk_size, wrapper.hash_set.size());
+            ASSERT_EQ(expected_prefetches, wrapper.hash_set.prefetched_hashes.size())
+                    << "dist=" << dist << " chunk_size=" << chunk_size;
+            for (size_t k = 0; k < expected_prefetches; ++k) {
+                EXPECT_EQ(SliceWithHash32Hash<PhmapSeed1>()(cache[udist + k]), wrapper.hash_set.prefetched_hashes[k])
+                        << "dist=" << dist << " chunk_size=" << chunk_size << " k=" << k;
+            }
+            const size_t preload = std::min(udist, chunk_size);
+            if (preload < 64) {
+                EXPECT_TRUE(wrapper._prefetch_hash_ring.empty()) << "dist=" << dist << " chunk_size=" << chunk_size;
+            } else {
+                EXPECT_EQ(std::bit_ceil(preload + 1), wrapper._prefetch_hash_ring.size())
+                        << "dist=" << dist << " chunk_size=" << chunk_size;
+            }
+
+            Filter not_founds(chunk_size, 1);
+            CountingSliceWithHash32Hash::call_count = 0;
+            wrapper.hash_set.prefetched_hashes.clear();
+            wrapper.probe_slice_cache_prefetch<false>(chunk_size, cache.data(), &pool, &not_founds);
+            EXPECT_EQ(chunk_size, CountingSliceWithHash32Hash::call_count)
+                    << "dist=" << dist << " chunk_size=" << chunk_size;
+            ASSERT_EQ(expected_prefetches, wrapper.hash_set.prefetched_hashes.size())
+                    << "dist=" << dist << " chunk_size=" << chunk_size;
+            for (size_t i = 0; i < chunk_size; ++i) {
+                EXPECT_EQ(0, not_founds[i]);
+            }
+        }
+    }
+}
+
+TEST(SliceWithHash32Test, PrefetchCacheResizeAcrossVaryingChunkSizes) {
+    const double saved_ratio = config::agg_prefetch_l2_ratio;
+    const int32_t saved_dist = config::agg_hash_map_prefetch_dist;
+    DeferOp restore([&]() {
+        config::agg_prefetch_l2_ratio = saved_ratio;
+        config::agg_hash_map_prefetch_dist = saved_dist;
+    });
+    config::agg_prefetch_l2_ratio = 0.0;
+    config::agg_hash_map_prefetch_dist = 16;
+
+    RuntimeProfile profile("test");
+    AggStatistics statistics(&profile);
+    MemPool pool;
+
+    AggHashSetOfOneStringKey<SliceAggTwoLevelHashSet<PhmapSeed1>> str_set(64, &statistics);
+    AggHashSetOfOneNullableStringKey<SliceAggTwoLevelHashSet<PhmapSeed1>> null_str_set(64, &statistics);
+    AggHashSetOfSerializedKey<SliceAggTwoLevelHashSet<PhmapSeed1>> ser_set(64, &statistics);
+
+    size_t next_id = 0;
+    for (size_t chunk_size : {size_t(64), size_t(11), size_t(32)}) {
+        auto bin = BinaryColumn::create();
+        auto null_col = NullColumn::create(chunk_size, 0);
+        auto int_col = Int32Column::create();
+        for (size_t i = 0; i < chunk_size; ++i) {
+            std::string s = "varying_chunk_key_" + std::to_string(next_id++);
+            bin->append(Slice(s));
+            int_col->append(static_cast<int32_t>(i));
+        }
+        Columns str_cols{bin};
+        Columns null_cols{NullableColumn::create(bin, null_col)};
+        Columns ser_cols{bin, int_col};
+
+        str_set.build_hash_set(chunk_size, str_cols, &pool);
+        null_str_set.build_hash_set(chunk_size, null_cols, &pool);
+        ser_set.build_hash_set(chunk_size, ser_cols, &pool);
+    }
+
+    EXPECT_EQ(next_id, str_set.hash_set.size());
+    EXPECT_EQ(next_id, null_str_set.hash_set.size());
+    EXPECT_EQ(next_id, ser_set.hash_set.size());
 }
 
 } // namespace starrocks
