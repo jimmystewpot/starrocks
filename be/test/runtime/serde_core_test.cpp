@@ -1251,15 +1251,18 @@ TEST(ColumnArraySerdeTest, streamvbyte_golden_wire_determinism) {
         ASSERT_EQ(0, std::memcmp(serde_buf.data() + kHeaderSize, v051_payload, v051_payload_size));
 
         // 2. Construct a standalone serialized buffer directly from the fixed 0.5.1 fixture
-        //    (without calling the encoder under test) and verify the current decoder reads it.
-        std::vector<uint8_t> legacy_v051_buf(kHeaderSize + v051_payload_size);
+        //    (without calling the encoder under test) with STREAMVBYTE_PADDING readable trailing
+        //    bytes required by streamvbyte_decode / streamvbyte_delta_decode, while keeping
+        //    legacy_end at the logical header + payload boundary.
+        const size_t logical_bytes = kHeaderSize + v051_payload_size;
+        std::vector<uint8_t> legacy_v051_buf(logical_bytes + STREAMVBYTE_PADDING, 0);
         encode_fixed32_le(legacy_v051_buf.data(), static_cast<uint32_t>(kCount * sizeof(int32_t)));
         encode_fixed64_le(legacy_v051_buf.data() + sizeof(uint32_t), static_cast<uint64_t>(v051_payload_size));
         std::memcpy(legacy_v051_buf.data() + kHeaderSize, v051_payload, v051_payload_size);
 
         auto restored = Int32Column::create();
         restored->resize(kCount);
-        const uint8_t* legacy_end = legacy_v051_buf.data() + legacy_v051_buf.size();
+        const uint8_t* legacy_end = legacy_v051_buf.data() + logical_bytes;
         ASSIGN_OR_ABORT(const uint8_t* read_end, ColumnArraySerde::deserialize(legacy_v051_buf.data(), legacy_end,
                                                                                restored.get(), sorted, kEncodeLevel));
         ASSERT_EQ(legacy_end, read_end);
