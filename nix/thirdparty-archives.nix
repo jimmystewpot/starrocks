@@ -344,10 +344,10 @@ let
       md5 = "774561443bc372ec6e8e56f46f3e9f4a";
       sha256 = "04wpgq7bq923bh2fbp9g2ljqd8svx8k5rvfa99bqjrxnfmnhn3hp";
     };
-    "streamvbyte-0.5.1.tar.gz" = {
-      url = "https://github.com/lemire/streamvbyte/archive/refs/tags/v0.5.1.tar.gz";
-      md5 = "251d9200d27dda9120653b4928a23a86";
-      sha256 = "0287mwpqc83rgs7rmc3iilsl6bnnldf8791ppgs7j2zrh8sl1wmh";
+    "streamvbyte-3.2.1.tar.gz" = {
+      url = "https://github.com/lemire/streamvbyte/archive/refs/tags/v3.2.1.tar.gz";
+      md5 = "a3fdf67a593aecd7797e51cbb55ebd0f";
+      sha256 = "0fpyl547ad225f4xy3xl3p9ryl1advxj4jf4z4sjgia76gyrb0c3";
     };
     "thrift-0.24.0.tar.gz" = {
       url = "https://archive.apache.org/dist/thrift/0.24.0/thrift-0.24.0.tar.gz";
@@ -522,7 +522,7 @@ let
       "opentelemetry-cpp-v1.9.1.tar.gz"
       "google_benchmark-1.9.5.tar.gz"
       "fast-float-8.2.10.tar.gz"
-      "streamvbyte-0.5.1.tar.gz"
+      "streamvbyte-3.2.1.tar.gz"
       "jansson-2.14.tar.gz"
       "avro-release-1.12.0.tar.gz"
       "libserdes-7.3.1.tar.gz"
@@ -596,7 +596,7 @@ let
       "opentelemetry-cpp-v1.9.1.tar.gz"
       "google_benchmark-1.9.5.tar.gz"
       "fast-float-8.2.10.tar.gz"
-      "streamvbyte-0.5.1.tar.gz"
+      "streamvbyte-3.2.1.tar.gz"
       "jansson-2.14.tar.gz"
       "avro-release-1.12.0.tar.gz"
       "libserdes-7.3.1.tar.gz"
@@ -670,7 +670,7 @@ let
       "opentelemetry-cpp-v1.9.1.tar.gz"
       "google_benchmark-1.9.5.tar.gz"
       "fast-float-8.2.10.tar.gz"
-      "streamvbyte-0.5.1.tar.gz"
+      "streamvbyte-3.2.1.tar.gz"
       "jansson-2.14.tar.gz"
       "avro-release-1.12.0.tar.gz"
       "libserdes-7.3.1.tar.gz"

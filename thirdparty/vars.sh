@@ -365,10 +365,11 @@ FAST_FLOAT_SOURCE="fast-float-8.2.10"
 FAST_FLOAT_MD5SUM="ddcf64ffe15f1e1ed964a355db7a04f3"
 
 # streamvbyte
-STREAMVBYTE_DOWNLOAD="https://github.com/lemire/streamvbyte/archive/refs/tags/v0.5.1.tar.gz"
-STREAMVBYTE_NAME="streamvbyte-0.5.1.tar.gz"
-STREAMVBYTE_SOURCE="streamvbyte-0.5.1"
-STREAMVBYTE_MD5SUM="251d9200d27dda9120653b4928a23a86"
+STREAMVBYTE_VERSION=3.2.1
+STREAMVBYTE_DOWNLOAD="https://github.com/lemire/streamvbyte/archive/refs/tags/v${STREAMVBYTE_VERSION}.tar.gz"
+STREAMVBYTE_NAME=streamvbyte-${STREAMVBYTE_VERSION}.tar.gz
+STREAMVBYTE_SOURCE=streamvbyte-${STREAMVBYTE_VERSION}
+STREAMVBYTE_MD5SUM="a3fdf67a593aecd7797e51cbb55ebd0f"
 
 # jansson
 JANSSON_DOWNLOAD="https://github.com/akheron/jansson/releases/download/v2.14/jansson-2.14.tar.gz"
