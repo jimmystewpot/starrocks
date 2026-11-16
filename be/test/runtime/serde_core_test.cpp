@@ -1344,18 +1344,21 @@ TEST(ColumnArraySerdeTest, corrupted_payload_bounds_check) {
 
     std::vector<uint8_t> buffer(ColumnArraySerde::max_serialized_size(*col, kEncodeLevel) + 32, 0);
     ASSIGN_OR_ABORT(uint8_t* write_end, ColumnArraySerde::serialize(*col, buffer.data(), false, kEncodeLevel));
+    const size_t serialized_bytes = static_cast<size_t>(write_end - buffer.data());
     const uint64_t compressed_bytes = decode_fixed64_le(buffer.data() + sizeof(uint32_t));
 
     // 1. Corrupt compressed_bytes header (+8 bytes while keeping end large enough) -> encode_size != decode_size.
     {
         auto corrupted = buffer;
         encode_fixed64_le(corrupted.data() + sizeof(uint32_t), compressed_bytes + 8);
-        const uint8_t* padded_end = write_end + 8;
+        const uint8_t* padded_end = corrupted.data() + serialized_bytes + 8;
         auto dst = Int32Column::create();
         dst->resize(kRows);
         auto st = ColumnArraySerde::deserialize(corrupted.data(), padded_end, dst.get(), false, kEncodeLevel);
         ASSERT_FALSE(st.ok());
         ASSERT_TRUE(st.status().is_internal_error()) << st.status();
+        ASSERT_NE(std::string_view::npos, st.status().message().find("encode size does not equal when decoding"))
+                << st.status();
     }
 
     // 2. Truncated buffer (end < buff + sizeof(uint32_t) + sizeof(uint64_t) + compressed_bytes).
@@ -1365,6 +1368,7 @@ TEST(ColumnArraySerdeTest, corrupted_payload_bounds_check) {
         auto st = ColumnArraySerde::deserialize(buffer.data(), write_end - 1, dst.get(), false, kEncodeLevel);
         ASSERT_FALSE(st.ok());
         ASSERT_TRUE(st.status().is_internal_error()) << st.status();
+        ASSERT_NE(std::string_view::npos, st.status().message().find("Expected remains size")) << st.status();
     }
 }
 
