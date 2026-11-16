@@ -308,8 +308,12 @@ public:
         return false;
     }
 
+    virtual void set_offset_only(bool v) { _is_offset_only = v; }
+    bool is_offset_only() const { return _is_offset_only; }
+
 protected:
     ColumnIteratorOptions _opts;
+    bool _is_offset_only = false;
 };
 
 using ColumnIteratorUPtr = std::unique_ptr<ColumnIterator>;

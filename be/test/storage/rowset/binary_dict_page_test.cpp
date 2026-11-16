@@ -592,4 +592,272 @@ TEST_F(BinaryDictPageTest, TestNextBatchWithFilterAllDictRejectedAdvancesCursor)
     ASSERT_EQ(8, page_decoder.current_index());
 }
 
+TEST_F(BinaryDictPageTest, TestOffsetOnlyNullableDecodeAndPredicates) {
+    auto compare_nullable_offset_only_vs_eager = [](const Column* offset_col, const Column* eager_col) {
+        offset_col->check_or_die();
+        eager_col->check_or_die();
+
+        const auto* offset_null = down_cast<const NullableColumn*>(offset_col);
+        const auto* eager_null = down_cast<const NullableColumn*>(eager_col);
+        ASSERT_EQ(eager_null->size(), offset_null->size());
+        ASSERT_EQ(eager_null->has_null(), offset_null->has_null());
+
+        const auto& offset_null_flags = offset_null->immutable_null_column_data();
+        const auto& eager_null_flags = eager_null->immutable_null_column_data();
+        ASSERT_EQ(eager_null_flags.size(), offset_null_flags.size());
+
+        const auto* offset_bin = down_cast<const BinaryColumn*>(offset_null->data_column().get());
+        const auto* eager_bin = down_cast<const BinaryColumn*>(eager_null->data_column().get());
+        ASSERT_TRUE(offset_bin->is_offset_only());
+        ASSERT_FALSE(eager_bin->is_offset_only());
+        ASSERT_EQ(0u, offset_bin->get_immutable_bytes().size());
+
+        const auto offset_offsets = offset_bin->get_offset();
+        const auto eager_offsets = eager_bin->get_offset();
+        ASSERT_EQ(offset_null->size() + 1, offset_offsets.size());
+        ASSERT_EQ(eager_null->size() + 1, eager_offsets.size());
+
+        for (size_t i = 0; i < offset_null->size(); ++i) {
+            ASSERT_EQ(eager_null_flags[i], offset_null_flags[i]) << "null flag mismatch at row " << i;
+            if (offset_null_flags[i] == 0) {
+                size_t offset_len = offset_offsets[i + 1] - offset_offsets[i];
+                size_t eager_len = eager_offsets[i + 1] - eager_offsets[i];
+                ASSERT_EQ(eager_len, offset_len) << "non-null length mismatch at row " << i;
+                ASSERT_EQ(eager_bin->get_slice(i).size, offset_len) << "slice size mismatch at row " << i;
+            }
+        }
+    };
+
+    // 16 rows mixing NULLs (encoded as "" in data page with null_data[i] == 1), empty strings "", and non-empty strings.
+    const std::vector<std::string> page0_strings = {
+            "",                // 0: NULL
+            "",                // 1: empty
+            "alpha",           // 2: non-empty (5)
+            "beta_longer",     // 3: non-empty (11)
+            "",                // 4: NULL
+            "gamma_val_12345", // 5: non-empty (15)
+            "",                // 6: empty
+            "",                // 7: NULL
+            "alpha",           // 8: non-empty (5)
+            "",                // 9: empty
+            "beta_longer",     // 10: non-empty (11)
+            "",                // 11: NULL
+            "alpha",           // 12: non-empty (5)
+            "",                // 13: empty
+            "",                // 14: NULL
+            "z",               // 15: non-empty (1) - pushes dictionary past dict_page_size
+    };
+    const std::vector<uint8_t> page0_nulls = {
+            1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0,
+    };
+    ASSERT_EQ(page0_strings.size(), page0_nulls.size());
+
+    std::vector<Slice> page0_slices;
+    page0_slices.reserve(page0_strings.size());
+    for (const auto& s : page0_strings) {
+        page0_slices.emplace_back(s);
+    }
+
+    // Small dict_page_size so page 0 uses DICT_ENCODING and overflows the dictionary on its last row,
+    // causing page 1 after reset() to fall back to PLAIN_ENCODING.
+    PageBuilderOptions options;
+    options.data_page_size = 256 * 1024;
+    options.dict_page_size = 52;
+    BinaryDictPageBuilder page_builder(options);
+
+    size_t count0 = page0_slices.size();
+    const Slice* ptr0 = page0_slices.data();
+    ASSERT_EQ(count0, page_builder.add(reinterpret_cast<const uint8_t*>(ptr0), count0));
+    ASSERT_TRUE(page_builder.is_page_full());
+    ASSERT_TRUE(page_builder.all_dict_encoded());
+    OwnedSlice page0_owned = page_builder.finish()->build();
+
+    // Resetting after dictionary full transitions builder to PLAIN_ENCODING for the fallback page.
+    page_builder.reset();
+
+    const std::vector<std::string> page1_strings = {
+            "",                        // 0: empty
+            "",                        // 1: NULL
+            "plain_fallback_short",    // 2: non-empty (20)
+            "",                        // 3: NULL
+            "",                        // 4: empty
+            "plain_fallback_longer_x", // 5: non-empty (23)
+            "k",                       // 6: non-empty (1)
+            "",                        // 7: NULL
+            "",                        // 8: empty
+            "plain_fallback_short",    // 9: non-empty (20)
+            "",                        // 10: NULL
+            "tail_value_99",           // 11: non-empty (13)
+    };
+    const std::vector<uint8_t> page1_nulls = {
+            0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0,
+    };
+    ASSERT_EQ(page1_strings.size(), page1_nulls.size());
+
+    std::vector<Slice> page1_slices;
+    page1_slices.reserve(page1_strings.size());
+    for (const auto& s : page1_strings) {
+        page1_slices.emplace_back(s);
+    }
+    size_t count1 = page1_slices.size();
+    const Slice* ptr1 = page1_slices.data();
+    ASSERT_EQ(count1, page_builder.add(reinterpret_cast<const uint8_t*>(ptr1), count1));
+    OwnedSlice page1_owned = page_builder.finish()->build();
+    ASSERT_FALSE(page_builder.all_dict_encoded());
+
+    OwnedSlice dict_slice = page_builder.get_dictionary_page()->build();
+    auto dict_page_decoder = std::make_unique<BinaryPlainPageDecoder<TYPE_VARCHAR>>(dict_slice.slice());
+    ASSERT_TRUE(dict_page_decoder->init().ok());
+
+    auto decode_raw_page = [](const OwnedSlice& owned, std::unique_ptr<std::vector<uint8_t>>* page_buf,
+                              Slice* out_slice) {
+        *out_slice = owned.slice();
+        PageFooterPB footer;
+        footer.set_type(DATA_PAGE);
+        footer.mutable_data_page_footer()->set_nullmap_size(0);
+        ASSERT_TRUE(StoragePageDecoder::decode_page(&footer, 0, starrocks::DICT_ENCODING, page_buf, out_slice).ok());
+    };
+
+    std::unique_ptr<std::vector<uint8_t>> page0_buf;
+    Slice page0_encoded;
+    decode_raw_page(page0_owned, &page0_buf, &page0_encoded);
+
+    std::unique_ptr<std::vector<uint8_t>> page1_buf;
+    Slice page1_encoded;
+    decode_raw_page(page1_owned, &page1_buf, &page1_encoded);
+
+    auto make_decoder = [&](const Slice& encoded_data, EncodingTypePB expected_encoding, bool offset_only,
+                            bool set_before_init) {
+        auto decoder = std::make_unique<BinaryDictPageDecoder<TYPE_VARCHAR>>(encoded_data);
+        decoder->set_dict_decoder(dict_page_decoder.get());
+        if (offset_only && set_before_init) {
+            decoder->set_offset_only(true);
+        }
+        Status st = decoder->init();
+        EXPECT_TRUE(st.ok()) << st.to_string();
+        EXPECT_EQ(expected_encoding, decoder->encoding_type());
+        if (offset_only && !set_before_init) {
+            decoder->set_offset_only(true);
+        }
+        return decoder;
+    };
+
+    // Predicates compatible with offset-only columns: col <> '', col = '', col IS NOT NULL, col IS NULL.
+    std::vector<std::unique_ptr<ColumnPredicate>> pred_holders;
+    pred_holders.emplace_back(new_column_ne_predicate(get_type_info(TYPE_VARCHAR), 0, ""));
+    pred_holders.emplace_back(new_column_eq_predicate(get_type_info(TYPE_VARCHAR), 0, ""));
+    pred_holders.emplace_back(new_column_null_predicate(get_type_info(TYPE_VARCHAR), 0, false));
+    pred_holders.emplace_back(new_column_null_predicate(get_type_info(TYPE_VARCHAR), 0, true));
+
+    auto verify_page_decodes = [&](const Slice& encoded_data, EncodingTypePB expected_encoding,
+                                   const std::vector<uint8_t>& page_nulls, const SparseRange<>& multi_range,
+                                   const SparseRange<>& single_range, const std::vector<rowid_t>& rowids) {
+        for (bool set_before_init : {true, false}) {
+            // Subcase A & C: Sparse filtered reads (next_batch_with_filter) across multi-range with gaps
+            // and single-range, both with null_data != nullptr and null_data == nullptr.
+            for (const SparseRange<>& range : {multi_range, single_range}) {
+                const size_t num_rows = range.span_size();
+                for (const auto& pred_ptr : pred_holders) {
+                    std::vector<const ColumnPredicate*> preds{pred_ptr.get()};
+
+                    for (const uint8_t* null_data_ptr : {page_nulls.data(), static_cast<const uint8_t*>(nullptr)}) {
+                        auto eager_dec = make_decoder(encoded_data, expected_encoding, false, set_before_init);
+                        auto offset_dec = make_decoder(encoded_data, expected_encoding, true, set_before_init);
+
+                        auto eager_col = ChunkFactory::column_from_field_type(TYPE_VARCHAR, true);
+                        auto offset_col = ChunkFactory::column_from_field_type(TYPE_VARCHAR, true);
+
+                        std::vector<uint8_t> eager_sel(num_rows, 0);
+                        std::vector<uint8_t> offset_sel(num_rows, 0);
+                        std::vector<uint16_t> eager_idx(num_rows, 0);
+                        std::vector<uint16_t> offset_idx(num_rows, 0);
+
+                        Status st1 = eager_dec->next_batch_with_filter(eager_col.get(), range, preds, null_data_ptr,
+                                                                       eager_sel.data(), eager_idx.data());
+                        Status st2 = offset_dec->next_batch_with_filter(offset_col.get(), range, preds, null_data_ptr,
+                                                                        offset_sel.data(), offset_idx.data());
+                        ASSERT_TRUE(st1.ok()) << st1.to_string();
+                        ASSERT_TRUE(st2.ok()) << st2.to_string();
+                        ASSERT_EQ(eager_sel, offset_sel);
+                        ASSERT_EQ(eager_dec->current_index(), offset_dec->current_index());
+                        compare_nullable_offset_only_vs_eager(offset_col.get(), eager_col.get());
+                    }
+                }
+
+                // Also verify unfiltered next_batch(SparseRange<>, Column*) into NullableColumn with null flags.
+                auto populate_null_flags_for_range = [&](NullableColumn* nullable_col) {
+                    auto* null_col = nullable_col->null_column_raw_ptr();
+                    for (size_t i = 0; i < range.size(); ++i) {
+                        Range<> r = range[i];
+                        null_col->append_numbers(page_nulls.data() + r.begin(), r.span_size() * sizeof(uint8_t));
+                    }
+                    nullable_col->update_has_null();
+                };
+
+                auto eager_dec = make_decoder(encoded_data, expected_encoding, false, set_before_init);
+                auto offset_dec = make_decoder(encoded_data, expected_encoding, true, set_before_init);
+
+                auto eager_col = ChunkFactory::column_from_field_type(TYPE_VARCHAR, true);
+                auto offset_col = ChunkFactory::column_from_field_type(TYPE_VARCHAR, true);
+                auto* eager_nullable = down_cast<NullableColumn*>(eager_col.get());
+                auto* offset_nullable = down_cast<NullableColumn*>(offset_col.get());
+
+                ASSERT_TRUE(eager_dec->next_batch(range, eager_nullable->data_column_raw_ptr()).ok());
+                ASSERT_TRUE(offset_dec->next_batch(range, offset_nullable->data_column_raw_ptr()).ok());
+                populate_null_flags_for_range(eager_nullable);
+                populate_null_flags_for_range(offset_nullable);
+                compare_nullable_offset_only_vs_eager(offset_col.get(), eager_col.get());
+            }
+
+            // Subcase B & C: Row-ID reads (read_by_rowids) into NullableColumn (both direct and with page null map).
+            {
+                auto eager_dec = make_decoder(encoded_data, expected_encoding, false, set_before_init);
+                auto offset_dec = make_decoder(encoded_data, expected_encoding, true, set_before_init);
+
+                auto eager_col = ChunkFactory::column_from_field_type(TYPE_VARCHAR, true);
+                auto offset_col = ChunkFactory::column_from_field_type(TYPE_VARCHAR, true);
+
+                size_t eager_read = rowids.size();
+                size_t offset_read = rowids.size();
+                ASSERT_TRUE(eager_dec->read_by_rowids(0, rowids.data(), &eager_read, eager_col.get()).ok());
+                ASSERT_TRUE(offset_dec->read_by_rowids(0, rowids.data(), &offset_read, offset_col.get()).ok());
+                ASSERT_EQ(rowids.size(), eager_read);
+                ASSERT_EQ(rowids.size(), offset_read);
+                compare_nullable_offset_only_vs_eager(offset_col.get(), eager_col.get());
+
+                // Apply the page's null flags for the requested rowids (matching ParsedPageV2::read_by_rowids)
+                // and verify null flags and non-null lengths match eager decoding.
+                auto* eager_nullable = down_cast<NullableColumn*>(eager_col.get());
+                auto* offset_nullable = down_cast<NullableColumn*>(offset_col.get());
+                for (size_t i = 0; i < rowids.size(); ++i) {
+                    eager_nullable->null_column_data()[i] = page_nulls[rowids[i]];
+                    offset_nullable->null_column_data()[i] = page_nulls[rowids[i]];
+                }
+                eager_nullable->update_has_null();
+                offset_nullable->update_has_null();
+                compare_nullable_offset_only_vs_eager(offset_col.get(), eager_col.get());
+            }
+        }
+    };
+
+    // Page 0 (DICT_ENCODING): multi-range with gaps [0, 3), [5, 9), [11, 16), single-range [2, 14), and rowids.
+    SparseRange<> page0_multi_range;
+    page0_multi_range.add(Range<>(0, 3));
+    page0_multi_range.add(Range<>(5, 9));
+    page0_multi_range.add(Range<>(11, 16));
+    SparseRange<> page0_single_range(2, 14);
+    std::vector<rowid_t> page0_rowids = {0, 1, 2, 4, 5, 6, 7, 11, 12, 13, 15};
+    verify_page_decodes(page0_encoded, DICT_ENCODING, page0_nulls, page0_multi_range, page0_single_range, page0_rowids);
+
+    // Page 1 (PLAIN_ENCODING fallback): multi-range with gaps [0, 4), [5, 8), [9, 12), single-range [1, 11), and rowids.
+    SparseRange<> page1_multi_range;
+    page1_multi_range.add(Range<>(0, 4));
+    page1_multi_range.add(Range<>(5, 8));
+    page1_multi_range.add(Range<>(9, 12));
+    SparseRange<> page1_single_range(1, 11);
+    std::vector<rowid_t> page1_rowids = {0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11};
+    verify_page_decodes(page1_encoded, PLAIN_ENCODING, page1_nulls, page1_multi_range, page1_single_range,
+                        page1_rowids);
+}
+
 } // namespace starrocks

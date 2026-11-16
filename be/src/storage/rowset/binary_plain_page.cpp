@@ -238,11 +238,69 @@ Status BinaryPlainPageDecoder<Type>::next_batch(const SparseRange<>& range, Colu
 }
 
 template <LogicalType Type>
+bool BinaryPlainPageDecoder<Type>::append_range_offsets_only(uint32_t idx, uint32_t end, Column* dst) const {
+    if constexpr (Type == TYPE_VARCHAR) {
+        auto* data_column = ColumnHelper::get_data_column(dst);
+        auto* binary_col = down_cast<BinaryColumn*>(data_column);
+        binary_col->set_offset_only(true);
+        auto& offsets = binary_col->get_offset();
+        DCHECK_GE(offsets.size(), 1);
+        if (UNLIKELY(idx >= end)) {
+            return true;
+        }
+
+        const uint64_t begin_offset = offsets.back();
+        size_t current_offset_sz = offsets.size();
+        const uint32_t page_data_offset = offset_uncheck(idx);
+        const uint32_t append_bytes_length = offset(end) - page_data_offset;
+        const uint64_t final_offset = begin_offset + append_bytes_length;
+        offsets.resize_uninitialized(current_offset_sz + end - idx, final_offset);
+        offsets.visit_storage([&](auto& offsets_buf) {
+            using OffsetValue = typename std::decay_t<decltype(offsets_buf)>::value_type;
+            auto* dst_offsets = offsets_buf.data() + current_offset_sz;
+            // vectorized loop
+            for (uint32_t i = idx; i < end - 1; i++) {
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+                auto offset = _offsets_ptr[i + 1];
+#else
+                auto offset = offset_uncheck(i + 1);
+#endif
+                const uint64_t current_offset = begin_offset + static_cast<uint64_t>(offset - page_data_offset);
+                *dst_offsets++ = static_cast<OffsetValue>(current_offset);
+            }
+
+            for (uint32_t i = end - 1; i < end; i++) {
+                const uint64_t current_offset = begin_offset + static_cast<uint64_t>(offset(i + 1) - page_data_offset);
+                *dst_offsets++ = static_cast<OffsetValue>(current_offset);
+            }
+        });
+
+        if (dst->is_nullable()) {
+            auto& null_data = down_cast<NullableColumn*>(dst)->null_column_data();
+            size_t null_data_size = null_data.size();
+            null_data.resize(null_data_size + end - idx, 0);
+        }
+
+#ifndef NDEBUG
+        dst->check_or_die();
+#endif
+        return true;
+    } else {
+        DCHECK(false) << "unreachable path";
+        return false;
+    }
+}
+
+template <LogicalType Type>
 bool BinaryPlainPageDecoder<Type>::append_range(uint32_t idx, uint32_t end, Column* dst) const {
     if constexpr (Type == TYPE_VARCHAR) {
-        auto data_column = ColumnHelper::get_data_column(dst);
-        auto& bytes = down_cast<BinaryColumn*>(data_column)->get_bytes();
-        auto& offsets = down_cast<BinaryColumn*>(data_column)->get_offset();
+        auto* data_column = ColumnHelper::get_data_column(dst);
+        auto* binary_col = down_cast<BinaryColumn*>(data_column);
+        if (_offset_only || binary_col->is_offset_only()) {
+            return append_range_offsets_only(idx, end, dst);
+        }
+        auto& bytes = binary_col->get_bytes();
+        auto& offsets = binary_col->get_offset();
         DCHECK_GE(offsets.size(), 1);
 
         const uint64_t begin_offset = offsets.back();
@@ -393,12 +451,25 @@ Status BinaryPlainPageDecoder<Type>::next_range_with_filter(
             temp_offsets.set(i - idx + 1, current_offset);
         }
 
-        size_t data_length = temp_offsets.back();
-        const void* data_ptr = _data.get_data() + page_data_offset;
+        auto* data_column = ColumnHelper::get_data_column(dst);
+        auto* dst_binary_col = down_cast<BinaryColumn*>(data_column);
+        const bool offset_only_mode = _offset_only || dst_binary_col->is_offset_only();
+        if (offset_only_mode) {
+            dst_binary_col->set_offset_only(true);
+        }
 
-        // Create zero-copy BinaryColumn directly from page
-        ContainerResource container(_page_handle, data_ptr, data_length);
-        auto temp_data_column = BinaryColumn::create(container, std::move(temp_offsets));
+        MutableColumnPtr temp_data_column;
+        if (offset_only_mode) {
+            auto col = BinaryColumn::create(BinaryColumn::Bytes(), std::move(temp_offsets));
+            col->set_offset_only(true);
+            temp_data_column = std::move(col);
+        } else {
+            size_t data_length = temp_offsets.back();
+            const void* data_ptr = _data.get_data() + page_data_offset;
+            // Create zero-copy BinaryColumn directly from page
+            ContainerResource container(_page_handle, data_ptr, data_length);
+            temp_data_column = BinaryColumn::create(container, std::move(temp_offsets));
+        }
 
         // Create temporary column for predicate evaluation
         ColumnPtr temp_eval_column;
@@ -406,10 +477,10 @@ Status BinaryPlainPageDecoder<Type>::next_range_with_filter(
             // If null data is provided, create a NullableColumn for predicate evaluation
             auto temp_null_column = NullColumn::create();
             temp_null_column->append_numbers(null, num_rows);
-            temp_eval_column = NullableColumn::create(temp_data_column, temp_null_column);
+            temp_eval_column = NullableColumn::create(temp_data_column->as_mutable_ptr(), std::move(temp_null_column));
         } else {
             // No null data, use data column directly
-            temp_eval_column = temp_data_column;
+            temp_eval_column = temp_data_column->get_ptr();
         }
 
         // Evaluate predicates on the temporary column
@@ -421,7 +492,6 @@ Status BinaryPlainPageDecoder<Type>::next_range_with_filter(
             return Status::OK();
         }
 
-        auto data_column = ColumnHelper::get_data_column(dst);
         RETURN_IF_ERROR(append_with_mask</*PositiveSelect=*/true>(data_column, *temp_data_column, selection, num_rows));
 
         if (dst->is_nullable()) {
@@ -458,6 +528,43 @@ Status BinaryPlainPageDecoder<Type>::read_by_rowids(const ordinal_t first_ordina
         return Status::OK();
     }
     size_t total = *count;
+    if constexpr (Type == TYPE_VARCHAR) {
+        auto* data_column = ColumnHelper::get_data_column(column);
+        auto* binary_col = down_cast<BinaryColumn*>(data_column);
+        if (_offset_only || binary_col->is_offset_only()) {
+            binary_col->set_offset_only(true);
+            auto& offsets = binary_col->get_offset();
+            const size_t prev_num_offsets = offsets.size();
+            const uint64_t dst_begin = offsets.back();
+            uint64_t cur_offset = dst_begin;
+            size_t valid_total = 0;
+            for (size_t i = 0; i < total; i++) {
+                ordinal_t ord = rowids[i] - first_ordinal_in_page;
+                if (UNLIKELY(ord >= _num_elems)) {
+                    break;
+                }
+                cur_offset += string_length_at_index(ord);
+                valid_total++;
+            }
+            offsets.resize_uninitialized(prev_num_offsets + valid_total, cur_offset);
+            offsets.visit_storage([&](auto& dst_buf) {
+                using DstValue = typename std::decay_t<decltype(dst_buf)>::value_type;
+                auto* __restrict dst_offsets = dst_buf.data() + prev_num_offsets;
+                uint64_t running = dst_begin;
+                for (size_t i = 0; i < valid_total; i++) {
+                    ordinal_t ord = rowids[i] - first_ordinal_in_page;
+                    running += string_length_at_index(ord);
+                    dst_offsets[i] = static_cast<DstValue>(running);
+                }
+            });
+            if (column->is_nullable()) {
+                auto& null_data = down_cast<NullableColumn*>(column)->null_column_data();
+                null_data.resize(null_data.size() + valid_total, 0);
+            }
+            *count = valid_total;
+            return Status::OK();
+        }
+    }
     static_assert(sizeof(Slice) == sizeof(int128_t));
     auto slices_data = std::make_unique_for_overwrite<uint8_t[]>(total * sizeof(Slice));
     Slice* slices = reinterpret_cast<Slice*>(slices_data.get());

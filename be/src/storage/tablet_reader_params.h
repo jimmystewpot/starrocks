@@ -96,6 +96,7 @@ struct TabletReaderParams {
 
     ColumnIdToGlobalDictMap* global_dictmaps = &EMPTY_GLOBAL_DICTMAPS;
     const std::unordered_set<uint32_t>* unused_output_column_ids = &EMPTY_FILTERED_COLUMN_IDS;
+    const std::unordered_set<uint32_t>* offset_only_column_ids = &EMPTY_FILTERED_COLUMN_IDS;
     RowsetIdToDRSSId* rowset_id_to_drssid = nullptr;
 
     RowidRangeOptionPtr rowid_range_option = nullptr;
@@ -143,5 +144,14 @@ std::string to_string(TabletReaderParams::RangeStartOperation range_start_op);
 std::string to_string(TabletReaderParams::RangeEndOperation range_end_op);
 std::ostream& operator<<(std::ostream& os, TabletReaderParams::RangeStartOperation range_start_op);
 std::ostream& operator<<(std::ostream& os, TabletReaderParams::RangeEndOperation range_end_op);
+
+inline bool tablet_reader_supports_offset_only(KeysType keys_type, bool skip_aggregation,
+                                               bool sorted_by_keys_per_tablet) {
+    if (sorted_by_keys_per_tablet) {
+        return false;
+    }
+    return keys_type == KeysType::DUP_KEYS || keys_type == KeysType::PRIMARY_KEYS ||
+           (keys_type == KeysType::UNIQUE_KEYS && skip_aggregation);
+}
 
 } // namespace starrocks

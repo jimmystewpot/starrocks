@@ -483,6 +483,9 @@ Status ScalarColumnIterator::_read_data_page(const OrdinalPageIndexIterator& ite
     RETURN_IF_ERROR(_reader->read_page(_opts, iter.page(), &handle, &page_body, &footer));
     RETURN_IF_ERROR(parse_page(&_page, std::move(handle), page_body, footer.data_page_footer(),
                                _reader->encoding_info(), iter.page(), iter.page_index()));
+    if (_is_offset_only && _page->data_decoder() != nullptr) {
+        _page->data_decoder()->set_offset_only(true);
+    }
 
     // dictionary page is read when the first data page that uses it is read,
     // this is to optimize the memory usage: when there is no query on one column, we could
@@ -781,6 +784,40 @@ Status ScalarColumnIterator::_do_next_batch_dict_codes(const SparseRange<>& rang
 template <LogicalType Type>
 Status ScalarColumnIterator::_do_decode_dict_codes(const int32_t* codes, size_t size, Column* words) {
     auto dict = down_cast<BinaryPlainPageDecoder<Type>*>(_dict_decoder.get());
+    if constexpr (Type == TYPE_VARCHAR) {
+        auto* data_col = ColumnHelper::get_data_column(words);
+        auto* binary_col = down_cast<BinaryColumn*>(data_col);
+        if (_is_offset_only || binary_col->is_offset_only()) {
+            binary_col->set_offset_only(true);
+            auto& offsets = binary_col->get_offset();
+            const size_t prev_num_offsets = offsets.size();
+            const uint64_t dst_begin = offsets.back();
+            uint64_t cur_offset = dst_begin;
+            for (size_t i = 0; i < size; i++) {
+                if (codes[i] >= 0) {
+                    cur_offset += dict->string_length_at_index(codes[i]);
+                }
+            }
+            offsets.resize_uninitialized(prev_num_offsets + size, cur_offset);
+            offsets.visit_storage([&](auto& dst_buf) {
+                using DstValue = typename std::decay_t<decltype(dst_buf)>::value_type;
+                auto* __restrict dst_offsets = dst_buf.data() + prev_num_offsets;
+                uint64_t running = dst_begin;
+                for (size_t i = 0; i < size; i++) {
+                    if (codes[i] >= 0) {
+                        running += dict->string_length_at_index(codes[i]);
+                    }
+                    dst_offsets[i] = static_cast<DstValue>(running);
+                }
+            });
+            if (words->is_nullable()) {
+                auto& null_data = down_cast<NullableColumn*>(words)->null_column_data();
+                null_data.resize(null_data.size() + size, 0);
+            }
+            _opts.stats->bytes_read += static_cast<int64_t>(words->byte_size() + BitmapSize(size));
+            return Status::OK();
+        }
+    }
     std::vector<Slice> slices;
     slices.reserve(size);
     for (size_t i = 0; i < size; i++) {

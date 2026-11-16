@@ -114,6 +114,7 @@ private:
 
     // unused ouput columns
     std::unordered_set<uint32_t> _unused_output_column_ids;
+    std::unordered_set<uint32_t> _offset_only_column_ids;
 
     // projection iterator, doing the job of choosing |_scanner_columns| from |_reader_columns|.
     std::shared_ptr<ChunkIterator> _prj_iter;

@@ -73,6 +73,8 @@ Status SegmentReadOptions::convert_to(SegmentReadOptions* dst, const std::vector
     dst->temporary_data = temporary_data;
     dst->profile = profile;
     dst->global_dictmaps = global_dictmaps;
+    dst->unused_output_column_ids = unused_output_column_ids;
+    dst->offset_only_column_ids = offset_only_column_ids;
     dst->rowid_range_option = rowid_range_option;
     dst->read_state_cache = read_state_cache;
     dst->short_key_ranges = short_key_ranges;

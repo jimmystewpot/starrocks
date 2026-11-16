@@ -24,6 +24,7 @@
 #include "storage/rowset/rowset.h"
 #include "storage/rowset/rowset_meta.h"
 #include "storage/tablet_manager.h"
+#include "storage/tablet_reader_params.h"
 #include "storage_primitive/flat_json_config.h"
 #include "storage_primitive/tablet_basic_info.h"
 
@@ -203,5 +204,27 @@ TEST_F(TabletTest, test_get_average_row_size_holds_meta_lock) {
     tablet->release_header_lock();
     reader.join();
     EXPECT_TRUE(finished.load(std::memory_order_acquire));
+}
+
+TEST_F(TabletTest, test_tablet_reader_supports_offset_only) {
+    EXPECT_TRUE(tablet_reader_supports_offset_only(KeysType::DUP_KEYS, false, false));
+    EXPECT_TRUE(tablet_reader_supports_offset_only(KeysType::DUP_KEYS, true, false));
+    EXPECT_FALSE(tablet_reader_supports_offset_only(KeysType::DUP_KEYS, false, true));
+    EXPECT_FALSE(tablet_reader_supports_offset_only(KeysType::DUP_KEYS, true, true));
+
+    EXPECT_TRUE(tablet_reader_supports_offset_only(KeysType::PRIMARY_KEYS, false, false));
+    EXPECT_TRUE(tablet_reader_supports_offset_only(KeysType::PRIMARY_KEYS, true, false));
+    EXPECT_FALSE(tablet_reader_supports_offset_only(KeysType::PRIMARY_KEYS, false, true));
+    EXPECT_FALSE(tablet_reader_supports_offset_only(KeysType::PRIMARY_KEYS, true, true));
+
+    EXPECT_FALSE(tablet_reader_supports_offset_only(KeysType::UNIQUE_KEYS, false, false));
+    EXPECT_TRUE(tablet_reader_supports_offset_only(KeysType::UNIQUE_KEYS, true, false));
+    EXPECT_FALSE(tablet_reader_supports_offset_only(KeysType::UNIQUE_KEYS, false, true));
+    EXPECT_FALSE(tablet_reader_supports_offset_only(KeysType::UNIQUE_KEYS, true, true));
+
+    EXPECT_FALSE(tablet_reader_supports_offset_only(KeysType::AGG_KEYS, false, false));
+    EXPECT_FALSE(tablet_reader_supports_offset_only(KeysType::AGG_KEYS, true, false));
+    EXPECT_FALSE(tablet_reader_supports_offset_only(KeysType::AGG_KEYS, false, true));
+    EXPECT_FALSE(tablet_reader_supports_offset_only(KeysType::AGG_KEYS, true, true));
 }
 } // namespace starrocks

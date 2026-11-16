@@ -183,6 +183,62 @@ Status TabletScanner::_init_reader_params(const std::vector<OlapScanRange*>* key
     GlobalDictPredicatesRewriter not_pushdown_predicate_rewriter(*_params.global_dictmaps);
     RETURN_IF_ERROR(not_pushdown_predicate_rewriter.rewrite_predicate(&_pool, _pred_tree));
 
+    const bool reader_supports_offset_only = tablet_reader_supports_offset_only(
+            _tablet->keys_type(), _params.skip_aggregation, _params.sorted_by_keys_per_tablet);
+    if (reader_supports_offset_only && _parent != nullptr && _parent->_tuple_desc != nullptr) {
+        std::unordered_set<SlotId> conjuncts_slot_ids;
+        for (auto* expr : _conjunct_ctxs) {
+            expr->root()->for_each_slot_id([&conjuncts_slot_ids](SlotId id) { conjuncts_slot_ids.insert(id); });
+        }
+        for (auto* expr : _parent->get_heavy_expr_ctxs()) {
+            if (expr != nullptr && expr->root() != nullptr) {
+                expr->root()->for_each_slot_id([&conjuncts_slot_ids](SlotId id) { conjuncts_slot_ids.insert(id); });
+            }
+        }
+        for (const auto& [rf_id, rf_desc] : _parent->runtime_filter_collector().descriptors()) {
+            if (rf_desc == nullptr) {
+                continue;
+            }
+            if (rf_desc->probe_expr_ctx() != nullptr && rf_desc->probe_expr_ctx()->root() != nullptr) {
+                rf_desc->probe_expr_ctx()->root()->for_each_slot_id(
+                        [&conjuncts_slot_ids](SlotId id) { conjuncts_slot_ids.insert(id); });
+            }
+            if (rf_desc->partition_by_expr_contexts() != nullptr) {
+                for (auto* part_ctx : *rf_desc->partition_by_expr_contexts()) {
+                    if (part_ctx != nullptr && part_ctx->root() != nullptr) {
+                        part_ctx->root()->for_each_slot_id(
+                                [&conjuncts_slot_ids](SlotId id) { conjuncts_slot_ids.insert(id); });
+                    }
+                }
+            }
+        }
+        const auto& offset_only_slots = _parent->offset_only_slots();
+        const auto& non_pushdown_cids = _pred_tree.column_ids();
+        for (auto* slot : _parent->_tuple_desc->slots()) {
+            if (!slot->is_materialized() || slot->type().type != TYPE_VARCHAR) {
+                continue;
+            }
+            if (conjuncts_slot_ids.contains(slot->id())) {
+                continue;
+            }
+            int32_t fid = _tablet_schema->field_index(slot->col_name());
+            if (fid < 0) {
+                continue;
+            }
+            const auto cid = static_cast<uint32_t>(fid);
+            if (non_pushdown_cids.contains(cid)) {
+                continue;
+            }
+            if (_params.global_dictmaps != nullptr && _params.global_dictmaps->contains(cid)) {
+                continue;
+            }
+            if (offset_only_slots.contains(slot->id()) || _unused_output_column_ids.contains(cid)) {
+                _offset_only_column_ids.insert(cid);
+            }
+        }
+    }
+    _params.offset_only_column_ids = &_offset_only_column_ids;
+
     // Range
     for (auto key_range : *key_ranges) {
         if (key_range->begin_scan_range.size() == 1 && key_range->begin_scan_range.get_value(0) == NEGATIVE_INFINITY) {

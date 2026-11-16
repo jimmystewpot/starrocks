@@ -217,6 +217,7 @@ public:
     Status next_batch(const SparseRange<>& range, Column* dst) override;
 
     bool append_range(uint32_t idx, uint32_t end, Column* dst) const;
+    bool append_range_offsets_only(uint32_t idx, uint32_t end, Column* dst) const;
 
     Status read_by_rowids(const ordinal_t first_ordinal_in_page, const rowid_t* rowids, size_t* count,
                           Column* column) override;
@@ -243,6 +244,10 @@ public:
         const uint32_t start_offset = offset(idx);
         uint32_t len = offset(static_cast<int>(idx) + 1) - start_offset;
         return {&_data[start_offset], len};
+    }
+
+    uint32_t string_length_at_index(uint32_t idx) const {
+        return offset(static_cast<int>(idx) + 1) - offset_uncheck(idx);
     }
 
     void batch_string_at_index(Slice* dst, const int32_t* idx, size_t size) const;
@@ -375,7 +380,12 @@ private:
 
         if (data_col->is_binary() && data_col->capacity() == 0) {
             BinaryColumn* binary_col = down_cast<BinaryColumn*>(data_col);
-            binary_col->reserve(n, n * _estimated_row_size);
+            if (_offset_only || binary_col->is_offset_only()) {
+                binary_col->set_offset_only(true);
+                binary_col->reserve(n);
+            } else {
+                binary_col->reserve(n, n * _estimated_row_size);
+            }
         }
     }
 

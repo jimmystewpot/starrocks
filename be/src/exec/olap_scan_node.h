@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <unordered_set>
 #include <vector>
 
 #include "column/chunk.h"
@@ -104,6 +105,9 @@ public:
     std::optional<bool> partition_order_hint() const override { return _partition_order_hint; }
 
     const std::vector<ExprContext*>& bucket_exprs() const { return _bucket_exprs; }
+
+    void set_offset_only_slots(std::unordered_set<SlotId> slots) { _offset_only_slots = std::move(slots); }
+    const std::unordered_set<SlotId>& offset_only_slots() const { return _offset_only_slots; }
 
 private:
     friend class TabletScanner;
@@ -197,6 +201,7 @@ private:
     std::atomic<int32_t> _closed_scanners{0};
 
     std::vector<std::string> _unused_output_columns;
+    std::unordered_set<SlotId> _offset_only_slots;
 
     // The row sets of tablets will become stale and be deleted, if compaction occurs
     // and these row sets aren't referenced, which will typically happen when the tablets
