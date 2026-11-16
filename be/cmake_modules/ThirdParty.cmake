@@ -269,7 +269,11 @@ add_library(zstd STATIC IMPORTED)
 set_target_properties(zstd PROPERTIES IMPORTED_LOCATION ${ZSTD_LIBRARY})
 
 add_library(streamvbyte STATIC IMPORTED)
-set_target_properties(streamvbyte PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib/libstreamvbyte_static.a)
+if (EXISTS "${THIRDPARTY_DIR}/lib/libstreamvbyte.a")
+    set_target_properties(streamvbyte PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib/libstreamvbyte.a)
+else()
+    set_target_properties(streamvbyte PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib/libstreamvbyte_static.a)
+endif()
 
 starrocks_resolve_thirdparty_library(ARROW_LIBRARY libarrow.a)
 add_library(arrow STATIC IMPORTED)
