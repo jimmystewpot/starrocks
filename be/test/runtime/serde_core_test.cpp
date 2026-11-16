@@ -13,8 +13,11 @@
 // limitations under the License.
 
 #include <gtest/gtest.h>
+#include <streamvbyte.h>
+#include <streamvbytedelta.h>
 
 #include <chrono>
+#include <cstring>
 #include <iostream>
 #include <memory>
 
@@ -33,6 +36,7 @@
 #include "column/field.h"
 #include "column/fixed_length_column.h"
 #include "column/json_column.h"
+#include "column/map_column.h"
 #include "column/nullable_column.h"
 #include "column/schema.h"
 #include "column/serde/column_array_serde.h"
@@ -1018,6 +1022,349 @@ PARALLEL_TEST(ColumnArraySerdeTest, array_column) {
 
         ASSERT_EQ("[1,2,3]", c2->debug_item(0));
         ASSERT_EQ("[4,5,6]", c2->debug_item(1));
+    }
+}
+
+static Status verify_streamvbyte_serde_roundtrip(const Column& src, Column* dst, bool sorted, int encode_level) {
+    std::vector<uint8_t> buffer(ColumnArraySerde::max_serialized_size(src, encode_level));
+    ASSIGN_OR_RETURN(uint8_t* end_ptr, ColumnArraySerde::serialize(src, buffer.data(), sorted, encode_level));
+    if (static_cast<size_t>(end_ptr - buffer.data()) > buffer.size()) {
+        return Status::InternalError("serialized size exceeds max_serialized_size");
+    }
+    ASSIGN_OR_RETURN(const uint8_t* read_end,
+                     ColumnArraySerde::deserialize(buffer.data(), end_ptr, dst, sorted, encode_level));
+    if (read_end != end_ptr) {
+        return Status::InternalError("deserialized end pointer does not match serialized end pointer");
+    }
+    return Status::OK();
+}
+
+// NOLINTNEXTLINE
+TEST(ColumnArraySerdeTest, streamvbyte_int32_unsorted_and_sorted_multiblock_roundtrip) {
+    const std::vector<size_t> i32_counts{64, 65, 95, 128, 257, 1024, 4099};
+    const std::vector<int> encode_levels{2, 7};
+
+    for (size_t count : i32_counts) {
+        // Pattern 1: small deltas (<= 255), exercising keys == 0 16-bit prefix-sum fast path.
+        auto small_delta_col = Int32Column::create();
+        small_delta_col->reserve(count);
+        uint32_t acc_small = 7;
+        for (size_t i = 0; i < count; ++i) {
+            small_delta_col->append(static_cast<int32_t>(acc_small));
+            acc_small += static_cast<uint32_t>((i % 251) + 1);
+        }
+
+        // Pattern 2: multi-width deltas (1B, 2B, 3B, 4B), transitioning from keys == 0 in the first
+        // 64 elements to mixed non-zero keys in subsequent blocks.
+        auto mixed_delta_col = Int32Column::create();
+        mixed_delta_col->reserve(count);
+        uint32_t acc_mixed = 42;
+        for (size_t i = 0; i < count; ++i) {
+            if (i < 64) {
+                acc_mixed += static_cast<uint32_t>((i % 200) + 1);
+            } else {
+                switch (i & 3) {
+                case 0:
+                    acc_mixed += 5u;
+                    break;
+                case 1:
+                    acc_mixed += 1024u;
+                    break;
+                case 2:
+                    acc_mixed += 131072u;
+                    break;
+                default:
+                    acc_mixed += 20000000u;
+                    break;
+                }
+            }
+            mixed_delta_col->append(static_cast<int32_t>(acc_mixed));
+        }
+
+        for (int level : encode_levels) {
+            for (bool sorted : {false, true}) {
+                for (const auto* src : {small_delta_col.get(), mixed_delta_col.get()}) {
+                    auto out = Int32Column::create();
+                    out->resize(src->size());
+                    ASSERT_TRUE(verify_streamvbyte_serde_roundtrip(*src, out.get(), sorted, level).ok())
+                            << "count=" << count << " level=" << level << " sorted=" << sorted;
+                    ASSERT_EQ(src->size(), out->size());
+                    for (size_t i = 0; i < count; ++i) {
+                        ASSERT_EQ(src->get_data()[i], out->get_data()[i])
+                                << "mismatch at index " << i << " count=" << count << " level=" << level
+                                << " sorted=" << sorted;
+                    }
+                }
+            }
+        }
+    }
+
+    // Int64Column across {32, 65, 1024, 4099} with negative values and large 64-bit timestamps.
+    const std::vector<size_t> i64_counts{32, 65, 1024, 4099};
+    for (size_t count : i64_counts) {
+        auto neg_col = Int64Column::create();
+        auto ts_col = Int64Column::create();
+        neg_col->reserve(count);
+        ts_col->reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            neg_col->append(-100000LL - static_cast<int64_t>(i));
+            ts_col->append(1700000000000LL + static_cast<int64_t>(i) * 1000LL);
+        }
+
+        for (int level : encode_levels) {
+            for (bool sorted : {false, true}) {
+                for (const auto* src : {neg_col.get(), ts_col.get()}) {
+                    auto out = Int64Column::create();
+                    out->resize(src->size());
+                    ASSERT_TRUE(verify_streamvbyte_serde_roundtrip(*src, out.get(), sorted, level).ok())
+                            << "i64 count=" << count << " level=" << level << " sorted=" << sorted;
+                    ASSERT_EQ(src->size(), out->size());
+                    for (size_t i = 0; i < count; ++i) {
+                        ASSERT_EQ(src->get_data()[i], out->get_data()[i])
+                                << "i64 mismatch at index " << i << " count=" << count << " level=" << level
+                                << " sorted=" << sorted;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// NOLINTNEXTLINE
+TEST(ColumnArraySerdeTest, streamvbyte_binary_array_map_offsets_roundtrip) {
+    const std::vector<int> encode_levels{2, 7};
+
+    // 1. BinaryColumn: 256 and 1024 rows with short strings (< 256 B) and occasional strings (> 65536 B).
+    for (size_t num_rows : {size_t{256}, size_t{1024}}) {
+        auto bin_src = BinaryColumn::create();
+        std::string large_str(70000, 'L');
+        for (size_t i = 0; i < num_rows; ++i) {
+            if (i == 100 || i == 200) {
+                large_str[0] = static_cast<char>('A' + (i % 26));
+                bin_src->append(Slice(large_str));
+            } else {
+                std::string short_str((i % 37) + 1, static_cast<char>('a' + (i % 26)));
+                bin_src->append(Slice(short_str));
+            }
+        }
+
+        for (int level : encode_levels) {
+            auto bin_dst = BinaryColumn::create();
+            ASSERT_TRUE(verify_streamvbyte_serde_roundtrip(*bin_src, bin_dst.get(), false, level).ok())
+                    << "BinaryColumn rows=" << num_rows << " level=" << level;
+            ASSERT_EQ(bin_src->size(), bin_dst->size());
+            for (size_t i = 0; i < num_rows; ++i) {
+                ASSERT_EQ(bin_src->get_slice(i), bin_dst->get_slice(i))
+                        << "BinaryColumn mismatch at row " << i << " rows=" << num_rows << " level=" << level;
+            }
+        }
+    }
+
+    // 2. ArrayColumn: 256 and 1024 rows at encode_level = 2 and 7.
+    for (size_t num_rows : {size_t{256}, size_t{1024}}) {
+        auto offsets = UInt32Column::create();
+        offsets->append(0);
+        auto elements = NullableColumn::create(Int32Column::create(), NullColumn::create());
+        uint32_t cur_offset = 0;
+        for (size_t i = 0; i < num_rows; ++i) {
+            size_t len = (i % 5);
+            for (size_t j = 0; j < len; ++j) {
+                if ((i + j) % 7 == 0) {
+                    elements->append_nulls(1);
+                } else {
+                    elements->append_datum(Datum(static_cast<int32_t>(i * 10 + j)));
+                }
+            }
+            cur_offset += static_cast<uint32_t>(len);
+            offsets->append(cur_offset);
+        }
+        auto arr_src = ArrayColumn::create(std::move(elements), std::move(offsets));
+
+        for (int level : encode_levels) {
+            auto dst_offsets = UInt32Column::create();
+            auto dst_elements = NullableColumn::create(Int32Column::create(), NullColumn::create());
+            auto arr_dst = ArrayColumn::create(std::move(dst_elements), std::move(dst_offsets));
+            ASSERT_TRUE(verify_streamvbyte_serde_roundtrip(*arr_src, arr_dst.get(), false, level).ok())
+                    << "ArrayColumn rows=" << num_rows << " level=" << level;
+            ASSERT_EQ(arr_src->size(), arr_dst->size());
+            for (size_t i = 0; i < num_rows; ++i) {
+                ASSERT_EQ(arr_src->debug_item(i), arr_dst->debug_item(i))
+                        << "ArrayColumn mismatch at row " << i << " rows=" << num_rows << " level=" << level;
+            }
+        }
+    }
+
+    // 3. MapColumn: 256 rows at encode_level = 2 and 7.
+    {
+        constexpr size_t kMapRows = 256;
+        auto offsets = UInt32Column::create();
+        offsets->append(0);
+        auto keys = NullableColumn::create(Int32Column::create(), NullColumn::create());
+        auto values = NullableColumn::create(Int32Column::create(), NullColumn::create());
+        uint32_t cur_offset = 0;
+        for (size_t i = 0; i < kMapRows; ++i) {
+            size_t entries = (i % 4) + 1;
+            for (size_t j = 0; j < entries; ++j) {
+                keys->append_datum(Datum(static_cast<int32_t>(i * 100 + j)));
+                if ((i + j) % 5 == 0) {
+                    values->append_nulls(1);
+                } else {
+                    values->append_datum(Datum(static_cast<int32_t>(i * 1000 + j)));
+                }
+            }
+            cur_offset += static_cast<uint32_t>(entries);
+            offsets->append(cur_offset);
+        }
+        auto map_src = MapColumn::create(std::move(keys), std::move(values), std::move(offsets));
+
+        for (int level : encode_levels) {
+            auto dst_offsets = UInt32Column::create();
+            auto dst_keys = NullableColumn::create(Int32Column::create(), NullColumn::create());
+            auto dst_values = NullableColumn::create(Int32Column::create(), NullColumn::create());
+            auto map_dst = MapColumn::create(std::move(dst_keys), std::move(dst_values), std::move(dst_offsets));
+            ASSERT_TRUE(verify_streamvbyte_serde_roundtrip(*map_src, map_dst.get(), false, level).ok())
+                    << "MapColumn level=" << level;
+            ASSERT_EQ(map_src->size(), map_dst->size());
+            for (size_t i = 0; i < kMapRows; ++i) {
+                ASSERT_EQ(map_src->debug_item(i), map_dst->debug_item(i))
+                        << "MapColumn mismatch at row " << i << " level=" << level;
+            }
+        }
+    }
+}
+
+// NOLINTNEXTLINE
+TEST(ColumnArraySerdeTest, streamvbyte_golden_wire_determinism) {
+    constexpr size_t kCount = 64;
+    constexpr size_t kHeaderSize = sizeof(uint32_t) + sizeof(uint64_t); // raw_bytes (4B) + compressed_bytes (8B)
+    constexpr int kEncodeLevel = 2;
+
+    // Case 1: Unsorted mixed-width 64-element Int32Column producing 128 compressed bytes
+    // (16 control bytes + 112 data bytes: each 4-int group has widths 1B + 1B + 2B + 3B = 7B).
+    {
+        auto mixed_col = Int32Column::create();
+        for (size_t g = 0; g < kCount / 4; ++g) {
+            mixed_col->append(static_cast<int32_t>(1 + g));         // 1 byte
+            mixed_col->append(static_cast<int32_t>(100 + g));       // 1 byte
+            mixed_col->append(static_cast<int32_t>(300 + g * 17));  // 2 bytes
+            mixed_col->append(static_cast<int32_t>(70000 + g * 3)); // 3 bytes
+        }
+        std::vector<uint8_t> serde_buf(ColumnArraySerde::max_serialized_size(*mixed_col, kEncodeLevel));
+        ASSIGN_OR_ABORT(uint8_t* write_end,
+                        ColumnArraySerde::serialize(*mixed_col, serde_buf.data(), false, kEncodeLevel));
+
+        std::vector<uint8_t> direct_buf(streamvbyte_max_compressedbytes(kCount));
+        size_t direct_bytes =
+                streamvbyte_encode(reinterpret_cast<const uint32_t*>(mixed_col->raw_data()), kCount, direct_buf.data());
+
+        ASSERT_EQ(128u, direct_bytes);
+        ASSERT_EQ(kCount * sizeof(int32_t), decode_fixed32_le(serde_buf.data()));
+        ASSERT_EQ(direct_bytes, decode_fixed64_le(serde_buf.data() + sizeof(uint32_t)));
+        ASSERT_EQ(kHeaderSize + direct_bytes, static_cast<size_t>(write_end - serde_buf.data()));
+        ASSERT_EQ(0, std::memcmp(serde_buf.data() + kHeaderSize, direct_buf.data(), direct_bytes));
+
+        auto restored = Int32Column::create();
+        restored->resize(kCount);
+        ASSIGN_OR_ABORT(const uint8_t* read_end, ColumnArraySerde::deserialize(serde_buf.data(), write_end,
+                                                                               restored.get(), false, kEncodeLevel));
+        ASSERT_EQ(write_end, read_end);
+        ASSERT_EQ(0, std::memcmp(mixed_col->raw_data(), restored->raw_data(), kCount * sizeof(int32_t)));
+    }
+
+    // Case 2: Unsorted 2-byte values where all 16 control bytes are 0x55.
+    {
+        auto two_byte_col = Int32Column::create();
+        for (size_t i = 0; i < kCount; ++i) {
+            two_byte_col->append(static_cast<int32_t>(256 + i * 3));
+        }
+        std::vector<uint8_t> serde_buf(ColumnArraySerde::max_serialized_size(*two_byte_col, kEncodeLevel));
+        ASSIGN_OR_ABORT(uint8_t* write_end,
+                        ColumnArraySerde::serialize(*two_byte_col, serde_buf.data(), false, kEncodeLevel));
+
+        std::vector<uint8_t> direct_buf(streamvbyte_max_compressedbytes(kCount));
+        size_t direct_bytes = streamvbyte_encode(reinterpret_cast<const uint32_t*>(two_byte_col->raw_data()), kCount,
+                                                 direct_buf.data());
+
+        ASSERT_EQ(144u, direct_bytes);
+        for (size_t k = 0; k < 16; ++k) {
+            ASSERT_EQ(0x55, serde_buf[kHeaderSize + k]);
+        }
+        ASSERT_EQ(0, std::memcmp(serde_buf.data() + kHeaderSize, direct_buf.data(), direct_bytes));
+
+        auto restored = Int32Column::create();
+        restored->resize(kCount);
+        ASSIGN_OR_ABORT(const uint8_t* read_end, ColumnArraySerde::deserialize(serde_buf.data(), write_end,
+                                                                               restored.get(), false, kEncodeLevel));
+        ASSERT_EQ(write_end, read_end);
+        ASSERT_EQ(0, std::memcmp(two_byte_col->raw_data(), restored->raw_data(), kCount * sizeof(int32_t)));
+    }
+
+    // Case 3: Sorted 1-byte deltas (100 + i * 3) producing 80 compressed bytes
+    // (16 control bytes of 0x00 + 64 data bytes).
+    {
+        auto sorted_col = Int32Column::create();
+        for (size_t i = 0; i < kCount; ++i) {
+            sorted_col->append(static_cast<int32_t>(100 + i * 3));
+        }
+        std::vector<uint8_t> serde_buf(ColumnArraySerde::max_serialized_size(*sorted_col, kEncodeLevel));
+        ASSIGN_OR_ABORT(uint8_t* write_end,
+                        ColumnArraySerde::serialize(*sorted_col, serde_buf.data(), true, kEncodeLevel));
+
+        std::vector<uint8_t> direct_buf(streamvbyte_max_compressedbytes(kCount));
+        size_t direct_bytes = streamvbyte_delta_encode(reinterpret_cast<const uint32_t*>(sorted_col->raw_data()),
+                                                       kCount, direct_buf.data(), 0);
+
+        ASSERT_EQ(80u, direct_bytes);
+        ASSERT_EQ(kCount * sizeof(int32_t), decode_fixed32_le(serde_buf.data()));
+        ASSERT_EQ(direct_bytes, decode_fixed64_le(serde_buf.data() + sizeof(uint32_t)));
+        ASSERT_EQ(kHeaderSize + direct_bytes, static_cast<size_t>(write_end - serde_buf.data()));
+        for (size_t k = 0; k < 16; ++k) {
+            ASSERT_EQ(0x00, serde_buf[kHeaderSize + k]);
+        }
+        ASSERT_EQ(0, std::memcmp(serde_buf.data() + kHeaderSize, direct_buf.data(), direct_bytes));
+
+        auto restored = Int32Column::create();
+        restored->resize(kCount);
+        ASSIGN_OR_ABORT(const uint8_t* read_end,
+                        ColumnArraySerde::deserialize(serde_buf.data(), write_end, restored.get(), true, kEncodeLevel));
+        ASSERT_EQ(write_end, read_end);
+        ASSERT_EQ(0, std::memcmp(sorted_col->raw_data(), restored->raw_data(), kCount * sizeof(int32_t)));
+    }
+}
+
+// NOLINTNEXTLINE
+TEST(ColumnArraySerdeTest, corrupted_payload_bounds_check) {
+    constexpr size_t kRows = 256;
+    constexpr int kEncodeLevel = 2;
+
+    auto col = Int32Column::create();
+    for (size_t i = 0; i < kRows; ++i) {
+        col->append(static_cast<int32_t>(i * 7 + 3));
+    }
+
+    std::vector<uint8_t> buffer(ColumnArraySerde::max_serialized_size(*col, kEncodeLevel) + 32, 0);
+    ASSIGN_OR_ABORT(uint8_t* write_end, ColumnArraySerde::serialize(*col, buffer.data(), false, kEncodeLevel));
+    const uint64_t compressed_bytes = decode_fixed64_le(buffer.data() + sizeof(uint32_t));
+
+    // 1. Corrupt compressed_bytes header (+8 bytes while keeping end large enough) -> encode_size != decode_size.
+    {
+        auto corrupted = buffer;
+        encode_fixed64_le(corrupted.data() + sizeof(uint32_t), compressed_bytes + 8);
+        const uint8_t* padded_end = write_end + 8;
+        auto dst = Int32Column::create();
+        dst->resize(kRows);
+        auto st = ColumnArraySerde::deserialize(corrupted.data(), padded_end, dst.get(), false, kEncodeLevel);
+        ASSERT_FALSE(st.ok());
+        ASSERT_TRUE(st.status().is_internal_error()) << st.status();
+    }
+
+    // 2. Truncated buffer (end < buff + sizeof(uint32_t) + sizeof(uint64_t) + compressed_bytes).
+    {
+        auto dst = Int32Column::create();
+        dst->resize(kRows);
+        auto st = ColumnArraySerde::deserialize(buffer.data(), write_end - 1, dst.get(), false, kEncodeLevel);
+        ASSERT_FALSE(st.ok());
+        ASSERT_TRUE(st.status().is_internal_error()) << st.status();
     }
 }
 
