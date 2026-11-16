@@ -716,17 +716,6 @@ if [[ -d $TP_SOURCE_DIR/$JEMALLOC_SOURCE ]] ; then
     echo "Finished patching $JEMALLOC_SOURCE"
 fi
 
-# patch streamvbyte
-if [[ -d $TP_SOURCE_DIR/$STREAMVBYTE_SOURCE ]] ; then
-    cd $TP_SOURCE_DIR/$STREAMVBYTE_SOURCE
-    if [ ! -f $PATCHED_MARK ] && [ $STREAMVBYTE_SOURCE = "streamvbyte-0.5.1" ]; then
-        apply_patch -p1 $TP_PATCH_DIR/streamvbyte.patch
-        touch $PATCHED_MARK
-    fi
-    cd -
-    echo "Finished patching $STREAMVBYTE_SOURCE"
-fi
-
 # patch hyperscan
 if [[ -d $TP_SOURCE_DIR/$HYPERSCAN_SOURCE ]] ; then
     cd $TP_SOURCE_DIR/$HYPERSCAN_SOURCE

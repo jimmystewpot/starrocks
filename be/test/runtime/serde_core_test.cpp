@@ -13,8 +13,11 @@
 // limitations under the License.
 
 #include <gtest/gtest.h>
+#include <streamvbyte.h>
+#include <streamvbytedelta.h>
 
 #include <chrono>
+#include <cstring>
 #include <iostream>
 #include <memory>
 
@@ -33,6 +36,7 @@
 #include "column/field.h"
 #include "column/fixed_length_column.h"
 #include "column/json_column.h"
+#include "column/map_column.h"
 #include "column/nullable_column.h"
 #include "column/schema.h"
 #include "column/serde/column_array_serde.h"
@@ -1018,6 +1022,398 @@ PARALLEL_TEST(ColumnArraySerdeTest, array_column) {
 
         ASSERT_EQ("[1,2,3]", c2->debug_item(0));
         ASSERT_EQ("[4,5,6]", c2->debug_item(1));
+    }
+}
+
+static Status verify_streamvbyte_serde_roundtrip(const Column& src, Column* dst, bool sorted, int encode_level) {
+    std::vector<uint8_t> buffer(ColumnArraySerde::max_serialized_size(src, encode_level));
+    ASSIGN_OR_RETURN(uint8_t* end_ptr, ColumnArraySerde::serialize(src, buffer.data(), sorted, encode_level));
+    if (static_cast<size_t>(end_ptr - buffer.data()) > buffer.size()) {
+        return Status::InternalError("serialized size exceeds max_serialized_size");
+    }
+    ASSIGN_OR_RETURN(const uint8_t* read_end,
+                     ColumnArraySerde::deserialize(buffer.data(), end_ptr, dst, sorted, encode_level));
+    if (read_end != end_ptr) {
+        return Status::InternalError("deserialized end pointer does not match serialized end pointer");
+    }
+    return Status::OK();
+}
+
+// NOLINTNEXTLINE
+TEST(ColumnArraySerdeTest, streamvbyte_int32_unsorted_and_sorted_multiblock_roundtrip) {
+    const std::vector<size_t> i32_counts{64, 65, 95, 128, 257, 1024, 4099};
+    const std::vector<int> encode_levels{2, 7};
+
+    for (size_t count : i32_counts) {
+        // Pattern 1: small deltas (<= 255), exercising keys == 0 16-bit prefix-sum fast path.
+        auto small_delta_col = Int32Column::create();
+        small_delta_col->reserve(count);
+        uint32_t acc_small = 7;
+        for (size_t i = 0; i < count; ++i) {
+            small_delta_col->append(static_cast<int32_t>(acc_small));
+            acc_small += static_cast<uint32_t>((i % 251) + 1);
+        }
+
+        // Pattern 2: multi-width deltas (1B, 2B, 3B, 4B), transitioning from keys == 0 in the first
+        // 64 elements to mixed non-zero keys in subsequent blocks.
+        auto mixed_delta_col = Int32Column::create();
+        mixed_delta_col->reserve(count);
+        uint32_t acc_mixed = 42;
+        for (size_t i = 0; i < count; ++i) {
+            if (i < 64) {
+                acc_mixed += static_cast<uint32_t>((i % 200) + 1);
+            } else {
+                switch (i & 3) {
+                case 0:
+                    acc_mixed += 5u;
+                    break;
+                case 1:
+                    acc_mixed += 1024u;
+                    break;
+                case 2:
+                    acc_mixed += 131072u;
+                    break;
+                default:
+                    acc_mixed += 20000000u;
+                    break;
+                }
+            }
+            mixed_delta_col->append(static_cast<int32_t>(acc_mixed));
+        }
+
+        for (int level : encode_levels) {
+            for (bool sorted : {false, true}) {
+                for (const auto* src : {small_delta_col.get(), mixed_delta_col.get()}) {
+                    auto out = Int32Column::create();
+                    out->resize(src->size());
+                    ASSERT_TRUE(verify_streamvbyte_serde_roundtrip(*src, out.get(), sorted, level).ok())
+                            << "count=" << count << " level=" << level << " sorted=" << sorted;
+                    ASSERT_EQ(src->size(), out->size());
+                    for (size_t i = 0; i < count; ++i) {
+                        ASSERT_EQ(src->get_data()[i], out->get_data()[i])
+                                << "mismatch at index " << i << " count=" << count << " level=" << level
+                                << " sorted=" << sorted;
+                    }
+                }
+            }
+        }
+    }
+
+    // Int64Column across {32, 65, 1024, 4099} with negative values and large 64-bit timestamps.
+    const std::vector<size_t> i64_counts{32, 65, 1024, 4099};
+    for (size_t count : i64_counts) {
+        auto neg_col = Int64Column::create();
+        auto ts_col = Int64Column::create();
+        neg_col->reserve(count);
+        ts_col->reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            neg_col->append(-100000LL - static_cast<int64_t>(i));
+            ts_col->append(1700000000000LL + static_cast<int64_t>(i) * 1000LL);
+        }
+
+        for (int level : encode_levels) {
+            for (bool sorted : {false, true}) {
+                for (const auto* src : {neg_col.get(), ts_col.get()}) {
+                    auto out = Int64Column::create();
+                    out->resize(src->size());
+                    ASSERT_TRUE(verify_streamvbyte_serde_roundtrip(*src, out.get(), sorted, level).ok())
+                            << "i64 count=" << count << " level=" << level << " sorted=" << sorted;
+                    ASSERT_EQ(src->size(), out->size());
+                    for (size_t i = 0; i < count; ++i) {
+                        ASSERT_EQ(src->get_data()[i], out->get_data()[i])
+                                << "i64 mismatch at index " << i << " count=" << count << " level=" << level
+                                << " sorted=" << sorted;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// NOLINTNEXTLINE
+TEST(ColumnArraySerdeTest, streamvbyte_binary_array_map_offsets_roundtrip) {
+    const std::vector<int> encode_levels{2, 7};
+
+    // 1. BinaryColumn: 256 and 1024 rows with short strings (< 256 B) and occasional strings (> 65536 B).
+    for (size_t num_rows : {size_t{256}, size_t{1024}}) {
+        auto bin_src = BinaryColumn::create();
+        std::string large_str(70000, 'L');
+        for (size_t i = 0; i < num_rows; ++i) {
+            if (i == 100 || i == 200) {
+                large_str[0] = static_cast<char>('A' + (i % 26));
+                bin_src->append(Slice(large_str));
+            } else {
+                std::string short_str((i % 37) + 1, static_cast<char>('a' + (i % 26)));
+                bin_src->append(Slice(short_str));
+            }
+        }
+
+        for (int level : encode_levels) {
+            auto bin_dst = BinaryColumn::create();
+            ASSERT_TRUE(verify_streamvbyte_serde_roundtrip(*bin_src, bin_dst.get(), false, level).ok())
+                    << "BinaryColumn rows=" << num_rows << " level=" << level;
+            ASSERT_EQ(bin_src->size(), bin_dst->size());
+            for (size_t i = 0; i < num_rows; ++i) {
+                ASSERT_EQ(bin_src->get_slice(i), bin_dst->get_slice(i))
+                        << "BinaryColumn mismatch at row " << i << " rows=" << num_rows << " level=" << level;
+            }
+        }
+    }
+
+    // 2. ArrayColumn: 256 and 1024 rows at encode_level = 2 and 7.
+    for (size_t num_rows : {size_t{256}, size_t{1024}}) {
+        auto offsets = UInt32Column::create();
+        offsets->append(0);
+        auto elements = NullableColumn::create(Int32Column::create(), NullColumn::create());
+        uint32_t cur_offset = 0;
+        for (size_t i = 0; i < num_rows; ++i) {
+            size_t len = (i % 5);
+            for (size_t j = 0; j < len; ++j) {
+                if ((i + j) % 7 == 0) {
+                    elements->append_nulls(1);
+                } else {
+                    elements->append_datum(Datum(static_cast<int32_t>(i * 10 + j)));
+                }
+            }
+            cur_offset += static_cast<uint32_t>(len);
+            offsets->append(cur_offset);
+        }
+        auto arr_src = ArrayColumn::create(std::move(elements), std::move(offsets));
+
+        for (int level : encode_levels) {
+            auto dst_offsets = UInt32Column::create();
+            auto dst_elements = NullableColumn::create(Int32Column::create(), NullColumn::create());
+            auto arr_dst = ArrayColumn::create(std::move(dst_elements), std::move(dst_offsets));
+            ASSERT_TRUE(verify_streamvbyte_serde_roundtrip(*arr_src, arr_dst.get(), false, level).ok())
+                    << "ArrayColumn rows=" << num_rows << " level=" << level;
+            ASSERT_EQ(arr_src->size(), arr_dst->size());
+            for (size_t i = 0; i < num_rows; ++i) {
+                ASSERT_EQ(arr_src->debug_item(i), arr_dst->debug_item(i))
+                        << "ArrayColumn mismatch at row " << i << " rows=" << num_rows << " level=" << level;
+            }
+        }
+    }
+
+    // 3. MapColumn: 256 rows at encode_level = 2 and 7.
+    {
+        constexpr size_t kMapRows = 256;
+        auto offsets = UInt32Column::create();
+        offsets->append(0);
+        auto keys = NullableColumn::create(Int32Column::create(), NullColumn::create());
+        auto values = NullableColumn::create(Int32Column::create(), NullColumn::create());
+        uint32_t cur_offset = 0;
+        for (size_t i = 0; i < kMapRows; ++i) {
+            size_t entries = (i % 4) + 1;
+            for (size_t j = 0; j < entries; ++j) {
+                keys->append_datum(Datum(static_cast<int32_t>(i * 100 + j)));
+                if ((i + j) % 5 == 0) {
+                    values->append_nulls(1);
+                } else {
+                    values->append_datum(Datum(static_cast<int32_t>(i * 1000 + j)));
+                }
+            }
+            cur_offset += static_cast<uint32_t>(entries);
+            offsets->append(cur_offset);
+        }
+        auto map_src = MapColumn::create(std::move(keys), std::move(values), std::move(offsets));
+
+        for (int level : encode_levels) {
+            auto dst_offsets = UInt32Column::create();
+            auto dst_keys = NullableColumn::create(Int32Column::create(), NullColumn::create());
+            auto dst_values = NullableColumn::create(Int32Column::create(), NullColumn::create());
+            auto map_dst = MapColumn::create(std::move(dst_keys), std::move(dst_values), std::move(dst_offsets));
+            ASSERT_TRUE(verify_streamvbyte_serde_roundtrip(*map_src, map_dst.get(), false, level).ok())
+                    << "MapColumn level=" << level;
+            ASSERT_EQ(map_src->size(), map_dst->size());
+            for (size_t i = 0; i < kMapRows; ++i) {
+                ASSERT_EQ(map_src->debug_item(i), map_dst->debug_item(i))
+                        << "MapColumn mismatch at row " << i << " level=" << level;
+            }
+        }
+    }
+}
+
+// NOLINTNEXTLINE
+TEST(ColumnArraySerdeTest, streamvbyte_golden_wire_determinism) {
+    constexpr size_t kCount = 64;
+    constexpr size_t kHeaderSize = sizeof(uint32_t) + sizeof(uint64_t); // raw_bytes (4B) + compressed_bytes (8B)
+    constexpr int kEncodeLevel = 2;
+
+    auto verify_against_v051_fixture = [&](const Int32Column& expected_col, const uint8_t* v051_payload,
+                                           size_t v051_payload_size, bool sorted) {
+        // 1. Verify current serializer emits the exact 0.5.1 wire bytes.
+        std::vector<uint8_t> serde_buf(ColumnArraySerde::max_serialized_size(expected_col, kEncodeLevel));
+        ASSIGN_OR_ABORT(uint8_t* write_end,
+                        ColumnArraySerde::serialize(expected_col, serde_buf.data(), sorted, kEncodeLevel));
+        ASSERT_EQ(kCount * sizeof(int32_t), decode_fixed32_le(serde_buf.data()));
+        ASSERT_EQ(v051_payload_size, decode_fixed64_le(serde_buf.data() + sizeof(uint32_t)));
+        ASSERT_EQ(kHeaderSize + v051_payload_size, static_cast<size_t>(write_end - serde_buf.data()));
+        ASSERT_EQ(0, std::memcmp(serde_buf.data() + kHeaderSize, v051_payload, v051_payload_size));
+
+        // 2. Construct a standalone serialized buffer directly from the fixed 0.5.1 fixture
+        //    (without calling the encoder under test) with STREAMVBYTE_PADDING readable trailing
+        //    bytes required by streamvbyte_decode / streamvbyte_delta_decode, while keeping
+        //    legacy_end at the logical header + payload boundary.
+        const size_t logical_bytes = kHeaderSize + v051_payload_size;
+        std::vector<uint8_t> legacy_v051_buf(logical_bytes + STREAMVBYTE_PADDING, 0);
+        encode_fixed32_le(legacy_v051_buf.data(), static_cast<uint32_t>(kCount * sizeof(int32_t)));
+        encode_fixed64_le(legacy_v051_buf.data() + sizeof(uint32_t), static_cast<uint64_t>(v051_payload_size));
+        std::memcpy(legacy_v051_buf.data() + kHeaderSize, v051_payload, v051_payload_size);
+
+        auto restored = Int32Column::create();
+        restored->resize(kCount);
+        const uint8_t* legacy_end = legacy_v051_buf.data() + logical_bytes;
+        ASSIGN_OR_ABORT(const uint8_t* read_end, ColumnArraySerde::deserialize(legacy_v051_buf.data(), legacy_end,
+                                                                               restored.get(), sorted, kEncodeLevel));
+        ASSERT_EQ(legacy_end, read_end);
+        ASSERT_EQ(0, std::memcmp(expected_col.raw_data(), restored->raw_data(), kCount * sizeof(int32_t)));
+    };
+
+    // Case 1: Unsorted mixed-width 64-element Int32Column against fixed streamvbyte 0.5.1 fixture
+    // (128 compressed bytes = 16 control bytes of 0x90 + 112 data bytes: 1B + 1B + 2B + 3B = 7B per 4-int group).
+    {
+        constexpr std::array<uint8_t, 128> kExpectedV051MixedPayload = {{
+                0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+                0x01, 0x64, 0x2c, 0x01, 0x70, 0x11, 0x01, 0x02, 0x65, 0x3d, 0x01, 0x73, 0x11, 0x01, 0x03, 0x66,
+                0x4e, 0x01, 0x76, 0x11, 0x01, 0x04, 0x67, 0x5f, 0x01, 0x79, 0x11, 0x01, 0x05, 0x68, 0x70, 0x01,
+                0x7c, 0x11, 0x01, 0x06, 0x69, 0x81, 0x01, 0x7f, 0x11, 0x01, 0x07, 0x6a, 0x92, 0x01, 0x82, 0x11,
+                0x01, 0x08, 0x6b, 0xa3, 0x01, 0x85, 0x11, 0x01, 0x09, 0x6c, 0xb4, 0x01, 0x88, 0x11, 0x01, 0x0a,
+                0x6d, 0xc5, 0x01, 0x8b, 0x11, 0x01, 0x0b, 0x6e, 0xd6, 0x01, 0x8e, 0x11, 0x01, 0x0c, 0x6f, 0xe7,
+                0x01, 0x91, 0x11, 0x01, 0x0d, 0x70, 0xf8, 0x01, 0x94, 0x11, 0x01, 0x0e, 0x71, 0x09, 0x02, 0x97,
+                0x11, 0x01, 0x0f, 0x72, 0x1a, 0x02, 0x9a, 0x11, 0x01, 0x10, 0x73, 0x2b, 0x02, 0x9d, 0x11, 0x01,
+        }};
+
+        auto mixed_col = Int32Column::create();
+        for (size_t g = 0; g < kCount / 4; ++g) {
+            mixed_col->append(static_cast<int32_t>(1 + g));         // 1 byte
+            mixed_col->append(static_cast<int32_t>(100 + g));       // 1 byte
+            mixed_col->append(static_cast<int32_t>(300 + g * 17));  // 2 bytes
+            mixed_col->append(static_cast<int32_t>(70000 + g * 3)); // 3 bytes
+        }
+        verify_against_v051_fixture(*mixed_col, kExpectedV051MixedPayload.data(), kExpectedV051MixedPayload.size(),
+                                    false);
+    }
+
+    // Case 2: Unsorted 2-byte values against fixed streamvbyte 0.5.1 fixture
+    // (144 compressed bytes = 16 control bytes of 0x55 + 128 data bytes).
+    {
+        constexpr std::array<uint8_t, 144> kExpectedV051TwoBytePayload = {{
+                0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+                0x00, 0x01, 0x03, 0x01, 0x06, 0x01, 0x09, 0x01, 0x0c, 0x01, 0x0f, 0x01, 0x12, 0x01, 0x15, 0x01,
+                0x18, 0x01, 0x1b, 0x01, 0x1e, 0x01, 0x21, 0x01, 0x24, 0x01, 0x27, 0x01, 0x2a, 0x01, 0x2d, 0x01,
+                0x30, 0x01, 0x33, 0x01, 0x36, 0x01, 0x39, 0x01, 0x3c, 0x01, 0x3f, 0x01, 0x42, 0x01, 0x45, 0x01,
+                0x48, 0x01, 0x4b, 0x01, 0x4e, 0x01, 0x51, 0x01, 0x54, 0x01, 0x57, 0x01, 0x5a, 0x01, 0x5d, 0x01,
+                0x60, 0x01, 0x63, 0x01, 0x66, 0x01, 0x69, 0x01, 0x6c, 0x01, 0x6f, 0x01, 0x72, 0x01, 0x75, 0x01,
+                0x78, 0x01, 0x7b, 0x01, 0x7e, 0x01, 0x81, 0x01, 0x84, 0x01, 0x87, 0x01, 0x8a, 0x01, 0x8d, 0x01,
+                0x90, 0x01, 0x93, 0x01, 0x96, 0x01, 0x99, 0x01, 0x9c, 0x01, 0x9f, 0x01, 0xa2, 0x01, 0xa5, 0x01,
+                0xa8, 0x01, 0xab, 0x01, 0xae, 0x01, 0xb1, 0x01, 0xb4, 0x01, 0xb7, 0x01, 0xba, 0x01, 0xbd, 0x01,
+        }};
+
+        auto two_byte_col = Int32Column::create();
+        for (size_t i = 0; i < kCount; ++i) {
+            two_byte_col->append(static_cast<int32_t>(256 + i * 3));
+        }
+        verify_against_v051_fixture(*two_byte_col, kExpectedV051TwoBytePayload.data(),
+                                    kExpectedV051TwoBytePayload.size(), false);
+    }
+
+    // Case 3: Sorted 1-byte deltas (100 + i * 3) against fixed streamvbyte 0.5.1 delta fixture
+    // (80 compressed bytes = 16 control bytes of 0x00 + 64 data bytes).
+    {
+        constexpr std::array<uint8_t, 80> kExpectedV051SortedSmallDeltaPayload = {{
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x64, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03,
+                0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03,
+                0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03,
+                0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03,
+        }};
+
+        auto sorted_col = Int32Column::create();
+        for (size_t i = 0; i < kCount; ++i) {
+            sorted_col->append(static_cast<int32_t>(100 + i * 3));
+        }
+        verify_against_v051_fixture(*sorted_col, kExpectedV051SortedSmallDeltaPayload.data(),
+                                    kExpectedV051SortedSmallDeltaPayload.size(), true);
+    }
+
+    // Case 4: Sorted multi-width deltas (1B + 2B + 3B + 4B) against fixed streamvbyte 0.5.1 delta fixture
+    // (176 compressed bytes = 16 control bytes of 0xe4 + 160 data bytes).
+    {
+        constexpr std::array<uint8_t, 176> kExpectedV051SortedMixedDeltaPayload = {{
+                0xe4, 0xe4, 0xe4, 0xe4, 0xe4, 0xe4, 0xe4, 0xe4, 0xe4, 0xe4, 0xe4, 0xe4, 0xe4, 0xe4, 0xe4, 0xe4,
+                0x2f, 0x00, 0x04, 0x00, 0x00, 0x02, 0x00, 0x2d, 0x31, 0x01, 0x05, 0x00, 0x04, 0x00, 0x00, 0x02,
+                0x00, 0x2d, 0x31, 0x01, 0x05, 0x00, 0x04, 0x00, 0x00, 0x02, 0x00, 0x2d, 0x31, 0x01, 0x05, 0x00,
+                0x04, 0x00, 0x00, 0x02, 0x00, 0x2d, 0x31, 0x01, 0x05, 0x00, 0x04, 0x00, 0x00, 0x02, 0x00, 0x2d,
+                0x31, 0x01, 0x05, 0x00, 0x04, 0x00, 0x00, 0x02, 0x00, 0x2d, 0x31, 0x01, 0x05, 0x00, 0x04, 0x00,
+                0x00, 0x02, 0x00, 0x2d, 0x31, 0x01, 0x05, 0x00, 0x04, 0x00, 0x00, 0x02, 0x00, 0x2d, 0x31, 0x01,
+                0x05, 0x00, 0x04, 0x00, 0x00, 0x02, 0x00, 0x2d, 0x31, 0x01, 0x05, 0x00, 0x04, 0x00, 0x00, 0x02,
+                0x00, 0x2d, 0x31, 0x01, 0x05, 0x00, 0x04, 0x00, 0x00, 0x02, 0x00, 0x2d, 0x31, 0x01, 0x05, 0x00,
+                0x04, 0x00, 0x00, 0x02, 0x00, 0x2d, 0x31, 0x01, 0x05, 0x00, 0x04, 0x00, 0x00, 0x02, 0x00, 0x2d,
+                0x31, 0x01, 0x05, 0x00, 0x04, 0x00, 0x00, 0x02, 0x00, 0x2d, 0x31, 0x01, 0x05, 0x00, 0x04, 0x00,
+                0x00, 0x02, 0x00, 0x2d, 0x31, 0x01, 0x05, 0x00, 0x04, 0x00, 0x00, 0x02, 0x00, 0x2d, 0x31, 0x01,
+        }};
+
+        auto sorted_mixed_col = Int32Column::create();
+        uint32_t acc = 42;
+        for (size_t i = 0; i < kCount; ++i) {
+            switch (i & 3) {
+            case 0:
+                acc += 5u;
+                break;
+            case 1:
+                acc += 1024u;
+                break;
+            case 2:
+                acc += 131072u;
+                break;
+            default:
+                acc += 20000000u;
+                break;
+            }
+            sorted_mixed_col->append(static_cast<int32_t>(acc));
+        }
+        verify_against_v051_fixture(*sorted_mixed_col, kExpectedV051SortedMixedDeltaPayload.data(),
+                                    kExpectedV051SortedMixedDeltaPayload.size(), true);
+    }
+}
+
+// NOLINTNEXTLINE
+TEST(ColumnArraySerdeTest, corrupted_payload_bounds_check) {
+    constexpr size_t kRows = 256;
+    constexpr int kEncodeLevel = 2;
+
+    auto col = Int32Column::create();
+    for (size_t i = 0; i < kRows; ++i) {
+        col->append(static_cast<int32_t>(i * 7 + 3));
+    }
+
+    std::vector<uint8_t> buffer(ColumnArraySerde::max_serialized_size(*col, kEncodeLevel) + 32, 0);
+    ASSIGN_OR_ABORT(uint8_t* write_end, ColumnArraySerde::serialize(*col, buffer.data(), false, kEncodeLevel));
+    const size_t serialized_bytes = static_cast<size_t>(write_end - buffer.data());
+    const uint64_t compressed_bytes = decode_fixed64_le(buffer.data() + sizeof(uint32_t));
+
+    // 1. Corrupt compressed_bytes header (+8 bytes while keeping end large enough) -> encode_size != decode_size.
+    {
+        auto corrupted = buffer;
+        encode_fixed64_le(corrupted.data() + sizeof(uint32_t), compressed_bytes + 8);
+        const uint8_t* padded_end = corrupted.data() + serialized_bytes + 8;
+        auto dst = Int32Column::create();
+        dst->resize(kRows);
+        auto st = ColumnArraySerde::deserialize(corrupted.data(), padded_end, dst.get(), false, kEncodeLevel);
+        ASSERT_FALSE(st.ok());
+        ASSERT_TRUE(st.status().is_internal_error()) << st.status();
+        ASSERT_NE(std::string_view::npos, st.status().message().find("encode size does not equal when decoding"))
+                << st.status();
+    }
+
+    // 2. Truncated buffer (end < buff + sizeof(uint32_t) + sizeof(uint64_t) + compressed_bytes).
+    {
+        auto dst = Int32Column::create();
+        dst->resize(kRows);
+        auto st = ColumnArraySerde::deserialize(buffer.data(), write_end - 1, dst.get(), false, kEncodeLevel);
+        ASSERT_FALSE(st.ok());
+        ASSERT_TRUE(st.status().is_internal_error()) << st.status();
+        ASSERT_NE(std::string_view::npos, st.status().message().find("Expected remains size")) << st.status();
     }
 }
 

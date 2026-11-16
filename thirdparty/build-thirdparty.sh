@@ -1558,6 +1558,7 @@ build_streamvbyte() {
     check_if_source_exist $STREAMVBYTE_SOURCE
 
     cd $TP_SOURCE_DIR/$STREAMVBYTE_SOURCE/
+    : > cmake/CPM.cmake
 
     mkdir -p $BUILD_DIR
     cd $BUILD_DIR
@@ -1565,10 +1566,17 @@ build_streamvbyte() {
 
     CMAKE_GENERATOR="Unix Makefiles"
     BUILD_SYSTEM='make'
-    $CMAKE_CMD .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX:PATH=$TP_INSTALL_DIR/
+    $CMAKE_CMD .. \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX:PATH=$TP_INSTALL_DIR/ \
+        -DCMAKE_INSTALL_LIBDIR=lib \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DSTREAMVBYTE_ENABLE_TESTS=OFF \
+        -DSTREAMVBYTE_ENABLE_EXAMPLES=OFF
 
     make -j$PARALLEL
     make install
+    ln -sf libstreamvbyte.a $TP_INSTALL_DIR/lib/libstreamvbyte_static.a
 }
 
 # jansson

@@ -177,19 +177,25 @@ let
   ];
   streamvbyte = pkgs.stdenv.mkDerivation {
     pname = "streamvbyte";
-    version = "0.5.1";
+    version = "3.2.1";
 
     src = pkgs.fetchurl {
-      url = "https://github.com/lemire/streamvbyte/archive/refs/tags/v0.5.1.tar.gz";
-      sha256 = "0287mwpqc83rgs7rmc3iilsl6bnnldf8791ppgs7j2zrh8sl1wmh";
+      url = "https://github.com/lemire/streamvbyte/archive/refs/tags/v3.2.1.tar.gz";
+      sha256 = "0fpyl547ad225f4xy3xl3p9ryl1advxj4jf4z4sjgia76gyrb0c3";
     };
 
     nativeBuildInputs = [ pkgs.cmake ];
 
+    postPatch = ''
+      : > cmake/CPM.cmake
+    '';
+
     cmakeFlags = [
       "-DCMAKE_BUILD_TYPE=Release"
-      "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+      "-DCMAKE_INSTALL_LIBDIR=lib"
+      "-DBUILD_SHARED_LIBS=OFF"
       "-DSTREAMVBYTE_ENABLE_TESTS=OFF"
+      "-DSTREAMVBYTE_ENABLE_EXAMPLES=OFF"
     ];
   };
 

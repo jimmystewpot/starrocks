@@ -2409,12 +2409,14 @@ build_formula_streamvbyte() {
 }
 
 build_streamvbyte() {
-    if [[ -f "${TP_INSTALL_DIR}/lib/libstreamvbyte_static.a" && -f "${TP_INCLUDE_DIR}/streamvbyte.h" ]]; then
+    if [[ -f "${TP_INSTALL_DIR}/lib/libstreamvbyte.a" && -f "${TP_INCLUDE_DIR}/streamvbyte.h" ]]; then
+        link_if_missing "${TP_INSTALL_DIR}/lib/libstreamvbyte.a" "${TP_INSTALL_DIR}/lib/libstreamvbyte_static.a"
         return 0
     fi
 
     check_if_source_exist "${STREAMVBYTE_SOURCE}"
     cd "${TP_SOURCE_DIR}/${STREAMVBYTE_SOURCE}"
+    : > cmake/CPM.cmake
     rm -rf build
     mkdir -p build
     cd build
@@ -2423,10 +2425,12 @@ build_streamvbyte() {
         -DCMAKE_INSTALL_PREFIX="${TP_INSTALL_DIR}" \
         -DCMAKE_INSTALL_LIBDIR=lib \
         -DSTREAMVBYTE_ENABLE_TESTS=OFF \
+        -DSTREAMVBYTE_ENABLE_EXAMPLES=OFF \
         -DBUILD_SHARED_LIBS=OFF \
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5
     ${BUILD_SYSTEM} -j"${PARALLEL}"
     ${BUILD_SYSTEM} install
+    link_if_missing "${TP_INSTALL_DIR}/lib/libstreamvbyte.a" "${TP_INSTALL_DIR}/lib/libstreamvbyte_static.a"
     sync_lib64_links
 }
 
