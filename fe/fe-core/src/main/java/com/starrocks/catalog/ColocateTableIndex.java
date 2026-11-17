@@ -530,6 +530,15 @@ public class ColocateTableIndex implements Writable {
         }
     }
 
+    public boolean isColocateGroupTable(GroupId groupId, long tableId) {
+        readLock();
+        try {
+            return Objects.equals(groupId, table2Group.get(tableId));
+        } finally {
+            readUnlock();
+        }
+    }
+
     public boolean isMetaGroupColocateTable(long tableId) {
         readLock();
         try {
@@ -689,18 +698,12 @@ public class ColocateTableIndex implements Writable {
         Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(groupId.dbId);
         int numOfTablets = 0;
         if (db != null && !allTableIds.isEmpty()) {
-            Locker locker = new Locker();
-            try {
-                locker.lockDatabase(db.getId(), LockType.READ);
-                for (long tableId : allTableIds) {
-                    OlapTable tbl = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore()
-                                .getTable(db.getId(), tableId);
-                    if (tbl != null) {
-                        numOfTablets += tbl.getNumberOfPartitions();
-                    }
+            for (long tableId : allTableIds) {
+                OlapTable tbl = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore()
+                        .getTable(db.getId(), tableId);
+                if (tbl != null) {
+                    numOfTablets += tbl.getNumberOfPartitions();
                 }
-            } finally {
-                locker.unLockDatabase(db.getId(), LockType.READ);
             }
         }
         return numOfTablets;
