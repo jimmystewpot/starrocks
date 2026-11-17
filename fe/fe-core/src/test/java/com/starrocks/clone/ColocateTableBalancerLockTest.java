@@ -579,4 +579,40 @@ public class ColocateTableBalancerLockTest {
             colocateIndex.removeTable(secondTbl.getId(), secondTbl, false);
         }
     }
+
+    @Test
+    public void testDoMatchOneGroupSkipsNonOlapTableEntryWithoutClassCastException() throws Exception {
+        starRocksAssert.withDatabase("db_non_olap_match").useDatabase("db_non_olap_match")
+                .withTable("CREATE TABLE db_non_olap_match.t_valid(id INT NOT NULL) " +
+                        "distributed by hash(`id`) buckets 1 " +
+                        "properties('replication_num' = '1', 'colocate_with' = 'grp_non_olap_match');");
+
+        GlobalStateMgr globalStateMgr = GlobalStateMgr.getCurrentState();
+        Database db = globalStateMgr.getLocalMetastore().getDb("db_non_olap_match");
+        OlapTable validTbl = (OlapTable) globalStateMgr.getLocalMetastore().getTable(db.getFullName(), "t_valid");
+        ColocateTableIndex colocateIndex = globalStateMgr.getColocateTableIndex();
+        GroupId groupId = colocateIndex.getGroup(validTbl.getId());
+
+        com.starrocks.catalog.Table nonOlapTable = new com.starrocks.catalog.Table(
+                987654322L, "v_dummy_match", com.starrocks.catalog.Table.TableType.VIEW, Lists.newArrayList());
+        db.registerTableUnlocked(nonOlapTable);
+        com.google.common.collect.Multimap<GroupId, Long> group2Tables =
+                Deencapsulation.getField(colocateIndex, "group2Tables");
+        java.util.Map<Long, GroupId> table2Group =
+                Deencapsulation.getField(colocateIndex, "table2Group");
+        group2Tables.put(groupId, nonOlapTable.getId());
+        table2Group.put(nonOlapTable.getId(), groupId);
+
+        try {
+            ColocateMatchResult result = Deencapsulation.invoke(BALANCER, "doMatchOneGroup",
+                    groupId, false, globalStateMgr, colocateIndex, globalStateMgr.getTabletScheduler());
+            Assertions.assertEquals(Status.STABLE, result.status,
+                    "Non-OlapTable entry in group must be skipped cleanly without ClassCastException");
+        } finally {
+            group2Tables.remove(groupId, nonOlapTable.getId());
+            table2Group.remove(nonOlapTable.getId());
+            db.dropTable(nonOlapTable.getName());
+            colocateIndex.removeTable(validTbl.getId(), validTbl, false);
+        }
+    }
 }
