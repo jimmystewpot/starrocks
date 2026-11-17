@@ -501,4 +501,32 @@ public class ColocateTableBalancerLockTest {
             colocateIndex.removeTable(tbl.getId(), tbl, false);
         }
     }
+
+    @Test
+    public void testReplacedOrBucketMismatchedIndexReturnsUnknownInsteadOfStable() throws Exception {
+        starRocksAssert.withDatabase("db_idx_mismatch").useDatabase("db_idx_mismatch")
+                .withTable("CREATE TABLE db_idx_mismatch.t_mismatch(id INT NOT NULL) " +
+                        "distributed by hash(`id`) buckets 2 " +
+                        "properties('replication_num' = '1', 'colocate_with' = 'grp_idx_mismatch');");
+
+        GlobalStateMgr globalStateMgr = GlobalStateMgr.getCurrentState();
+        Database db = globalStateMgr.getLocalMetastore().getDb("db_idx_mismatch");
+        OlapTable tbl = (OlapTable) globalStateMgr.getLocalMetastore().getTable(db.getFullName(), "t_mismatch");
+        ColocateTableIndex colocateIndex = globalStateMgr.getColocateTableIndex();
+        GroupId groupId = colocateIndex.getGroup(tbl.getId());
+
+        try {
+            colocateIndex.markGroupUnstable(groupId, false);
+            // Set 1 bucket in backendBucketsSeq while the table index has 2 tablets (bucket mismatch)
+            colocateIndex.addBackendsPerBucketSeq(groupId,
+                    Lists.<List<Long>>newArrayList(Lists.newArrayList(99999999L)));
+
+            ColocateMatchResult result = Deencapsulation.invoke(BALANCER, "doMatchOneGroup",
+                    groupId, false, globalStateMgr, colocateIndex, globalStateMgr.getTabletScheduler());
+            Assertions.assertEquals(Status.UNKNOWN, result.status,
+                    "Unchecked index with bucket-size mismatch must return UNKNOWN, never STABLE");
+        } finally {
+            colocateIndex.removeTable(tbl.getId(), tbl, false);
+        }
+    }
 }

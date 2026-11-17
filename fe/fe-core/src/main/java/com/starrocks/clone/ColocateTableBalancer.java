@@ -843,10 +843,9 @@ public class ColocateTableBalancer extends LeaderDaemon {
                     for (MaterializedIndex index : physicalPartition.getLatestMaterializedIndices(IndexExtState.VISIBLE)) {
                         if (physicalPartition.getIndex(index.getId()) != index
                                 || backendBucketsSeq.size() != index.getTablets().size()) {
-                            continue;
+                            isAborted = true;
+                            break TABLE;
                         }
-                        Preconditions.checkState(backendBucketsSeq.size() == index.getTablets().size(),
-                                backendBucketsSeq.size() + " v.s. " + index.getTablets().size());
 
                         BalanceStat balanceStat = BalanceStat.BALANCED_STAT;
 
@@ -969,7 +968,8 @@ public class ColocateTableBalancer extends LeaderDaemon {
                                             visibleVersion = physicalPartition.getVisibleVersion();
                                             if (physicalPartition.getIndex(index.getId()) != index
                                                     || backendBucketsSeq.size() != index.getTablets().size()) {
-                                                continue PARTITION;
+                                                isAborted = true;
+                                                break TABLE;
                                             }
                                         }
                                     }
