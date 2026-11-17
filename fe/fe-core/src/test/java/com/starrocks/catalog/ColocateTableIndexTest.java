@@ -1209,4 +1209,37 @@ public class ColocateTableIndexTest {
         Assertions.assertTrue(colocateIndex.isColocateGroupTable(gid1, 300L));
         Assertions.assertFalse(colocateIndex.isColocateGroupTable(gid2, 300L));
     }
+
+    @Test
+    public void testGetNumOfTabletsPerBucketSkipsNonOlapTableEntry() throws Exception {
+        ConnectContext connectContext = UtFrameUtils.createDefaultCtx();
+        CreateDbStmt createDbStmt = (CreateDbStmt) UtFrameUtils.parseStmtWithNewParser(
+                "create database db_non_olap;", connectContext);
+        GlobalStateMgr.getCurrentState().getLocalMetastore().createDb(createDbStmt.getFullDbName());
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("db_non_olap");
+
+        String sql = "CREATE TABLE db_non_olap.t1 (k1 int, v1 int) DUPLICATE KEY(k1)\n" +
+                "DISTRIBUTED BY HASH(k1) BUCKETS 2\n" +
+                "PROPERTIES(\"colocate_with\"=\"grp_non_olap\", \"replication_num\" = \"1\");";
+        StarRocksAssert.utCreateTableWithRetry(
+                (CreateTableStmt) UtFrameUtils.parseStmtWithNewParser(sql, connectContext));
+
+        OlapTable t1 = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore()
+                .getTable(db.getFullName(), "t1");
+        ColocateTableIndex colocateIndex = GlobalStateMgr.getCurrentState().getColocateTableIndex();
+        ColocateTableIndex.GroupId groupId = colocateIndex.getGroup(t1.getId());
+
+        Table nonOlapTable = new Table(987654321L, "v_dummy", Table.TableType.VIEW, new ArrayList<>());
+        db.registerTableUnlocked(nonOlapTable);
+        com.google.common.collect.Multimap<ColocateTableIndex.GroupId, Long> group2Tables =
+                Deencapsulation.getField(colocateIndex, "group2Tables");
+        group2Tables.put(groupId, nonOlapTable.getId());
+        try {
+            Assertions.assertEquals(1, colocateIndex.getNumOfTabletsPerBucket(groupId));
+        } finally {
+            group2Tables.remove(groupId, nonOlapTable.getId());
+            db.dropTable(nonOlapTable.getName());
+            colocateIndex.removeTable(t1.getId(), t1, false);
+        }
+    }
 }

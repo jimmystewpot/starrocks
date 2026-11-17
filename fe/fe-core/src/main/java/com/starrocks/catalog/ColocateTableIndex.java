@@ -704,10 +704,10 @@ public class ColocateTableIndex implements Writable {
         int numOfTablets = 0;
         if (db != null && !allTableIds.isEmpty()) {
             for (long tableId : allTableIds) {
-                OlapTable tbl = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore()
+                Table tbl = GlobalStateMgr.getCurrentState().getLocalMetastore()
                         .getTable(db.getId(), tableId);
-                if (tbl != null) {
-                    numOfTablets += tbl.getNumberOfPartitions();
+                if (tbl instanceof OlapTable) {
+                    numOfTablets += ((OlapTable) tbl).getNumberOfPartitions();
                 }
             }
         }
