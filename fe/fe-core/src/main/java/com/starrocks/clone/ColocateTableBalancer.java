@@ -85,6 +85,7 @@ public class ColocateTableBalancer extends LeaderDaemon {
     private static final Logger LOG = LogManager.getLogger(ColocateTableBalancer.class);
 
     private static final long CHECK_INTERVAL_MS = 20 * 1000L; // 20 second
+    private static final long MIN_LOCK_HOLD_TIME_MS = 100L;
 
     private ColocateTableBalancer(long intervalMs) {
         super("colocate-group-clone-checker", intervalMs);
@@ -749,51 +750,88 @@ public class ColocateTableBalancer extends LeaderDaemon {
         }
 
         boolean isGroupStable = true;
+        boolean isAborted = false;
         // set the config to a local variable to avoid config params changed.
         int partitionBatchNum = Config.tablet_checker_partition_batch_num;
+        long maxLockHoldTimeMs = Math.max(Config.tablet_checker_lock_time_per_cycle_ms, MIN_LOCK_HOLD_TIME_MS);
         boolean disableColocateBalance = Config.tablet_sched_disable_colocate_balance;
         SystemInfoService infoService = globalStateMgr.getNodeMgr().getClusterInfo();
         int partitionChecked = 0;
-        YieldableLock lock = YieldableLock.lockDatabase(db.getId(), LockType.READ);
-        try {
-            TABLE:
-            for (Long tableId : tableIds) {
-                OlapTable olapTable = (OlapTable) globalStateMgr.getLocalMetastore().getTableIncludeRecycleBin(db, tableId);
-                if (olapTable == null || !colocateIndex.isColocateTable(olapTable.getId())) {
-                    continue;
+        long totalHeldTimeNs = 0L;
+        TABLE:
+        for (Long tableId : tableIds) {
+            if (isUrgent && !globalStateMgr.getTabletChecker().isUrgentTable(db.getId(), tableId)) {
+                continue;
+            }
+
+            YieldableLock lock = YieldableLock.lockTableWithIntensiveDbLock(db.getId(), tableId, LockType.READ);
+            try {
+                db = globalStateMgr.getLocalMetastore().getDbIncludeRecycleBin(groupId.dbId);
+                if (db == null) {
+                    isAborted = true;
+                    break TABLE;
+                }
+                backendBucketsSeq = colocateIndex.getBackendsPerBucketSeqSet(groupId);
+                if (backendBucketsSeq.isEmpty()) {
+                    isAborted = true;
+                    break TABLE;
+                }
+                OlapTable olapTable = (OlapTable) globalStateMgr.getLocalMetastore()
+                        .getTableIncludeRecycleBin(db, tableId);
+                if (olapTable == null || !colocateIndex.isColocateGroupTable(groupId, tableId)) {
+                    continue TABLE;
+                }
+                if (isUrgent && !globalStateMgr.getTabletChecker().isUrgentTable(db.getId(), tableId)) {
+                    continue TABLE;
                 }
 
-                if ((isUrgent && !globalStateMgr.getTabletChecker().isUrgentTable(db.getId(), tableId))) {
-                    continue;
-                }
-
-                for (Partition partition : globalStateMgr.getLocalMetastore().getPartitionsIncludeRecycleBin(olapTable)) {
-                    partitionChecked++;
+                List<Long> partitionIds = globalStateMgr.getLocalMetastore()
+                        .getPartitionsIncludeRecycleBin(olapTable)
+                        .stream().map(Partition::getId).collect(Collectors.toList());
+                PARTITION:
+                for (Long partitionId : partitionIds) {
+                    Partition partition = globalStateMgr.getLocalMetastore()
+                            .getPartitionIncludeRecycleBin(olapTable, partitionId);
+                    if (partition == null) {
+                        continue PARTITION;
+                    }
 
                     boolean isPartitionUrgent =
-                            globalStateMgr.getTabletChecker().isPartitionUrgent(db.getId(), tableId, partition.getId());
+                            globalStateMgr.getTabletChecker().isPartitionUrgent(db.getId(), tableId, partitionId);
                     boolean isUrgentPartitionHealthy = true;
                     if ((isUrgent && !isPartitionUrgent) || (!isUrgent && isPartitionUrgent)) {
                         continue;
                     }
 
-                    if (partitionChecked % partitionBatchNum == 0) {
+                    partitionChecked++;
+                    if (partitionChecked % partitionBatchNum == 0
+                            || lock.getCurrentHoldTimeMs() >= maxLockHoldTimeMs) {
                         // release lock, so that lock can be acquired by other threads.
                         lock.refresh();
-                        if (globalStateMgr.getLocalMetastore().getDbIncludeRecycleBin(groupId.dbId) == null) {
-                            return new ColocateMatchResult(lock.getHeldTimeNs(), Status.UNKNOWN);
+                        db = globalStateMgr.getLocalMetastore().getDbIncludeRecycleBin(groupId.dbId);
+                        if (db == null) {
+                            isAborted = true;
+                            break TABLE;
                         }
-                        if (globalStateMgr.getLocalMetastore().getTableIncludeRecycleBin(db, olapTable.getId()) == null) {
+                        backendBucketsSeq = colocateIndex.getBackendsPerBucketSeqSet(groupId);
+                        if (backendBucketsSeq.isEmpty()) {
+                            isAborted = true;
+                            break TABLE;
+                        }
+                        olapTable = (OlapTable) globalStateMgr.getLocalMetastore()
+                                .getTableIncludeRecycleBin(db, tableId);
+                        if (olapTable == null || !colocateIndex.isColocateGroupTable(groupId, tableId)) {
                             continue TABLE;
                         }
-                        if (globalStateMgr.getLocalMetastore().getPartitionIncludeRecycleBin(olapTable, partition.getId()) ==
-                                null) {
-                            continue;
+                        partition = globalStateMgr.getLocalMetastore()
+                                .getPartitionIncludeRecycleBin(olapTable, partitionId);
+                        if (partition == null) {
+                            continue PARTITION;
                         }
                     }
                     short replicationNum =
-                            globalStateMgr.getLocalMetastore().getReplicationNumIncludeRecycleBin(olapTable.getPartitionInfo(),
-                                    partition.getId());
+                            globalStateMgr.getLocalMetastore().getReplicationNumIncludeRecycleBin(
+                                    olapTable.getPartitionInfo(), partition.getId());
                     if (replicationNum == (short) -1) {
                         continue;
                     }
@@ -811,6 +849,10 @@ public class ColocateTableBalancer extends LeaderDaemon {
                         int idx = 0;
                         for (Long tabletId : index.getTabletIdsInOrder()) {
                             LocalTablet tablet = (LocalTablet) index.getTablet(tabletId);
+                            if (tablet == null) {
+                                idx++;
+                                continue;
+                            }
                             Set<Long> bucketSeq = backendBucketsSeq.get(idx);
 
                             // check tablet colocate status
@@ -827,7 +869,8 @@ public class ColocateTableBalancer extends LeaderDaemon {
                             }
                             if (st == TabletHealthStatus.COLOCATE_MISMATCH && balanceStat.isBalanced()) {
                                 balanceStat =
-                                        BalanceStat.createColocationGroupBalanceStat(tabletId, tablet.getBackendIds(), bucketSeq);
+                                        BalanceStat.createColocationGroupBalanceStat(
+                                                tabletId, tablet.getBackendIds(), bucketSeq);
                             }
 
                             // Tablet has already been scheduled, no need to schedule again
@@ -885,6 +928,46 @@ public class ColocateTableBalancer extends LeaderDaemon {
                                                             Lists.newArrayList(),
                                                     bucketSeq);
                                         }
+
+                                        if (Thread.currentThread().isInterrupted()) {
+                                            isAborted = true;
+                                            break TABLE;
+                                        }
+                                        if (result.second > 0) {
+                                            db = globalStateMgr.getLocalMetastore().getDbIncludeRecycleBin(groupId.dbId);
+                                            if (db == null) {
+                                                isAborted = true;
+                                                break TABLE;
+                                            }
+                                            backendBucketsSeq = colocateIndex.getBackendsPerBucketSeqSet(groupId);
+                                            if (backendBucketsSeq.isEmpty()) {
+                                                isAborted = true;
+                                                break TABLE;
+                                            }
+                                            olapTable = (OlapTable) globalStateMgr.getLocalMetastore()
+                                                    .getTableIncludeRecycleBin(db, tableId);
+                                            if (olapTable == null
+                                                    || !colocateIndex.isColocateGroupTable(groupId, tableId)) {
+                                                continue TABLE;
+                                            }
+                                            partition = globalStateMgr.getLocalMetastore()
+                                                    .getPartitionIncludeRecycleBin(olapTable, partitionId);
+                                            if (partition == null) {
+                                                continue PARTITION;
+                                            }
+                                            replicationNum = globalStateMgr.getLocalMetastore()
+                                                    .getReplicationNumIncludeRecycleBin(
+                                                            olapTable.getPartitionInfo(), partitionId);
+                                            if (replicationNum == (short) -1) {
+                                                continue PARTITION;
+                                            }
+                                            physicalPartition = partition.getDefaultPhysicalPartition();
+                                            visibleVersion = physicalPartition.getVisibleVersion();
+                                            if (physicalPartition.getIndex(index.getId()) != index
+                                                    || backendBucketsSeq.size() != index.getTablets().size()) {
+                                                continue PARTITION;
+                                            }
+                                        }
                                     }
                                 } else {
                                     tablet.setLastStatusCheckTime(checkStartTime);
@@ -909,15 +992,19 @@ public class ColocateTableBalancer extends LeaderDaemon {
                                         Lists.newArrayList(partition.getId())));
                     }
                 } // end for partitions
-            } // end for tables
+            } finally {
+                lock.close();
+                totalHeldTimeNs += lock.getHeldTimeNs();
+            }
+        } // end for tables
 
-        } finally {
-            lock.close();
+        if (isAborted) {
+            return new ColocateMatchResult(totalHeldTimeNs, Status.UNKNOWN);
         }
 
         // The scope tracks actually-held time, so the blocking-add wait windows are
         // already excluded.
-        return new ColocateMatchResult(lock.getHeldTimeNs(),
+        return new ColocateMatchResult(totalHeldTimeNs,
                 isGroupStable ? Status.STABLE : Status.UNSTABLE);
     }
 
