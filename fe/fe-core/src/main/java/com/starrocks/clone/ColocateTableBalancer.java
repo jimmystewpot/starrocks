@@ -841,6 +841,10 @@ public class ColocateTableBalancer extends LeaderDaemon {
                     // Here we only get VISIBLE indexes. All other indexes are not queryable.
                     // So it does not matter if tablets of other indexes are not matched.
                     for (MaterializedIndex index : physicalPartition.getLatestMaterializedIndices(IndexExtState.VISIBLE)) {
+                        if (physicalPartition.getIndex(index.getId()) != index
+                                || backendBucketsSeq.size() != index.getTablets().size()) {
+                            continue;
+                        }
                         Preconditions.checkState(backendBucketsSeq.size() == index.getTablets().size(),
                                 backendBucketsSeq.size() + " v.s. " + index.getTablets().size());
 

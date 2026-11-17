@@ -52,6 +52,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class ColocateTableBalancerLockTest {
     private static final ColocateTableBalancer BALANCER = ColocateTableBalancer.getInstance();
@@ -119,63 +120,74 @@ public class ColocateTableBalancerLockTest {
         ColocateTableIndex colocateIndex = globalStateMgr.getColocateTableIndex();
         GroupId groupId = colocateIndex.getGroup(colocateTbl.getId());
 
-        CountDownLatch insideTabletCheck = new CountDownLatch(1);
-        CountDownLatch resumeTabletCheck = new CountDownLatch(1);
-        AtomicBoolean heldDbIntentionShared = new AtomicBoolean(false);
-        AtomicBoolean heldDbPlainRead = new AtomicBoolean(false);
-        AtomicBoolean heldTableRead = new AtomicBoolean(false);
+        try {
+            CountDownLatch insideTabletCheck = new CountDownLatch(1);
+            CountDownLatch resumeTabletCheck = new CountDownLatch(1);
+            AtomicBoolean heldDbIntentionShared = new AtomicBoolean(false);
+            AtomicBoolean heldDbPlainRead = new AtomicBoolean(false);
+            AtomicBoolean heldTableRead = new AtomicBoolean(false);
 
-        new MockUp<TabletChecker>() {
-            @Mock
-            public TabletHealthStatus getColocateTabletHealthStatus(LocalTablet localTablet, long visibleVersion,
-                                                                    int replicationNum, Set<Long> backendsSet) {
-                LockManager lockManager = GlobalStateMgr.getCurrentState().getLockManager();
-                Locker probe = new Locker();
-                heldDbIntentionShared.set(lockManager.isOwner(db.getId(), probe, LockType.INTENTION_SHARED));
-                heldDbPlainRead.set(lockManager.isOwner(db.getId(), probe, LockType.READ));
-                heldTableRead.set(lockManager.isOwner(colocateTbl.getId(), probe, LockType.READ));
-                insideTabletCheck.countDown();
-                try {
-                    resumeTabletCheck.await(10, TimeUnit.SECONDS);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
+            new MockUp<TabletChecker>() {
+                @Mock
+                public TabletHealthStatus getColocateTabletHealthStatus(LocalTablet localTablet, long visibleVersion,
+                                                                        int replicationNum, Set<Long> backendsSet) {
+                    LockManager lockManager = GlobalStateMgr.getCurrentState().getLockManager();
+                    Locker probe = new Locker();
+                    heldDbIntentionShared.set(lockManager.isOwner(db.getId(), probe, LockType.INTENTION_SHARED));
+                    heldDbPlainRead.set(lockManager.isOwner(db.getId(), probe, LockType.READ));
+                    heldTableRead.set(lockManager.isOwner(colocateTbl.getId(), probe, LockType.READ));
+                    insideTabletCheck.countDown();
+                    try {
+                        resumeTabletCheck.await(10, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return TabletHealthStatus.HEALTHY;
                 }
-                return TabletHealthStatus.HEALTHY;
-            }
-        };
+            };
 
-        AtomicBoolean writerSucceeded = new AtomicBoolean(false);
-        Thread matchThread = new Thread(() -> {
-            Deencapsulation.invoke(BALANCER, "doMatchOneGroup",
-                    groupId, false, globalStateMgr, colocateIndex, globalStateMgr.getTabletScheduler());
-        });
-        matchThread.start();
-        Assertions.assertTrue(insideTabletCheck.await(5, TimeUnit.SECONDS));
-
-        // While doMatchOneGroup holds the lock on t_colocate, acquire WRITE lock on t_other in the same DB
-        Thread writerThread = new Thread(() -> {
-            Locker writerLocker = new Locker();
-            if (writerLocker.tryLockTablesWithIntensiveDbLock(
-                    db.getId(), Lists.newArrayList(otherTbl.getId()), LockType.WRITE, 1000, TimeUnit.MILLISECONDS)) {
+            AtomicBoolean writerSucceeded = new AtomicBoolean(false);
+            AtomicReference<Throwable> matchError = new AtomicReference<>();
+            Thread matchThread = new Thread(() -> {
                 try {
-                    writerSucceeded.set(true);
-                } finally {
-                    writerLocker.unLockTablesWithIntensiveDbLock(
-                            db.getId(), Lists.newArrayList(otherTbl.getId()), LockType.WRITE);
+                    Deencapsulation.invoke(BALANCER, "doMatchOneGroup",
+                            groupId, false, globalStateMgr, colocateIndex, globalStateMgr.getTabletScheduler());
+                } catch (Throwable t) {
+                    matchError.set(t);
                 }
-            }
-        });
-        writerThread.start();
-        writerThread.join(3000);
-        resumeTabletCheck.countDown();
-        matchThread.join(5000);
+            });
+            matchThread.start();
+            Assertions.assertTrue(insideTabletCheck.await(5, TimeUnit.SECONDS));
 
-        Assertions.assertTrue(heldDbIntentionShared.get(), "Expected INTENTION_SHARED on DB");
-        Assertions.assertFalse(heldDbPlainRead.get(), "Must not hold plain READ lock on DB");
-        Assertions.assertTrue(heldTableRead.get(), "Expected READ lock on colocate table");
-        Assertions.assertTrue(writerSucceeded.get(), "Concurrent WRITE on unrelated table in same DB must not block");
+            // While doMatchOneGroup holds the lock on t_colocate, acquire WRITE lock on t_other in the same DB
+            Thread writerThread = new Thread(() -> {
+                Locker writerLocker = new Locker();
+                if (writerLocker.tryLockTablesWithIntensiveDbLock(
+                        db.getId(), Lists.newArrayList(otherTbl.getId()), LockType.WRITE, 1000,
+                        TimeUnit.MILLISECONDS)) {
+                    try {
+                        writerSucceeded.set(true);
+                    } finally {
+                        writerLocker.unLockTablesWithIntensiveDbLock(
+                                db.getId(), Lists.newArrayList(otherTbl.getId()), LockType.WRITE);
+                    }
+                }
+            });
+            writerThread.start();
+            writerThread.join(3000);
+            resumeTabletCheck.countDown();
+            matchThread.join(5000);
 
-        colocateIndex.removeTable(colocateTbl.getId(), colocateTbl, false);
+            Assertions.assertFalse(matchThread.isAlive(), "matchThread should have completed");
+            Assertions.assertNull(matchError.get(), () -> "Unexpected error on matchThread: " + matchError.get());
+            Assertions.assertTrue(heldDbIntentionShared.get(), "Expected INTENTION_SHARED on DB");
+            Assertions.assertFalse(heldDbPlainRead.get(), "Must not hold plain READ lock on DB");
+            Assertions.assertTrue(heldTableRead.get(), "Expected READ lock on colocate table");
+            Assertions.assertTrue(writerSucceeded.get(),
+                    "Concurrent WRITE on unrelated table in same DB must not block");
+        } finally {
+            colocateIndex.removeTable(colocateTbl.getId(), colocateTbl, false);
+        }
     }
 
     @Test
@@ -191,14 +203,16 @@ public class ColocateTableBalancerLockTest {
         ColocateTableIndex colocateIndex = globalStateMgr.getColocateTableIndex();
         GroupId groupId = colocateIndex.getGroup(tbl.getId());
 
-        ColocateMatchResult result = Deencapsulation.invoke(BALANCER, "matchOneGroupUrgent",
-                groupId, globalStateMgr, colocateIndex, globalStateMgr.getTabletScheduler());
+        try {
+            ColocateMatchResult result = Deencapsulation.invoke(BALANCER, "matchOneGroupUrgent",
+                    groupId, globalStateMgr, colocateIndex, globalStateMgr.getTabletScheduler());
 
-        Assertions.assertEquals(Status.STABLE, result.status);
-        Assertions.assertEquals(0L, result.lockTotalTime,
-                "Urgent pass must acquire zero locks when no table in the group is urgent");
-
-        colocateIndex.removeTable(tbl.getId(), tbl, false);
+            Assertions.assertEquals(Status.STABLE, result.status);
+            Assertions.assertEquals(0L, result.lockTotalTime,
+                    "Urgent pass must acquire zero locks when no table in the group is urgent");
+        } finally {
+            colocateIndex.removeTable(tbl.getId(), tbl, false);
+        }
     }
 
     @Test
@@ -219,57 +233,65 @@ public class ColocateTableBalancerLockTest {
         ColocateTableIndex colocateIndex = globalStateMgr.getColocateTableIndex();
         GroupId groupId = colocateIndex.getGroup(tbl.getId());
 
-        Partition p1 = tbl.getPartition("p1");
-        Partition p3 = tbl.getPartition("p3");
+        try {
+            Partition p1 = tbl.getPartition("p1");
+            Partition p3 = tbl.getPartition("p3");
 
-        AtomicInteger refreshCount = new AtomicInteger(0);
-        AtomicLong mockedHoldTimeMs = new AtomicLong(0L);
-        new MockUp<YieldableLock>() {
-            @Mock
-            public long getCurrentHoldTimeMs() {
-                return mockedHoldTimeMs.get();
-            }
+            AtomicInteger refreshCount = new AtomicInteger(0);
+            AtomicLong mockedHoldTimeMs = new AtomicLong(0L);
+            new MockUp<YieldableLock>() {
+                @Mock
+                public long getCurrentHoldTimeMs() {
+                    return mockedHoldTimeMs.get();
+                }
 
-            @Mock
-            public void refresh(mockit.Invocation inv) {
-                refreshCount.incrementAndGet();
-                inv.proceed();
-            }
-        };
+                @Mock
+                public void refresh(mockit.Invocation inv) {
+                    refreshCount.incrementAndGet();
+                    inv.proceed();
+                }
+            };
 
-        // Case 1: p1 and p3 are urgent, p2 is not. With partitionBatchNum = 2,
-        // skipping p2 must not prevent p3 (the 2nd matched partition) from triggering refresh().
-        Config.tablet_checker_partition_batch_num = 2;
-        Config.tablet_checker_lock_time_per_cycle_ms = 60000;
-        new MockUp<TabletChecker>() {
-            @Mock
-            public boolean isUrgentTable(long dbId, long tblId) {
-                return tblId == tbl.getId();
-            }
+            // Case 1: p1 and p3 are urgent, p2 is not. With partitionBatchNum = 2,
+            // skipping p2 must not prevent p3 (the 2nd matched partition) from triggering refresh().
+            Config.tablet_checker_partition_batch_num = 2;
+            Config.tablet_checker_lock_time_per_cycle_ms = 60000;
+            new MockUp<TabletChecker>() {
+                @Mock
+                public boolean isUrgentTable(long dbId, long tblId) {
+                    return tblId == tbl.getId();
+                }
 
-            @Mock
-            public boolean isPartitionUrgent(long dbId, long tblId, long partId) {
-                return partId == p1.getId() || partId == p3.getId();
-            }
-        };
+                @Mock
+                public boolean isPartitionUrgent(long dbId, long tblId, long partId) {
+                    return partId == p1.getId() || partId == p3.getId();
+                }
+            };
 
-        Deencapsulation.invoke(BALANCER, "matchOneGroupUrgent",
-                groupId, globalStateMgr, colocateIndex, globalStateMgr.getTabletScheduler());
-        Assertions.assertEquals(1, refreshCount.get(),
-                "Expected exactly 1 batch refresh on the 2nd matched urgent partition");
+            Deencapsulation.invoke(BALANCER, "matchOneGroupUrgent",
+                    groupId, globalStateMgr, colocateIndex, globalStateMgr.getTabletScheduler());
+            Assertions.assertEquals(1, refreshCount.get(),
+                    "Expected exactly 1 batch refresh on the 2nd matched urgent partition");
 
-        // Case 2: Time-based yielding when hold time >= maxLockHoldTimeMs (100ms floor)
-        refreshCount.set(0);
-        mockedHoldTimeMs.set(150L);
-        Config.tablet_checker_partition_batch_num = 1000;
-        Config.tablet_checker_lock_time_per_cycle_ms = 100;
+            // Case 2: Time-based yielding respects MIN_LOCK_HOLD_TIME_MS (100ms floor) even when config is 10ms
+            refreshCount.set(0);
+            mockedHoldTimeMs.set(50L);
+            Config.tablet_checker_partition_batch_num = 1000;
+            Config.tablet_checker_lock_time_per_cycle_ms = 10;
 
-        Deencapsulation.invoke(BALANCER, "matchOneGroupUrgent",
-                groupId, globalStateMgr, colocateIndex, globalStateMgr.getTabletScheduler());
-        Assertions.assertEquals(2, refreshCount.get(),
-                "Expected time-based refresh on each of the 2 matched urgent partitions");
+            Deencapsulation.invoke(BALANCER, "matchOneGroupUrgent",
+                    groupId, globalStateMgr, colocateIndex, globalStateMgr.getTabletScheduler());
+            Assertions.assertEquals(0, refreshCount.get(),
+                    "Hold time 50ms must not trigger refresh when clamped to 100ms floor");
 
-        colocateIndex.removeTable(tbl.getId(), tbl, false);
+            mockedHoldTimeMs.set(150L);
+            Deencapsulation.invoke(BALANCER, "matchOneGroupUrgent",
+                    groupId, globalStateMgr, colocateIndex, globalStateMgr.getTabletScheduler());
+            Assertions.assertEquals(2, refreshCount.get(),
+                    "Expected time-based refresh on each of the 2 matched urgent partitions at 150ms");
+        } finally {
+            colocateIndex.removeTable(tbl.getId(), tbl, false);
+        }
     }
 
     @Test
@@ -285,37 +307,198 @@ public class ColocateTableBalancerLockTest {
         ColocateTableIndex colocateIndex = globalStateMgr.getColocateTableIndex();
         GroupId groupId = colocateIndex.getGroup(tbl.getId());
 
-        // Set bucket sequence to a non-existent backend so tablet status is COLOCATE_MISMATCH
-        colocateIndex.addBackendsPerBucketSeq(groupId,
-                Lists.<List<Long>>newArrayList(Lists.newArrayList(99999999L), Lists.newArrayList(99999999L)));
+        try {
+            // Set bucket sequence to a non-existent backend so tablet status is COLOCATE_MISMATCH
+            colocateIndex.addBackendsPerBucketSeq(groupId,
+                    Lists.<List<Long>>newArrayList(Lists.newArrayList(99999999L), Lists.newArrayList(99999999L)));
 
-        new MockUp<LocalTablet>() {
-            @Mock
-            public boolean readyToBeRepaired(TabletHealthStatus status, TabletSchedCtx.Priority priority) {
-                return true;
+            new MockUp<LocalTablet>() {
+                @Mock
+                public boolean readyToBeRepaired(TabletHealthStatus status, TabletSchedCtx.Priority priority) {
+                    return true;
+                }
+            };
+
+            AtomicInteger blockingAddCalls = new AtomicInteger(0);
+            new MockUp<TabletScheduler>() {
+                @Mock
+                public Pair<Boolean, Long> blockingAddTabletCtxToScheduler(TabletSchedCtx ctx, boolean force,
+                                                                           YieldableLock heldLock)
+                        throws Exception {
+                    blockingAddCalls.incrementAndGet();
+                    // Yield lock via sleepUnlocked and drop the table while unlocked
+                    heldLock.sleepUnlocked(1);
+                    db.unprotectDropTable(tbl.getId(), true, false);
+                    colocateIndex.removeTable(tbl.getId(), tbl, false);
+                    return Pair.create(true, 10L);
+                }
+            };
+
+            ColocateMatchResult result = Deencapsulation.invoke(BALANCER, "doMatchOneGroup",
+                    groupId, false, globalStateMgr, colocateIndex, globalStateMgr.getTabletScheduler());
+            Assertions.assertNotNull(result);
+            Assertions.assertEquals(Status.UNKNOWN, result.status);
+            Assertions.assertTrue(result.lockTotalTime > 0L);
+            Assertions.assertEquals(1, blockingAddCalls.get(),
+                    "Must stop checking remaining tablets of dropped table after post-yield re-validation");
+        } finally {
+            colocateIndex.removeTable(tbl.getId(), tbl, false);
+        }
+    }
+
+    @Test
+    public void testRevalidationSkipsDeColocatedFirstTableAndContinuesToSecondTable() throws Exception {
+        starRocksAssert.withDatabase("db_reval_two_tbls").useDatabase("db_reval_two_tbls")
+                .withTable("CREATE TABLE db_reval_two_tbls.t1(k1 INT NOT NULL) DUPLICATE KEY(k1)\n" +
+                        "PARTITION BY RANGE(k1) (\n" +
+                        "  PARTITION p1 VALUES LESS THAN ('10'),\n" +
+                        "  PARTITION p2 VALUES LESS THAN ('20')\n" +
+                        ")\n" +
+                        "DISTRIBUTED BY HASH(k1) BUCKETS 1\n" +
+                        "PROPERTIES('replication_num' = '1', 'colocate_with' = 'grp_two_tbls');")
+                .withTable("CREATE TABLE db_reval_two_tbls.t2(k1 INT NOT NULL) DUPLICATE KEY(k1)\n" +
+                        "DISTRIBUTED BY HASH(k1) BUCKETS 1\n" +
+                        "PROPERTIES('replication_num' = '1', 'colocate_with' = 'grp_two_tbls');");
+
+        GlobalStateMgr globalStateMgr = GlobalStateMgr.getCurrentState();
+        Database db = globalStateMgr.getLocalMetastore().getDb("db_reval_two_tbls");
+        OlapTable t1 = (OlapTable) globalStateMgr.getLocalMetastore().getTable(db.getFullName(), "t1");
+        OlapTable t2 = (OlapTable) globalStateMgr.getLocalMetastore().getTable(db.getFullName(), "t2");
+        ColocateTableIndex colocateIndex = globalStateMgr.getColocateTableIndex();
+        GroupId groupId = colocateIndex.getGroup(t1.getId());
+
+        try {
+            // Set bucket sequence to a non-existent backend so any checked partition records an unbalanced BalanceStat
+            colocateIndex.addBackendsPerBucketSeq(groupId,
+                    Lists.<List<Long>>newArrayList(Lists.newArrayList(99999999L)));
+            Config.tablet_checker_partition_batch_num = 1;
+
+            AtomicBoolean deColocatedT1 = new AtomicBoolean(false);
+            new MockUp<YieldableLock>() {
+                @Mock
+                public void refresh(mockit.Invocation inv) {
+                    inv.proceed();
+                    if (deColocatedT1.compareAndSet(false, true)) {
+                        // De-colocate t1 during the first refresh while t2 stays in the group
+                        colocateIndex.removeTable(t1.getId(), t1, false);
+                    }
+                }
+            };
+
+            ColocateMatchResult result = Deencapsulation.invoke(BALANCER, "doMatchOneGroup",
+                    groupId, false, globalStateMgr, colocateIndex, globalStateMgr.getTabletScheduler());
+            Assertions.assertEquals(Status.UNSTABLE, result.status);
+            for (Partition p : t1.getPartitions()) {
+                Assertions.assertTrue(
+                        p.getDefaultPhysicalPartition().getLatestBaseIndex().getBalanceStat().isBalanced(),
+                        "De-colocated t1 partitions must be skipped via continue TABLE");
             }
-        };
+            Assertions.assertFalse(
+                    t2.getPartitions().iterator().next()
+                            .getDefaultPhysicalPartition().getLatestBaseIndex().getBalanceStat().isBalanced(),
+                    "Second table t2 must still be checked after continue TABLE on t1");
+        } finally {
+            colocateIndex.removeTable(t1.getId(), t1, false);
+            colocateIndex.removeTable(t2.getId(), t2, false);
+        }
+    }
 
-        AtomicInteger blockingAddCalls = new AtomicInteger(0);
-        new MockUp<TabletScheduler>() {
-            @Mock
-            public Pair<Boolean, Long> blockingAddTabletCtxToScheduler(TabletSchedCtx ctx, boolean force,
-                                                                       YieldableLock heldLock)
-                    throws Exception {
-                blockingAddCalls.incrementAndGet();
-                // Yield lock via sleepUnlocked and drop the table while unlocked
-                heldLock.sleepUnlocked(1);
-                db.unprotectDropTable(tbl.getId(), true, false);
-                colocateIndex.removeTable(tbl.getId(), tbl, false);
-                return Pair.create(true, 10L);
-            }
-        };
+    @Test
+    public void testRevalidationSkipsDroppedPartitionAndContinuesToNextPartition() throws Exception {
+        starRocksAssert.withDatabase("db_reval_part").useDatabase("db_reval_part")
+                .withTable("CREATE TABLE db_reval_part.t_multi_part(k1 INT NOT NULL) DUPLICATE KEY(k1)\n" +
+                        "PARTITION BY RANGE(k1) (\n" +
+                        "  PARTITION p1 VALUES LESS THAN ('10'),\n" +
+                        "  PARTITION p2 VALUES LESS THAN ('20')\n" +
+                        ")\n" +
+                        "DISTRIBUTED BY HASH(k1) BUCKETS 1\n" +
+                        "PROPERTIES('replication_num' = '1', 'colocate_with' = 'grp_reval_part');");
 
-        ColocateMatchResult result = Deencapsulation.invoke(BALANCER, "doMatchOneGroup",
-                groupId, false, globalStateMgr, colocateIndex, globalStateMgr.getTabletScheduler());
-        Assertions.assertNotNull(result);
-        Assertions.assertTrue(result.lockTotalTime > 0L);
-        Assertions.assertEquals(1, blockingAddCalls.get(),
-                "Must stop checking remaining tablets of dropped table after post-yield re-validation");
+        GlobalStateMgr globalStateMgr = GlobalStateMgr.getCurrentState();
+        Database db = globalStateMgr.getLocalMetastore().getDb("db_reval_part");
+        OlapTable tbl = (OlapTable) globalStateMgr.getLocalMetastore().getTable(db.getFullName(), "t_multi_part");
+        ColocateTableIndex colocateIndex = globalStateMgr.getColocateTableIndex();
+        GroupId groupId = colocateIndex.getGroup(tbl.getId());
+
+        try {
+            colocateIndex.addBackendsPerBucketSeq(groupId,
+                    Lists.<List<Long>>newArrayList(Lists.newArrayList(99999999L)));
+            Config.tablet_checker_partition_batch_num = 1;
+
+            List<Partition> orderedPartitions = Lists.newArrayList(
+                    globalStateMgr.getLocalMetastore().getPartitionsIncludeRecycleBin(tbl));
+            Partition firstPartition = orderedPartitions.get(0);
+            Partition secondPartition = orderedPartitions.get(1);
+
+            AtomicBoolean droppedFirst = new AtomicBoolean(false);
+            new MockUp<YieldableLock>() {
+                @Mock
+                public void refresh(mockit.Invocation inv) {
+                    inv.proceed();
+                    if (droppedFirst.compareAndSet(false, true)) {
+                        tbl.dropPartitionAndReserveTablet(firstPartition.getName());
+                    }
+                }
+            };
+
+            ColocateMatchResult result = Deencapsulation.invoke(BALANCER, "doMatchOneGroup",
+                    groupId, false, globalStateMgr, colocateIndex, globalStateMgr.getTabletScheduler());
+            Assertions.assertEquals(Status.UNSTABLE, result.status);
+            Assertions.assertTrue(
+                    firstPartition.getDefaultPhysicalPartition().getLatestBaseIndex().getBalanceStat().isBalanced(),
+                    "Dropped first partition must be skipped via continue PARTITION without setting BalanceStat");
+            Assertions.assertFalse(
+                    secondPartition.getDefaultPhysicalPartition().getLatestBaseIndex().getBalanceStat().isBalanced(),
+                    "Remaining second partition must still be checked after continue PARTITION");
+        } finally {
+            colocateIndex.removeTable(tbl.getId(), tbl, false);
+        }
+    }
+
+    @Test
+    public void testAbortWhenInterruptedDuringBlockingAddTabletCtxToScheduler() throws Exception {
+        starRocksAssert.withDatabase("db_reval_intr").useDatabase("db_reval_intr")
+                .withTable("CREATE TABLE db_reval_intr.t_intr(id INT NOT NULL) " +
+                        "distributed by hash(`id`) buckets 2 " +
+                        "properties('replication_num' = '1', 'colocate_with' = 'grp_reval_intr');");
+
+        GlobalStateMgr globalStateMgr = GlobalStateMgr.getCurrentState();
+        Database db = globalStateMgr.getLocalMetastore().getDb("db_reval_intr");
+        OlapTable tbl = (OlapTable) globalStateMgr.getLocalMetastore().getTable(db.getFullName(), "t_intr");
+        ColocateTableIndex colocateIndex = globalStateMgr.getColocateTableIndex();
+        GroupId groupId = colocateIndex.getGroup(tbl.getId());
+
+        try {
+            colocateIndex.addBackendsPerBucketSeq(groupId,
+                    Lists.<List<Long>>newArrayList(Lists.newArrayList(99999999L), Lists.newArrayList(99999999L)));
+
+            new MockUp<LocalTablet>() {
+                @Mock
+                public boolean readyToBeRepaired(TabletHealthStatus status, TabletSchedCtx.Priority priority) {
+                    return true;
+                }
+            };
+
+            AtomicInteger blockingAddCalls = new AtomicInteger(0);
+            new MockUp<TabletScheduler>() {
+                @Mock
+                public Pair<Boolean, Long> blockingAddTabletCtxToScheduler(TabletSchedCtx ctx, boolean force,
+                                                                           YieldableLock heldLock) {
+                    blockingAddCalls.incrementAndGet();
+                    Thread.currentThread().interrupt();
+                    return Pair.create(false, 10L);
+                }
+            };
+
+            ColocateMatchResult result = Deencapsulation.invoke(BALANCER, "doMatchOneGroup",
+                    groupId, false, globalStateMgr, colocateIndex, globalStateMgr.getTabletScheduler());
+            Assertions.assertEquals(Status.UNKNOWN, result.status,
+                    "Interrupted blockingAddTabletCtxToScheduler must abort doMatchOneGroup with UNKNOWN status");
+            Assertions.assertEquals(1, blockingAddCalls.get(),
+                    "Must break TABLE immediately upon detecting thread interrupt");
+        } finally {
+            Thread.interrupted();
+            colocateIndex.removeTable(tbl.getId(), tbl, false);
+        }
     }
 }

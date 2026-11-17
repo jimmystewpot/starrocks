@@ -1202,6 +1202,7 @@ public class ColocateTableIndexTest {
         ColocateTableIndex.GroupId gid2 = new ColocateTableIndex.GroupId(100L, 201L);
 
         Assertions.assertFalse(colocateIndex.isColocateGroupTable(gid1, 999L));
+        Assertions.assertFalse(colocateIndex.isColocateGroupTable(null, 999L));
 
         Map<Long, ColocateTableIndex.GroupId> table2Group = Deencapsulation.getField(colocateIndex, "table2Group");
         table2Group.put(300L, gid1);

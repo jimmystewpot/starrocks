@@ -533,7 +533,7 @@ public class ColocateTableIndex implements Writable {
     public boolean isColocateGroupTable(GroupId groupId, long tableId) {
         readLock();
         try {
-            return Objects.equals(groupId, table2Group.get(tableId));
+            return groupId != null && Objects.equals(groupId, table2Group.get(tableId));
         } finally {
             readUnlock();
         }
@@ -694,6 +694,11 @@ public class ColocateTableIndex implements Writable {
     }
 
     public int getNumOfTabletsPerBucket(GroupId groupId) {
+        // Lock-free reads are intentional: getAllTableIds snapshots under ColocateTableIndex's readLock,
+        // LocalMetastore.getTable hits Database.idToTable (ConcurrentHashMap), and tbl.getNumberOfPartitions()
+        // is a single size field read used as a balance heuristic. Avoiding a DB/table lock here prevents
+        // NotSupportLockException (DB READ while holding DB IS) and cross-table hold-and-wait when called
+        // from TabletScheduler.scheduleTablet while holding a single table lock.
         List<Long> allTableIds = getAllTableIds(groupId);
         Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(groupId.dbId);
         int numOfTablets = 0;
