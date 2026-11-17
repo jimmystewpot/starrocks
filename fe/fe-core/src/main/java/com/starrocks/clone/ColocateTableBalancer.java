@@ -379,7 +379,7 @@ public class ColocateTableBalancer extends LeaderDaemon {
                     globalStateMgr.getEditLog().logColocateBackendsPerBucketSeq(info, wal -> {
                         colocateIndex.addBackendsPerBucketSeq(gid, balancedBackendsPerBucketSeq);
                     });
-                    colocateIndex.markGroupUnstable(groupId, true);
+                    colocateIndex.markGroupUnstable(gid, true);
                     LOG.info("balance colocate per group , group id {}, " +
                                     "now backends per bucket sequence is: {}, " +
                                     "bucket sequence before balance: {}", gid, balancedBackendsPerBucketSeq,
@@ -426,17 +426,17 @@ public class ColocateTableBalancer extends LeaderDaemon {
                 continue;
             }
 
+            int numOfTabletsPerBucket = colocateIndex.getNumOfTabletsPerBucket(groupId);
+            // if this group has groups colocated with in other databases, we should add them up
+            for (GroupId otherGroupId : coGroupsInOtherDb) {
+                numOfTabletsPerBucket += colocateIndex.getNumOfTabletsPerBucket(otherGroupId);
+            }
             for (int i = 0; i < backendsPerBucketSeq.size(); i++) {
                 for (long backendId : backendsPerBucketSeq.get(i)) {
                     distInfoPerBackendMap.putIfAbsent(backendId,
                             AllGroupsReplicaDistInfoPerBe.createNewDistInfoObj(backendId));
                     AllGroupsReplicaDistInfoPerBe distInfoPerBe = distInfoPerBackendMap.get(backendId);
                     distInfoPerBe.totalNumOfBucketsAssigned++;
-                    int numOfTabletsPerBucket = colocateIndex.getNumOfTabletsPerBucket(groupId);
-                    // if this group has groups colocated with in other databases, we should add them up
-                    for (GroupId otherGroupId : coGroupsInOtherDb) {
-                        numOfTabletsPerBucket += colocateIndex.getNumOfTabletsPerBucket(otherGroupId);
-                    }
                     distInfoPerBe.totalNumOfReplicasAssigned += numOfTabletsPerBucket;
                     distInfoPerBe.replicaNumToGroupsMap
                             .computeIfAbsent(numOfTabletsPerBucket, k -> Sets.newHashSet())
