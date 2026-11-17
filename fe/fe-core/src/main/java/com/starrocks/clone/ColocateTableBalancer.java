@@ -1041,16 +1041,25 @@ public class ColocateTableBalancer extends LeaderDaemon {
         // check each group
         Set<GroupId> groupIds = colocateIndex.getAllGroupIds();
         for (GroupId groupId : groupIds) {
-            ColocateMatchResult urgentResult = matchOneGroupUrgent(groupId, globalStateMgr, colocateIndex, tabletScheduler);
-            lockTotalTime += urgentResult.lockTotalTime;
+            try {
+                ColocateMatchResult urgentResult =
+                        matchOneGroupUrgent(groupId, globalStateMgr, colocateIndex, tabletScheduler);
+                lockTotalTime += urgentResult.lockTotalTime;
 
-            ColocateMatchResult nonUrgentResult = matchOneGroupNonUrgent(groupId, globalStateMgr, colocateIndex, tabletScheduler);
-            lockTotalTime += nonUrgentResult.lockTotalTime;
+                ColocateMatchResult nonUrgentResult =
+                        matchOneGroupNonUrgent(groupId, globalStateMgr, colocateIndex, tabletScheduler);
+                lockTotalTime += nonUrgentResult.lockTotalTime;
 
-            if (urgentResult.status == Status.UNSTABLE || nonUrgentResult.status == Status.UNSTABLE) {
-                colocateIndex.markGroupUnstable(groupId, true);
-            } else if (urgentResult.status == Status.STABLE && nonUrgentResult.status == Status.STABLE) {
-                colocateIndex.markGroupStable(groupId, true);
+                if (urgentResult.status == Status.UNSTABLE || nonUrgentResult.status == Status.UNSTABLE) {
+                    colocateIndex.markGroupUnstable(groupId, true);
+                } else if (urgentResult.status == Status.STABLE && nonUrgentResult.status == Status.STABLE) {
+                    colocateIndex.markGroupStable(groupId, true);
+                }
+            } catch (RuntimeException e) {
+                LOG.warn("Failed to match colocate group {}, skip it this round", groupId, e);
+                if (Thread.currentThread().isInterrupted()) {
+                    break;
+                }
             }
         } // end for groups
 

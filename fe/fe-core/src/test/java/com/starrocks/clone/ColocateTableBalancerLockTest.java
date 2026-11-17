@@ -529,4 +529,54 @@ public class ColocateTableBalancerLockTest {
             colocateIndex.removeTable(tbl.getId(), tbl, false);
         }
     }
+
+    @Test
+    public void testMatchGroupsIsolatesRuntimeExceptionPerGroup() throws Exception {
+        starRocksAssert.withDatabase("db_group_isolation").useDatabase("db_group_isolation")
+                .withTable("CREATE TABLE db_group_isolation.t_poison(id INT NOT NULL) " +
+                        "distributed by hash(`id`) buckets 1 " +
+                        "properties('replication_num' = '1', 'colocate_with' = 'grp_poison');")
+                .withTable("CREATE TABLE db_group_isolation.t_second(id INT NOT NULL) " +
+                        "distributed by hash(`id`) buckets 1 " +
+                        "properties('replication_num' = '1', 'colocate_with' = 'grp_second');");
+
+        GlobalStateMgr globalStateMgr = GlobalStateMgr.getCurrentState();
+        Database db = globalStateMgr.getLocalMetastore().getDb("db_group_isolation");
+        OlapTable poisonTbl = (OlapTable) globalStateMgr.getLocalMetastore().getTable(db.getFullName(), "t_poison");
+        OlapTable secondTbl = (OlapTable) globalStateMgr.getLocalMetastore().getTable(db.getFullName(), "t_second");
+        ColocateTableIndex colocateIndex = globalStateMgr.getColocateTableIndex();
+        GroupId poisonGroupId = colocateIndex.getGroup(poisonTbl.getId());
+        GroupId secondGroupId = colocateIndex.getGroup(secondTbl.getId());
+
+        try {
+            // Corrupt poisonGroupId's bucket sequence (2 replicas in bucket vs replicationNum = 1)
+            // so Preconditions.checkState(bucketSeq.size() == replicationNum) throws IllegalStateException
+            colocateIndex.addBackendsPerBucketSeq(poisonGroupId,
+                    Lists.<List<Long>>newArrayList(Lists.newArrayList(99999998L, 99999999L)));
+
+            // secondGroupId has a mismatched backend and starts marked stable
+            colocateIndex.addBackendsPerBucketSeq(secondGroupId,
+                    Lists.<List<Long>>newArrayList(Lists.newArrayList(99999999L)));
+            colocateIndex.markGroupStable(secondGroupId, false);
+            Assertions.assertFalse(colocateIndex.isGroupUnstable(secondGroupId));
+
+            // Ensure poisonGroupId is visited before secondGroupId
+            new MockUp<ColocateTableIndex>() {
+                @Mock
+                public Set<GroupId> getAllGroupIds() {
+                    java.util.LinkedHashSet<GroupId> ordered = new java.util.LinkedHashSet<>();
+                    ordered.add(poisonGroupId);
+                    ordered.add(secondGroupId);
+                    return ordered;
+                }
+            };
+
+            Deencapsulation.invoke(BALANCER, "matchGroups");
+            Assertions.assertTrue(colocateIndex.isGroupUnstable(secondGroupId),
+                    "Exception in poisonGroupId must not prevent secondGroupId from being matched and marked unstable");
+        } finally {
+            colocateIndex.removeTable(poisonTbl.getId(), poisonTbl, false);
+            colocateIndex.removeTable(secondTbl.getId(), secondTbl, false);
+        }
+    }
 }
