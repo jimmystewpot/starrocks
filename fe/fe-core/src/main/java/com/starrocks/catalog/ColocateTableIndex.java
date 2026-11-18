@@ -530,6 +530,15 @@ public class ColocateTableIndex implements Writable {
         }
     }
 
+    public boolean isColocateGroupTable(GroupId groupId, long tableId) {
+        readLock();
+        try {
+            return groupId != null && Objects.equals(groupId, table2Group.get(tableId));
+        } finally {
+            readUnlock();
+        }
+    }
+
     public boolean isMetaGroupColocateTable(long tableId) {
         readLock();
         try {
@@ -685,22 +694,21 @@ public class ColocateTableIndex implements Writable {
     }
 
     public int getNumOfTabletsPerBucket(GroupId groupId) {
+        // Lock-free reads are intentional: getAllTableIds snapshots under ColocateTableIndex's readLock,
+        // LocalMetastore.getTable hits Database.idToTable (ConcurrentHashMap), and tbl.getNumberOfPartitions()
+        // is a single size field read used as a balance heuristic. Avoiding a DB/table lock here prevents
+        // NotSupportLockException (DB READ while holding DB IS) and cross-table hold-and-wait when called
+        // from TabletScheduler.scheduleTablet while holding a single table lock.
         List<Long> allTableIds = getAllTableIds(groupId);
         Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(groupId.dbId);
         int numOfTablets = 0;
         if (db != null && !allTableIds.isEmpty()) {
-            Locker locker = new Locker();
-            try {
-                locker.lockDatabase(db.getId(), LockType.READ);
-                for (long tableId : allTableIds) {
-                    OlapTable tbl = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore()
-                                .getTable(db.getId(), tableId);
-                    if (tbl != null) {
-                        numOfTablets += tbl.getNumberOfPartitions();
-                    }
+            for (long tableId : allTableIds) {
+                Table tbl = GlobalStateMgr.getCurrentState().getLocalMetastore()
+                        .getTable(db.getId(), tableId);
+                if (tbl instanceof OlapTable) {
+                    numOfTablets += ((OlapTable) tbl).getNumberOfPartitions();
                 }
-            } finally {
-                locker.unLockDatabase(db.getId(), LockType.READ);
             }
         }
         return numOfTablets;

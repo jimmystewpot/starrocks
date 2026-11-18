@@ -1124,4 +1124,105 @@ public class ColocateTableBalancerTest {
         Assertions.assertTrue(aliveBackendIds.isEmpty(), "aliveBackendIds must be reset on demotion");
         Assertions.assertEquals(-1L, systemStableStartTime, "systemStableStartTime must be reset on demotion");
     }
+
+    @Test
+    public void testInitDistInfoPerBackendMapCallsGetNumOfTabletsPerBucketOncePerGroup(
+            @Mocked SystemInfoService infoService) {
+        java.util.concurrent.atomic.AtomicInteger callCount = new java.util.concurrent.atomic.AtomicInteger(0);
+        new MockUp<ColocateTableIndex>() {
+            @Mock
+            public int getNumOfTabletsPerBucket(GroupId groupId) {
+                callCount.incrementAndGet();
+                return 5;
+            }
+        };
+        new Expectations() {
+            {
+                infoService.getAvailableBackendIds();
+                result = Lists.newArrayList(1L, 2L, 3L);
+                minTimes = 0;
+            }
+        };
+
+        GroupId groupId1 = new GroupId(10000L, 10001L);
+        GroupId coGroupId2 = new GroupId(20000L, 10001L);
+        ColocateTableIndex colocateIndex = new ColocateTableIndex();
+        // 4 buckets x 3 replicas = 12 bucket-replica iterations
+        List<List<Long>> bucketsSeq = Lists.newArrayList(
+                Lists.newArrayList(1L, 2L, 3L),
+                Lists.newArrayList(1L, 2L, 3L),
+                Lists.newArrayList(1L, 2L, 3L),
+                Lists.newArrayList(1L, 2L, 3L));
+        colocateIndex.addBackendsPerBucketSeq(groupId1, bucketsSeq);
+
+        Map<GroupId, List<GroupId>> groupToCoGroups = Maps.newHashMap();
+        groupToCoGroups.put(groupId1, Lists.newArrayList(coGroupId2));
+
+        Deencapsulation.invoke(balancer, "initDistInfoPerBackendMap",
+                colocateIndex, infoService, groupToCoGroups);
+
+        // Must be called exactly once for groupId1 and once for coGroupId2 (2 total, not 12 * 2 = 24)
+        Assertions.assertEquals(2, callCount.get());
+    }
+
+    @Test
+    public void testRelocateAndBalancePerGroupMarksCrossDbColocatedGroupsUnstable() throws Exception {
+        starRocksAssert.withDatabase("db_cross1").useDatabase("db_cross1")
+                .withTable("CREATE TABLE db_cross1.t1(id INT NOT NULL) " +
+                        "distributed by hash(`id`) buckets 3 " +
+                        "properties('replication_num' = '1', 'colocate_with' = 'global_grp');");
+        starRocksAssert.withDatabase("db_cross2").useDatabase("db_cross2")
+                .withTable("CREATE TABLE db_cross2.t2(id INT NOT NULL) " +
+                        "distributed by hash(`id`) buckets 3 " +
+                        "properties('replication_num' = '1', 'colocate_with' = 'global_grp');");
+
+        GlobalStateMgr globalStateMgr = GlobalStateMgr.getCurrentState();
+        Database db1 = globalStateMgr.getLocalMetastore().getDb("db_cross1");
+        Database db2 = globalStateMgr.getLocalMetastore().getDb("db_cross2");
+        OlapTable t1 = (OlapTable) globalStateMgr.getLocalMetastore().getTable(db1.getFullName(), "t1");
+        OlapTable t2 = (OlapTable) globalStateMgr.getLocalMetastore().getTable(db2.getFullName(), "t2");
+
+        ColocateTableIndex colocateIndex = globalStateMgr.getCurrentState().getColocateTableIndex();
+        GroupId gid1 = colocateIndex.getGroup(t1.getId());
+        GroupId gid2 = colocateIndex.getGroup(t2.getId());
+        Assertions.assertEquals(gid1.grpId, gid2.grpId);
+        Assertions.assertNotEquals(gid1.dbId, gid2.dbId);
+
+        colocateIndex.markGroupStable(gid1, false);
+        colocateIndex.markGroupStable(gid2, false);
+        Assertions.assertFalse(colocateIndex.isGroupUnstable(gid1));
+        Assertions.assertFalse(colocateIndex.isGroupUnstable(gid2));
+
+        SystemInfoService clusterInfo = globalStateMgr.getNodeMgr().getClusterInfo();
+        long aliveBeId = clusterInfo.getBackendIds(true).get(0);
+        List<List<Long>> initialSeq = Lists.newArrayList(
+                Lists.newArrayList(aliveBeId),
+                Lists.newArrayList(aliveBeId),
+                Lists.newArrayList(aliveBeId));
+        colocateIndex.addBackendsPerBucketSeq(gid1, initialSeq);
+        colocateIndex.addBackendsPerBucketSeq(gid2, initialSeq);
+
+        Backend extraBe = new Backend(99999L, "192.168.99.99", 9050);
+        extraBe.setAlive(true);
+        clusterInfo.addBackend(extraBe);
+        new MockUp<TabletScheduler>() {
+            @Mock
+            public ClusterLoadStatistic getClusterLoadStatistic() {
+                return new ClusterLoadStatistic(
+                        clusterInfo,
+                        globalStateMgr.getTabletInvertedIndex());
+            }
+        };
+
+        try {
+            boolean changed = Deencapsulation.invoke(balancer, "relocateAndBalancePerGroup");
+            Assertions.assertTrue(changed);
+            Assertions.assertTrue(colocateIndex.isGroupUnstable(gid1), "Primary group must be marked unstable");
+            Assertions.assertTrue(colocateIndex.isGroupUnstable(gid2), "Cross-DB colocated group must be marked unstable");
+        } finally {
+            clusterInfo.dropBackend(extraBe);
+            colocateIndex.removeTable(t1.getId(), t1, false);
+            colocateIndex.removeTable(t2.getId(), t2, false);
+        }
+    }
 }
