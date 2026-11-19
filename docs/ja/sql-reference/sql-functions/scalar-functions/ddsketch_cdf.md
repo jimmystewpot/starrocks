@@ -1,6 +1,7 @@
 ---
 displayed_sidebar: docs
 description: "シリアライズされた Datadog DDSketch VARBINARY から近似累積分布比 P(X <= value) を計算します。"
+products: [oss, enterprise, cloud, anywhere]
 ---
 
 # ddsketch_cdf

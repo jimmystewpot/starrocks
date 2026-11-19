@@ -1,6 +1,7 @@
 ---
 displayed_sidebar: docs
 description: "Merges serialized Datadog DDSketch VARBINARY values across rows into a single combined sketch with deterministic accuracy."
+products: [oss, enterprise, cloud, anywhere]
 ---
 
 # ddsketch_combine

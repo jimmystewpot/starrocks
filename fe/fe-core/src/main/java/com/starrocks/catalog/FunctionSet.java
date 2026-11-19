@@ -1023,6 +1023,8 @@ public class FunctionSet {
                     .add(DDSKETCH_ACCUMULATE)
                     .add(DDSKETCH_ACCUMULATE_WEIGHTED)
                     .add(DDSKETCH_COMBINE)
+                    .add(DDSKETCH_PERCENTILE)
+                    .add(DDSKETCH_PERCENTILE_WEIGHTED)
                     // Functions with constant contexts in be are not supported.
                     .add(WINDOW_FUNNEL)
                     .add(APPROX_TOP_K)

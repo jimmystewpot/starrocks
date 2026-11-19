@@ -1,6 +1,7 @@
 ---
 displayed_sidebar: docs
 description: "Datadog DDSketch を使用して、相対誤差保証付きの決定論的な近似パーセンタイルまたは重み付きパーセンタイルを計算します。"
+products: [oss, enterprise, cloud, anywhere]
 ---
 
 # ddsketch_percentile, ddsketch_percentile_weighted

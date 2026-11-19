@@ -1,6 +1,7 @@
 ---
 displayed_sidebar: docs
 description: "2 つのシリアライズされた Datadog DDSketch VARBINARY 値をペアごとにマージし、単一の結合スケッチを返します。"
+products: [oss, enterprise, cloud, anywhere]
 ---
 
 # ddsketch_union

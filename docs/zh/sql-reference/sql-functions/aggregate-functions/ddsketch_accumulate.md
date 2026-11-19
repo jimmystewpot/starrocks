@@ -1,6 +1,7 @@
 ---
 displayed_sidebar: docs
 description: "将数值列或带权重的数值累积到 Datadog DDSketch 草图中，并以 VARBINARY 格式返回序列化的 protobuf 草图。"
+products: [oss, enterprise, cloud, anywhere]
 ---
 
 # ddsketch_accumulate, ddsketch_accumulate_weighted

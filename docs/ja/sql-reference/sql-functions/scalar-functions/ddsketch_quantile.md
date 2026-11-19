@@ -1,6 +1,7 @@
 ---
 displayed_sidebar: docs
 description: "シリアライズされた Datadog DDSketch VARBINARY から分位数、観測カウント、およびビン中点近似の要約統計量を抽出します。"
+products: [oss, enterprise, cloud, anywhere]
 ---
 
 # ddsketch_quantile, ddsketch_min, ddsketch_max, ddsketch_count, ddsketch_sum, ddsketch_avg, ddsketch_empty

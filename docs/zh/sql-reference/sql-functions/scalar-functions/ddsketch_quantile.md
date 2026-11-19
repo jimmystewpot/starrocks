@@ -1,6 +1,7 @@
 ---
 displayed_sidebar: docs
 description: "从序列化的 Datadog DDSketch VARBINARY 草图中提取分位数、观测计数以及基于桶中点的汇总统计信息。"
+products: [oss, enterprise, cloud, anywhere]
 ---
 
 # ddsketch_quantile, ddsketch_min, ddsketch_max, ddsketch_count, ddsketch_sum, ddsketch_avg, ddsketch_empty

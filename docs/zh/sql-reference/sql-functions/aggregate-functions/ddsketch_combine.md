@@ -1,6 +1,7 @@
 ---
 displayed_sidebar: docs
 description: "跨行确定性地合并序列化的 Datadog DDSketch VARBINARY 草图，返回单个合并后的草图。"
+products: [oss, enterprise, cloud, anywhere]
 ---
 
 # ddsketch_combine

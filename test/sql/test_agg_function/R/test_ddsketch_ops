@@ -182,3 +182,50 @@ from t1;
 -- result:
 742.6095	1465.8536	742.6095	1408.3748	1465.8536
 -- !result
+-- 1-phase and 2-phase aggregation nullability on NOT NULL columns when all inputs in a group are ignored
+CREATE TABLE t_not_null_ignored (
+  id BIGINT NOT NULL,
+  grp VARCHAR(8) NOT NULL,
+  val DOUBLE NOT NULL,
+  weight BIGINT NOT NULL,
+  sk VARBINARY NOT NULL
+)
+DUPLICATE KEY(id)
+DISTRIBUTED BY HASH(id) BUCKETS 2
+PROPERTIES ("replication_num" = "1");
+-- result:
+-- !result
+insert into t_not_null_ignored values
+  (1, 'EMPTY', 10.0, 0, cast('' as varbinary)),
+  (2, 'EMPTY', 20.0, -5, cast('' as varbinary));
+-- result:
+-- !result
+SET new_planner_agg_stage = 1;
+-- result:
+-- !result
+select grp,
+       ddsketch_accumulate_weighted(val, weight),
+       ddsketch_combine(sk),
+       ddsketch_percentile_weighted(val, weight, 0.5),
+       ddsketch_percentile_weighted(val, weight, [0.5, 0.99])
+from t_not_null_ignored
+group by grp;
+-- result:
+EMPTY	None	None	None	None
+-- !result
+SET new_planner_agg_stage = 2;
+-- result:
+-- !result
+select grp,
+       ddsketch_accumulate_weighted(val, weight),
+       ddsketch_combine(sk),
+       ddsketch_percentile_weighted(val, weight, 0.5),
+       ddsketch_percentile_weighted(val, weight, [0.5, 0.99])
+from t_not_null_ignored
+group by grp;
+-- result:
+EMPTY	None	None	None	None
+-- !result
+SET new_planner_agg_stage = 0;
+-- result:
+-- !result

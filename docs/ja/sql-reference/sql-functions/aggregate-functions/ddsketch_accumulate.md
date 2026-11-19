@@ -1,6 +1,7 @@
 ---
 displayed_sidebar: docs
 description: "数値列または重み付き数値から Datadog DDSketch を構築し、シリアライズされた protobuf スケッチを VARBINARY として返します。"
+products: [oss, enterprise, cloud, anywhere]
 ---
 
 # ddsketch_accumulate, ddsketch_accumulate_weighted

@@ -1202,10 +1202,13 @@ public class AnalyzeFunctionTest {
         analyzeFail("select ddsketch_accumulate(v1) over () from t0");
         analyzeFail("select ddsketch_combine(v_varbinary) over () from tbinary");
 
-        // Negative analysis: agg_state combinators on accumulate/combine and AGG_KEYS column definition
+        // Negative analysis: agg_state combinators on accumulate/combine/percentile and AGG_KEYS column definition
         analyzeFail("select ddsketch_accumulate_state(v1) from t0");
         analyzeFail("select ddsketch_accumulate_weighted_state(v1, v2) from t0");
         analyzeFail("select ddsketch_combine_state(v_varbinary) from tbinary");
+        analyzeFail("select ddsketch_percentile_state(v1, 0.5) from t0");
+        analyzeFail("select ddsketch_percentile_weighted_state(v1, v2, 0.5) from t0");
+        analyzeFail("select ddsketch_percentile_if(v1, 0.5, v1 > 0) from t0");
         analyzeFail("create table t_agg_ddsketch (k1 int, v1 varbinary ddsketch_combine) " +
                 "aggregate key(k1) distributed by hash(k1) buckets 1 properties('replication_num'='1')");
 

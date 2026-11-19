@@ -1,6 +1,7 @@
 ---
 displayed_sidebar: docs
 description: "从序列化的 Datadog DDSketch VARBINARY 草图中计算近似累积分布比例 P(X <= value)。"
+products: [oss, enterprise, cloud, anywhere]
 ---
 
 # ddsketch_cdf

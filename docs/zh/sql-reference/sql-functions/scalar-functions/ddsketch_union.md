@@ -1,6 +1,7 @@
 ---
 displayed_sidebar: docs
 description: "对两个序列化的 Datadog DDSketch VARBINARY 草图执行标量两两合并，返回合并后的单个草图。"
+products: [oss, enterprise, cloud, anywhere]
 ---
 
 # ddsketch_union

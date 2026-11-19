@@ -1,6 +1,7 @@
 ---
 displayed_sidebar: docs
 description: "基于 Datadog DDSketch 计算具有相对误差保证的确定性近似百分位数或加权近似百分位数。"
+products: [oss, enterprise, cloud, anywhere]
 ---
 
 # ddsketch_percentile, ddsketch_percentile_weighted

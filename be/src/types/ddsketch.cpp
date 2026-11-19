@@ -692,9 +692,30 @@ void DDSketch::_init_mapping_from_gamma(double gamma, double index_offset) {
     _gamma = gamma;
     _index_offset = index_offset;
     _multiplier = 1.0 / std::log(_gamma);
-    const double min_exp = std::exp((static_cast<double>(kMinBinIndex) - _index_offset) / _multiplier);
+
+    const double max_safe_k =
+            std::floor(std::log(std::numeric_limits<double>::max() / _gamma) * _multiplier + _index_offset);
+    if (max_safe_k >= static_cast<double>(kMaxBinIndex)) {
+        _max_safe_bin_index = kMaxBinIndex;
+    } else if (max_safe_k <= static_cast<double>(kMinBinIndex)) {
+        _max_safe_bin_index = kMinBinIndex;
+    } else {
+        _max_safe_bin_index = static_cast<int32_t>(max_safe_k);
+    }
+
+    const double min_safe_k =
+            std::ceil(std::log(std::numeric_limits<double>::min() * _gamma) * _multiplier + _index_offset);
+    if (min_safe_k <= static_cast<double>(kMinBinIndex)) {
+        _min_safe_bin_index = kMinBinIndex;
+    } else if (min_safe_k >= static_cast<double>(kMaxBinIndex)) {
+        _min_safe_bin_index = kMaxBinIndex;
+    } else {
+        _min_safe_bin_index = static_cast<int32_t>(min_safe_k);
+    }
+
+    const double min_exp = std::exp((static_cast<double>(_min_safe_bin_index) - _index_offset) / _multiplier);
     _min_indexable_value = std::max(std::numeric_limits<double>::min() * _gamma, min_exp);
-    const double max_exp = std::exp((static_cast<double>(kMaxBinIndex) - _index_offset) / _multiplier);
+    const double max_exp = std::exp((static_cast<double>(_max_safe_bin_index) - _index_offset) / _multiplier);
     _max_indexable_value = std::min(std::numeric_limits<double>::max() / _gamma, max_exp);
 }
 
@@ -731,27 +752,31 @@ void DDSketch::clear() {
 int32_t DDSketch::key(double value) const {
     const double abs_val = std::abs(value);
     if (abs_val > _max_indexable_value) {
-        return kMaxBinIndex;
+        return _max_safe_bin_index;
     }
     if (abs_val < _min_indexable_value) {
-        return kMinBinIndex;
+        return _min_safe_bin_index;
     }
     double scaled = std::log(abs_val) * _multiplier;
     if (_index_offset != 0.0) {
         scaled += _index_offset;
     }
     const double ceiled = std::ceil(scaled);
-    if (ceiled <= static_cast<double>(kMinBinIndex)) {
-        return kMinBinIndex;
+    if (ceiled <= static_cast<double>(_min_safe_bin_index)) {
+        return _min_safe_bin_index;
     }
-    if (ceiled >= static_cast<double>(kMaxBinIndex)) {
-        return kMaxBinIndex;
+    if (ceiled >= static_cast<double>(_max_safe_bin_index)) {
+        return _max_safe_bin_index;
     }
     return static_cast<int32_t>(ceiled);
 }
 
 double DDSketch::bin_value(int32_t index) const {
-    return (2.0 / (1.0 + _gamma)) * std::exp((static_cast<double>(index) - _index_offset) / _multiplier);
+    const double v = (2.0 / (1.0 + _gamma)) * std::exp((static_cast<double>(index) - _index_offset) / _multiplier);
+    if (!std::isfinite(v)) {
+        return std::numeric_limits<double>::max();
+    }
+    return v;
 }
 
 void DDSketch::add(double value) {

@@ -1,6 +1,7 @@
 ---
 displayed_sidebar: docs
 description: "Merges two serialized Datadog DDSketch VARBINARY values pairwise into a single combined sketch."
+products: [oss, enterprise, cloud, anywhere]
 ---
 
 # ddsketch_union
