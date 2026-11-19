@@ -5885,5 +5885,13 @@ public class MaterializedViewTest extends MaterializedViewTestBase {
         // Query with default alpha (0.01) must not rewrite against MV with alpha=0.02
         testRewriteFail(mvCustomAlpha,
                 "select user_id, ddsketch_percentile(tag_id, 0.99) x from user_tags group by user_id;");
+
+        // 4. Value-changing casts (e.g. narrowing INT -> TINYINT) must not match un-casted column
+        testRewriteFail(mvNoRollup,
+                "select user_id, ddsketch_percentile(cast(tag_id as tinyint), 0.5) x from user_tags group by user_id;");
+        String mvNarrowCast = "select user_id, ddsketch_accumulate(cast(tag_id as tinyint)) " +
+                "from user_tags group by user_id;";
+        testRewriteFail(mvNarrowCast,
+                "select user_id, ddsketch_percentile(tag_id, 0.5) x from user_tags group by user_id;");
     }
 }

@@ -732,4 +732,70 @@ TEST_F(DDSketchAggTest, TestMemTrackerLifecycleAndReset) {
     }
 }
 
+TEST_F(DDSketchAggTest, TestNullableVariadicSpillNonNullableDst) {
+    // When ALWAYS_NULLABLE_RESULT_AGG_FUNCS selects the nullable variadic wrapper for non-nullable inputs,
+    // spill / streaming intermediate output passes a non-nullable BinaryColumn destination to
+    // convert_to_serialize_format. Verify both ddsketch_accumulate and ddsketch_percentile handle this cleanly.
+    {
+        std::vector<TypeDescriptor> args = {TYPE_DOUBLE_DESC};
+        std::unique_ptr<FunctionContext> ctx(
+                FunctionContext::create_test_context(std::move(args), TYPE_VARBINARY_DESC));
+        const AggregateFunction* func =
+                get_aggregate_function("ddsketch_accumulate", TYPE_DOUBLE, TYPE_VARBINARY, true);
+        ASSERT_NE(nullptr, func);
+
+        auto col = DoubleColumn::create();
+        for (int i = 1; i <= 10; ++i) {
+            col->append(static_cast<double>(i));
+        }
+
+        MutableColumnPtr non_nullable_dst = BinaryColumn::create();
+        func->convert_to_serialize_format(ctx.get(), Columns{col}, col->size(), non_nullable_dst);
+        ASSERT_FALSE(ctx->has_error()) << ctx->error_msg();
+        EXPECT_FALSE(non_nullable_dst->is_nullable());
+        ASSERT_EQ(10u, non_nullable_dst->size());
+
+        auto st = ManagedAggrState::create(ctx.get(), func);
+        for (size_t i = 0; i < non_nullable_dst->size(); ++i) {
+            func->merge(ctx.get(), non_nullable_dst.get(), st->state(), i);
+        }
+        ASSERT_FALSE(ctx->has_error()) << ctx->error_msg();
+
+        auto out = NullableColumn::create(BinaryColumn::create(), NullColumn::create());
+        func->finalize_to_column(ctx.get(), st->state(), out.get());
+        ASSERT_EQ(1u, out->size());
+        EXPECT_FALSE(out->is_null(0));
+    }
+
+    {
+        std::vector<TypeDescriptor> args = {TYPE_DOUBLE_DESC, TYPE_DOUBLE_DESC};
+        std::unique_ptr<FunctionContext> ctx(FunctionContext::create_test_context(std::move(args), TYPE_DOUBLE_DESC));
+        const AggregateFunction* func = get_aggregate_function("ddsketch_percentile", TYPE_DOUBLE, TYPE_DOUBLE, true);
+        ASSERT_NE(nullptr, func);
+
+        auto col = DoubleColumn::create();
+        for (int i = 1; i <= 10; ++i) {
+            col->append(static_cast<double>(i) * 10.0);
+        }
+        auto p_col = ColumnHelper::create_const_column<TYPE_DOUBLE>(0.5, 10);
+
+        MutableColumnPtr non_nullable_dst = BinaryColumn::create();
+        func->convert_to_serialize_format(ctx.get(), Columns{col, p_col}, col->size(), non_nullable_dst);
+        ASSERT_FALSE(ctx->has_error()) << ctx->error_msg();
+        EXPECT_FALSE(non_nullable_dst->is_nullable());
+        ASSERT_EQ(10u, non_nullable_dst->size());
+
+        auto st = ManagedAggrState::create(ctx.get(), func);
+        for (size_t i = 0; i < non_nullable_dst->size(); ++i) {
+            func->merge(ctx.get(), non_nullable_dst.get(), st->state(), i);
+        }
+        ASSERT_FALSE(ctx->has_error()) << ctx->error_msg();
+
+        auto out = NullableColumn::create(DoubleColumn::create(), NullColumn::create());
+        func->finalize_to_column(ctx.get(), st->state(), out.get());
+        ASSERT_EQ(1u, out->size());
+        EXPECT_FALSE(out->is_null(0));
+    }
+}
+
 } // namespace starrocks

@@ -111,6 +111,7 @@ struct AggNonNullPred {
 template <typename NestedAggregateFunctionPtr, typename State, bool IsWindowFunc, bool IgnoreNull = true,
           IsAggNullPred<typename State::NestedState> AggNullPred = AggNonNullPred<typename State::NestedState>>
 class NullableAggregateFunctionBase : public AggregateFunctionStateHelper<State> {
+protected:
     using NestedState = typename State::NestedState;
     static constexpr bool is_result_always_nullable = !std::is_same_v<AggNullPred, AggNonNullPred<NestedState>>;
 
@@ -1080,6 +1081,17 @@ public:
 
     void convert_to_serialize_format(FunctionContext* ctx, const Columns& src, size_t chunk_size,
                                      MutableColumnPtr& dst) const override {
+        if constexpr (this->is_result_always_nullable) {
+            if (!dst->is_nullable()) {
+                for ([[maybe_unused]] const auto& col : src) {
+                    DCHECK(!col->is_nullable());
+                }
+                this->nested_function->convert_to_serialize_format(ctx, src, chunk_size, dst);
+                return;
+            }
+        }
+
+        DCHECK(dst->is_nullable());
         auto* dst_nullable_column = down_cast<NullableColumn*>(dst.get());
 
         // dst's null_column, initial with false.

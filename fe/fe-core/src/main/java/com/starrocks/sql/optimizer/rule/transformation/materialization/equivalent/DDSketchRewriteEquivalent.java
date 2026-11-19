@@ -56,8 +56,16 @@ public class DDSketchRewriteEquivalent extends IAggregateRewriteEquivalent {
     }
 
     private static ScalarOperator unwrapDoubleCast(ScalarOperator op) {
-        while (op instanceof CastOperator && op.getType().isNumericType()) {
-            op = op.getChild(0);
+        if (op instanceof CastOperator) {
+            ScalarOperator child = op.getChild(0);
+            Type targetType = op.getType();
+            Type sourceType = child.getType();
+            if (targetType.isDouble() && sourceType.isNumericType()) {
+                return child;
+            }
+            if (targetType.isBigint() && sourceType.isIntegerType()) {
+                return child;
+            }
         }
         return op;
     }
