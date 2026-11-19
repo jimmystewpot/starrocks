@@ -18,6 +18,7 @@ set(TYPES_TEST_FILES
     bitmap_value_test.cpp
     copied_datum_test.cpp
     date_value_test.cpp
+    ddsketch_test.cpp
     decimalv2_value_test.cpp
     decimalv3_test.cpp
     datetime_value_test.cpp
