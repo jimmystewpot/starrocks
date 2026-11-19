@@ -704,4 +704,102 @@ TEST_F(DDSketchTest, TestSparseModeAndOptimizations) {
     }
 }
 
+TEST_F(DDSketchTest, TestUnalignedBuffersAndTruncationFuzz) {
+    // 1. Unaligned buffer encode/decode/merge_serialized across alignment offsets 0..15 with 0xFE guard canaries
+    DDSketch sk_sparse(0.01);
+    for (double v : {-1000.0, -5.0, 0.0, 0.01, 1.0, 50.0, 500.0, 25000.0}) {
+        sk_sparse.add(v);
+    }
+    DDSketch sk_dense(0.01);
+    for (int i = 1; i <= 500; ++i) {
+        sk_dense.add(static_cast<double>(i) * 0.73);
+        sk_dense.add(-static_cast<double>(i) * 1.19);
+    }
+    sk_dense.add(0.0);
+
+    for (const DDSketch* sk : {&sk_sparse, &sk_dense}) {
+        const size_t ser_size = static_cast<size_t>(sk->serialize_size());
+        for (size_t align_offset = 0; align_offset < 16; ++align_offset) {
+            constexpr size_t kGuard = 16;
+            std::vector<uint8_t> raw(kGuard + align_offset + ser_size + kGuard, 0xFE);
+            uint8_t* target = raw.data() + kGuard + align_offset;
+
+            const size_t written = sk->serialize(target);
+            ASSERT_EQ(ser_size, written);
+            for (size_t i = 0; i < kGuard + align_offset; ++i) {
+                EXPECT_EQ(0xFE, raw[i]);
+            }
+            for (size_t i = kGuard + align_offset + ser_size; i < raw.size(); ++i) {
+                EXPECT_EQ(0xFE, raw[i]);
+            }
+
+            Slice unaligned_slice(reinterpret_cast<const char*>(target), written);
+            DDSketch decoded;
+            ASSERT_TRUE(decoded.deserialize(unaligned_slice).ok());
+            EXPECT_EQ(sk->total_count(), decoded.total_count());
+            EXPECT_DOUBLE_EQ(sk->quantile(0.5), decoded.quantile(0.5));
+            EXPECT_DOUBLE_EQ(sk->quantile(0.99), decoded.quantile(0.99));
+
+            DDSketch merged;
+            ASSERT_TRUE(merged.merge_serialized(unaligned_slice).ok());
+            EXPECT_EQ(sk->total_count(), merged.total_count());
+            EXPECT_DOUBLE_EQ(sk->quantile(0.5), merged.quantile(0.5));
+            EXPECT_DOUBLE_EQ(sk->quantile(0.99), merged.quantile(0.99));
+        }
+
+        // 2. Exhaustive prefix truncation [0..ser_size] in exact-sized heap buffers (traps 1-byte ASan overreads)
+        std::vector<uint8_t> full(ser_size);
+        sk->serialize(full.data());
+        for (size_t prefix_len = 0; prefix_len <= ser_size; ++prefix_len) {
+            std::unique_ptr<uint8_t[]> exact_buf(prefix_len > 0 ? new uint8_t[prefix_len] : nullptr);
+            if (prefix_len > 0) {
+                std::memcpy(exact_buf.get(), full.data(), prefix_len);
+            }
+            Slice s(reinterpret_cast<const char*>(exact_buf.get()), prefix_len);
+
+            DDSketch d;
+            Status st_d = d.deserialize(s);
+            if (prefix_len == 0 || prefix_len == ser_size) {
+                EXPECT_TRUE(st_d.ok());
+            }
+
+            DDSketch m(0.01);
+            m.add(1.0);
+            Status st_m = m.merge_serialized(s);
+            if (prefix_len == 0 || prefix_len == ser_size) {
+                EXPECT_TRUE(st_m.ok());
+            }
+        }
+    }
+
+    // 3. Deterministic byte-level mutation fuzzing in exact-sized ASan heap allocations
+    std::string seed_bytes = serialize_sketch(sk_sparse);
+    std::mt19937_64 rng(20261120ULL);
+    for (int iter = 0; iter < 2000; ++iter) {
+        std::string payload = seed_bytes;
+        size_t num_mut = (rng() % 3) + 1;
+        for (size_t m = 0; m < num_mut; ++m) {
+            size_t pos = rng() % payload.size();
+            payload[pos] ^= static_cast<char>((rng() & 0xFF) | 1);
+        }
+        std::unique_ptr<uint8_t[]> exact_buf(new uint8_t[payload.size()]);
+        std::memcpy(exact_buf.get(), payload.data(), payload.size());
+        Slice fuzzed(reinterpret_cast<const char*>(exact_buf.get()), payload.size());
+
+        DDSketch d;
+        if (d.deserialize(fuzzed).ok()) {
+            (void)d.quantile(0.5);
+            (void)d.cdf(0.0);
+            (void)d.sum();
+        }
+        DDSketch m(0.01);
+        m.add(10.0);
+        if (m.merge_serialized(fuzzed).ok()) {
+            (void)m.quantile(0.5);
+            (void)m.cdf(10.0);
+            (void)m.sum();
+        }
+    }
+}
+
 } // namespace starrocks
