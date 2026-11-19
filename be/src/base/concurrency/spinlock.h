@@ -32,8 +32,8 @@ public:
     // Acquires the lock, spins until the lock becomes available.
     void lock() {
         if (!try_lock()) [[unlikely]] {
-            slow_acquire();
-        }
+                slow_acquire();
+            }
     }
 
     void unlock() {
