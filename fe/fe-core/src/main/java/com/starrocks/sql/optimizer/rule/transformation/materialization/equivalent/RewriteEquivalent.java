@@ -32,6 +32,7 @@ public class RewriteEquivalent {
             ArrayRewriteEquivalent.INSTANCE,
             HLLRewriteEquivalent.INSTANCE,
             PercentileRewriteEquivalent.INSTANCE,
+            DDSketchRewriteEquivalent.INSTANCE,
             AggStateRewriteEquivalent.INSTANCE
     );
     public static final List<IRewriteEquivalent> PREDICATE_EQUIVALENTS = Lists.newArrayList(

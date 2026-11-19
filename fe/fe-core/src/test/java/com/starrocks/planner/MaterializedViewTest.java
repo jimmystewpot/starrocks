@@ -5847,4 +5847,43 @@ public class MaterializedViewTest extends MaterializedViewTestBase {
         String sql = "select count(distinct lo_orderkey) from lineorder where lo_orderkey = 1";
         testRewriteOK(mv, sql);
     }
+
+    @Test
+    public void testDDSketchPercentileMvRewrite() {
+        // 1. Non-rollup MV with default relative_accuracy (0.01)
+        String mvNoRollup = "select user_id, ddsketch_accumulate(tag_id) from user_tags group by user_id;";
+        testRewriteOK(mvNoRollup,
+                "select user_id, ddsketch_percentile(tag_id, 0.5) x from user_tags group by user_id;")
+                .contains("ddsketch_quantile");
+        testRewriteOK(mvNoRollup,
+                "select user_id, ddsketch_percentile(tag_id, 0.99, 0.01) x from user_tags group by user_id;")
+                .contains("ddsketch_quantile");
+        testRewriteOK(mvNoRollup,
+                "select user_id, ddsketch_percentile(tag_id, [0.5, 0.99]) x from user_tags group by user_id;")
+                .contains("ddsketch_quantile");
+        // Mismatched relative_accuracy (0.02 vs MV default 0.01) must not rewrite
+        testRewriteFail(mvNoRollup,
+                "select user_id, ddsketch_percentile(tag_id, 0.5, 0.02) x from user_tags group by user_id;");
+
+        // 2. Rollup MV with default relative_accuracy (0.01)
+        String mvRollup = "select user_id, time, ddsketch_accumulate(tag_id) from user_tags group by user_id, time;";
+        testRewriteOK(mvRollup,
+                "select user_id, ddsketch_percentile(tag_id, 0.99) x from user_tags group by user_id;")
+                .contains("ddsketch_combine", "ddsketch_quantile");
+        testRewriteOK(mvRollup,
+                "select user_id, ddsketch_percentile(tag_id, [0.5, 0.95, 0.99]) x from user_tags group by user_id;")
+                .contains("ddsketch_combine", "ddsketch_quantile");
+        testRewriteFail(mvRollup,
+                "select user_id, ddsketch_percentile(tag_id, 0.99, 0.05) x from user_tags group by user_id;");
+
+        // 3. MV with explicit relative_accuracy (0.02)
+        String mvCustomAlpha = "select user_id, time, ddsketch_accumulate(tag_id, 0.02) " +
+                "from user_tags group by user_id, time;";
+        testRewriteOK(mvCustomAlpha,
+                "select user_id, ddsketch_percentile(tag_id, 0.99, 0.02) x from user_tags group by user_id;")
+                .contains("ddsketch_combine", "ddsketch_quantile");
+        // Query with default alpha (0.01) must not rewrite against MV with alpha=0.02
+        testRewriteFail(mvCustomAlpha,
+                "select user_id, ddsketch_percentile(tag_id, 0.99) x from user_tags group by user_id;");
+    }
 }
