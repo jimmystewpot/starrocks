@@ -65,6 +65,7 @@ set(EXPR_TEST_FILES
     map_element_expr_test.cpp
     map_functions_test.cpp
     ngram_search_test.cpp
+    ddsketch_functions_test.cpp
     percentile_functions_test.cpp
     condition_expr_core_test.cpp
     condition_expr_test.cpp

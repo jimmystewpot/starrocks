@@ -46,6 +46,7 @@ GEN_FUNCTIONS_OUTPUT = ${FE_TARGET_DIR}/com/starrocks/builtins/VectorizedBuiltin
 					${BUILD_DIR}/gen_cpp/opcode/ESFunctions.inc \
 					${BUILD_DIR}/gen_cpp/opcode/GeoFunctions.inc \
 					${BUILD_DIR}/gen_cpp/opcode/PercentileFunctions.inc \
+					${BUILD_DIR}/gen_cpp/opcode/DDSketchFunctions.inc \
 					${BUILD_DIR}/gen_cpp/opcode/ArrayFunctions.inc \
 					${BUILD_DIR}/gen_cpp/opcode/MapFunctions.inc \
 					${BUILD_DIR}/gen_cpp/opcode/GinFunctions.inc \
