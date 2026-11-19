@@ -636,4 +636,72 @@ TEST_F(DDSketchTest, TestMalformedAndAdversarialPayloads) {
     }
 }
 
+TEST_F(DDSketchTest, TestSparseModeAndOptimizations) {
+    // 1. Sparse mode for widely separated bins (span > 64, <= 2048, distinct bins <= 16)
+    {
+        CollapsingLowestDenseStore store;
+        store.add(0, 10);
+        EXPECT_FALSE(store.is_sparse());
+        store.add(200, 20); // span = 201 > 64 -> transitions to sparse buffer (capacity 4 -> 64 bytes)
+        EXPECT_TRUE(store.is_sparse());
+        EXPECT_EQ(2U, store.sparse_bins().size());
+        EXPECT_EQ(0, store.min_index());
+        EXPECT_EQ(200, store.max_index());
+        EXPECT_EQ(30ULL, store.total_count());
+        EXPECT_LE(store.mem_usage(), 4ULL * sizeof(CollapsingLowestDenseStore::SparseBin));
+
+        // Add up to 16 distinct bins within span <= 2048 -> stays sparse
+        for (int i = 1; i <= 14; ++i) {
+            store.add(i * 10, 1);
+        }
+        EXPECT_TRUE(store.is_sparse());
+        EXPECT_EQ(16U, store.sparse_bins().size());
+
+        // 17th distinct bin promotes to dense vector
+        store.add(199, 5);
+        EXPECT_FALSE(store.is_sparse());
+        EXPECT_EQ(201U, store.bins().size());
+        EXPECT_EQ(49ULL, store.total_count());
+    }
+
+    // 2. Batch quantiles(), O(1) cdf(), and merge_serialized() equivalence
+    {
+        DDSketch sk_a(0.01);
+        DDSketch sk_b(0.01);
+        DDSketch sk_ref(0.01);
+        for (double v : {-500.0, -10.0, 0.0, 0.5, 10.0, 250.0, 1000.0}) {
+            sk_a.add(v);
+            sk_ref.add(v);
+        }
+        for (double v : {-200.0, -1.0, 0.0, 5.0, 50.0, 5000.0}) {
+            sk_b.add(v);
+            sk_ref.add(v);
+        }
+
+        std::string wire_b = serialize_sketch(sk_b);
+        ASSERT_TRUE(sk_a.merge_serialized(Slice(wire_b)).ok());
+        EXPECT_EQ(serialize_sketch(sk_ref), serialize_sketch(sk_a));
+
+        // Batch quantiles (including unsorted and out-of-range elements) matches single quantile()
+        const double qs[7] = {0.95, 0.0, 0.50, -0.1, 1.0, 0.25, 1.5};
+        double batch_out[7] = {0};
+        sk_a.quantiles(qs, 7, batch_out);
+        for (size_t i = 0; i < 7; ++i) {
+            double single = sk_a.quantile(qs[i]);
+            if (std::isnan(single)) {
+                EXPECT_TRUE(std::isnan(batch_out[i]));
+            } else {
+                EXPECT_DOUBLE_EQ(single, batch_out[i]);
+            }
+        }
+
+        // Verify cdf() across negative, zero, and positive values
+        for (double x : {-1000.0, -500.0, -200.0, -10.0, -1.0, -1e-305, 0.0, 1e-305, 0.5, 10.0, 250.0, 10000.0}) {
+            double c = sk_a.cdf(x);
+            EXPECT_GE(c, 0.0);
+            EXPECT_LE(c, 1.0);
+        }
+    }
+}
+
 } // namespace starrocks

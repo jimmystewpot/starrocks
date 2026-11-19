@@ -24,8 +24,14 @@ namespace starrocks {
 
 class CollapsingLowestDenseStore {
 public:
+    struct SparseBin {
+        int32_t index;
+        uint64_t count;
+    };
+
     static constexpr uint32_t kDefaultMaxBins = 2048;
     static constexpr uint32_t kGrowthStep = 64;
+    static constexpr uint32_t kMaxSparseBins = 16;
 
     CollapsingLowestDenseStore() = default;
     explicit CollapsingLowestDenseStore(uint32_t max_bins) : _max_bins(max_bins) {}
@@ -35,21 +41,43 @@ public:
     void merge(const CollapsingLowestDenseStore& other);
 
     bool is_empty() const { return _total_count == 0; }
+    bool is_sparse() const { return !_sparse_bins.empty(); }
     uint64_t total_count() const { return _total_count; }
     int32_t offset() const { return _offset; }
+    int32_t min_index() const { return !_sparse_bins.empty() ? _sparse_bins.front().index : _offset; }
+    int32_t max_index() const {
+        if (!_sparse_bins.empty()) {
+            return _sparse_bins.back().index;
+        }
+        return _bins.empty()
+                       ? _offset
+                       : static_cast<int32_t>(static_cast<int64_t>(_offset) + static_cast<int64_t>(_bins.size()) - 1);
+    }
     const std::vector<uint64_t>& bins() const { return _bins; }
+    const std::vector<SparseBin>& sparse_bins() const { return _sparse_bins; }
     uint32_t max_bins() const { return _max_bins; }
-    uint64_t mem_usage() const { return _bins.capacity() * sizeof(uint64_t); }
+    uint64_t mem_usage() const {
+        return _bins.capacity() * sizeof(uint64_t) + _sparse_bins.capacity() * sizeof(SparseBin);
+    }
 
-    // Canonical trim invariant: when _total_count > 0, _bins.front() > 0 and _bins.back() > 0;
-    // when _total_count == 0, _bins.empty() && _offset == 0.
+    uint64_t prefix_count(int32_t max_inclusive_index) const;
+    void init_from_packed_doubles(int32_t trimmed_offset, const uint8_t* trimmed_packed_doubles, size_t trimmed_len,
+                                  uint64_t total_count, size_t nonzero_count);
+    void merge_from_packed_doubles(int32_t trimmed_offset, const uint8_t* trimmed_packed_doubles, size_t trimmed_len,
+                                   uint64_t total_count, size_t nonzero_count);
+
+    // Canonical trim invariant: when _total_count > 0, front and back active bins have count > 0;
+    // when _total_count == 0, _bins.empty() && _sparse_bins.empty() && _offset == 0.
     void trim();
 
 private:
+    void _promote_sparse_to_dense();
+
     int32_t _offset = 0;
     uint32_t _max_bins = kDefaultMaxBins;
     uint64_t _total_count = 0;
     std::vector<uint64_t> _bins;
+    std::vector<SparseBin> _sparse_bins;
 };
 
 class DDSketch {
@@ -73,11 +101,14 @@ public:
     void clear();
 
     void add(double value);
+    void add_batch(const double* values, size_t count);
     Status add_weighted(double value, int64_t weight);
     void add(double value, double weight);
     Status merge(const DDSketch& other);
+    Status merge_serialized(const Slice& src);
 
     double quantile(double q) const;
+    void quantiles(const double* qs, size_t count, double* out) const;
     double cdf(double value) const;
     uint64_t total_count() const { return _negative_store.total_count() + _zero_count + _positive_store.total_count(); }
     double sum() const;
@@ -101,11 +132,13 @@ public:
 private:
     void _init_mapping_from_gamma(double gamma, double index_offset);
     void _ensure_default_mapping();
+    int32_t _key_positive(double abs_val) const;
 
     bool _mapping_initialized = false;
     double _gamma = (1.0 + kDefaultRelativeAccuracy) / (1.0 - kDefaultRelativeAccuracy);
     double _index_offset = 0.0;
     double _multiplier = 0.0;
+    double _bin_norm = 2.0 / (1.0 + (1.0 + kDefaultRelativeAccuracy) / (1.0 - kDefaultRelativeAccuracy));
     double _min_indexable_value = 0.0;
     double _max_indexable_value = 0.0;
     int32_t _min_safe_bin_index = kMinBinIndex;

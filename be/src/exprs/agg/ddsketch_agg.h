@@ -272,18 +272,10 @@ inline void merge_serialized_sketch_slice(FunctionContext* ctx, const Slice& sli
     if (slice.empty()) {
         return;
     }
-    {
-        DDSketch tmp;
-        Status status = tmp.deserialize(slice);
-        if (UNLIKELY(!status.ok())) {
-            ctx->set_error(std::string(status.message()).c_str());
-            return;
-        }
-        status = st.sketch.merge(tmp);
-        if (UNLIKELY(!status.ok())) {
-            ctx->set_error(std::string(status.message()).c_str());
-            return;
-        }
+    Status status = st.sketch.merge_serialized(slice);
+    if (UNLIKELY(!status.ok())) {
+        ctx->set_error(std::string(status.message()).c_str());
+        return;
     }
     st.sync_mem_usage(ctx);
 }
@@ -409,9 +401,7 @@ public:
         if (!columns[0]->is_constant() && !columns[0]->is_nullable()) {
             if (const auto* dcol = dynamic_cast<const DoubleColumn*>(columns[0])) {
                 const double* values = dcol->immutable_data().data();
-                for (size_t i = 0; i < chunk_size; ++i) {
-                    st.sketch.add(values[i]);
-                }
+                st.sketch.add_batch(values, chunk_size);
                 st.sync_mem_usage(ctx);
                 return;
             }
@@ -812,18 +802,10 @@ public:
         }
 
         const Slice proto_slice(src.data + header_bytes, src.size - static_cast<size_t>(header_bytes));
-        {
-            DDSketch tmp;
-            Status status = tmp.deserialize(proto_slice);
-            if (UNLIKELY(!status.ok())) {
-                ctx->set_error(std::string(status.message()).c_str());
-                return;
-            }
-            status = st.sketch.merge(tmp);
-            if (UNLIKELY(!status.ok())) {
-                ctx->set_error(std::string(status.message()).c_str());
-                return;
-            }
+        Status status = st.sketch.merge_serialized(proto_slice);
+        if (UNLIKELY(!status.ok())) {
+            ctx->set_error(std::string(status.message()).c_str());
+            return;
         }
         st.sync_mem_usage(ctx);
     }
@@ -963,10 +945,19 @@ private:
                 array_col->append_default();
                 return;
             }
+            const size_t q_count = st.target_quantiles.size();
+            double stack_out[32];
+            std::vector<double> heap_out;
+            double* out_ptr = stack_out;
+            if (q_count > 32) {
+                heap_out.resize(q_count);
+                out_ptr = heap_out.data();
+            }
+            st.sketch.quantiles(st.target_quantiles.data(), q_count, out_ptr);
             DatumArray result_array;
-            result_array.reserve(st.target_quantiles.size());
-            for (double q : st.target_quantiles) {
-                result_array.emplace_back(st.sketch.quantile(q));
+            result_array.reserve(q_count);
+            for (size_t i = 0; i < q_count; ++i) {
+                result_array.emplace_back(out_ptr[i]);
             }
             array_col->append_datum(Datum(result_array));
         } else {
