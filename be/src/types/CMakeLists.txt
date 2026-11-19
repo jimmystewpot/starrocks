@@ -34,6 +34,7 @@ ADD_BE_LIB(Types
     type_descriptor.cpp
     date_value.cpp
     datetime_value.cpp
+    ddsketch.cpp
     tdigest.cpp
     time_types.cpp
     timestamp_value.cpp
@@ -41,6 +42,8 @@ ADD_BE_LIB(Types
     variant_value.cpp
     geo_wkb.cpp
 )
+
+set_source_files_properties(ddsketch.cpp PROPERTIES COMPILE_FLAGS "-ffp-contract=off")
 
 target_link_libraries(Types PRIVATE
     re2
