@@ -546,6 +546,7 @@ def generate_cpp(path):
         "ESFunctions",
         "GeoFunctions",
         "PercentileFunctions",
+        "DDSketchFunctions",
         "ArrayFunctions",
         "MapFunctions",
         "GinFunctions",

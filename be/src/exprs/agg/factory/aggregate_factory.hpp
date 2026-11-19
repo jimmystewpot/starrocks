@@ -31,6 +31,7 @@
 #include "exprs/agg/count.h"
 #include "exprs/agg/covariance.h"
 #include "exprs/agg/coverage_window.h"
+#include "exprs/agg/ddsketch_agg.h"
 #include "exprs/agg/distinct.h"
 #include "exprs/agg/ds_hll_count_distinct.h"
 #include "exprs/agg/ds_theta_combine.h"
@@ -216,6 +217,34 @@ public:
     static AggregateFunctionPtr MakePercentileApproxWeightedArrayAggregateFunction();
 
     static AggregateFunctionPtr MakePercentileUnionAggregateFunction();
+
+    static AggregateFunctionPtr MakeDDSketchAccumulateAggregateFunction() {
+        return new DDSketchAccumulateAggregateFunction();
+    }
+
+    static AggregateFunctionPtr MakeDDSketchAccumulateWeightedAggregateFunction() {
+        return new DDSketchAccumulateWeightedAggregateFunction();
+    }
+
+    static AggregateFunctionPtr MakeDDSketchCombineAggregateFunction() {
+        return new DDSketchCombineAggregateFunction();
+    }
+
+    static AggregateFunctionPtr MakeDDSketchPercentileAggregateFunction() {
+        return new DDSketchPercentileAggregateFunction();
+    }
+
+    static AggregateFunctionPtr MakeDDSketchPercentileArrayAggregateFunction() {
+        return new DDSketchPercentileArrayAggregateFunction();
+    }
+
+    static AggregateFunctionPtr MakeDDSketchPercentileWeightedAggregateFunction() {
+        return new DDSketchPercentileWeightedAggregateFunction();
+    }
+
+    static AggregateFunctionPtr MakeDDSketchPercentileWeightedArrayAggregateFunction() {
+        return new DDSketchPercentileWeightedArrayAggregateFunction();
+    }
 
     template <LogicalType LT>
     static AggregateFunctionPtr MakePercentileContAggregateFunction();

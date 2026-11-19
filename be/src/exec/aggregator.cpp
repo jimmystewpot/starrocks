@@ -52,8 +52,18 @@
 
 namespace starrocks {
 
-static const std::unordered_set<std::string> ALWAYS_NULLABLE_RESULT_AGG_FUNCS = {
-        "variance_samp", "var_samp", "stddev_samp", "covar_samp", "corr", "max_by_v2", "min_by_v2"};
+static const std::unordered_set<std::string> ALWAYS_NULLABLE_RESULT_AGG_FUNCS = {"variance_samp",
+                                                                                 "var_samp",
+                                                                                 "stddev_samp",
+                                                                                 "covar_samp",
+                                                                                 "corr",
+                                                                                 "max_by_v2",
+                                                                                 "min_by_v2",
+                                                                                 "ddsketch_accumulate",
+                                                                                 "ddsketch_accumulate_weighted",
+                                                                                 "ddsketch_combine",
+                                                                                 "ddsketch_percentile",
+                                                                                 "ddsketch_percentile_weighted"};
 
 static const std::string FUNCTION_COUNT = "count";
 
