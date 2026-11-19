@@ -21,9 +21,11 @@ import com.starrocks.sql.ast.SelectRelation;
 import com.starrocks.sql.ast.expression.AnalyticExpr;
 import com.starrocks.sql.ast.expression.FloatLiteral;
 import com.starrocks.sql.ast.expression.FunctionCallExpr;
+import com.starrocks.sql.ast.expression.FunctionParams;
 import com.starrocks.sql.ast.expression.SlotRef;
 import com.starrocks.sql.ast.expression.StringLiteral;
 import com.starrocks.type.ArrayType;
+import com.starrocks.type.FloatType;
 import com.starrocks.type.GeoType;
 import com.starrocks.type.GeoTypeDescriptor;
 import com.starrocks.type.PrimitiveType;
@@ -1091,5 +1093,136 @@ public class AnalyzeFunctionTest {
         // array_length has no special handling - should fail with clear message
         analyzeFail("select array_length(arr => [1,2,3])",
                 "does not support named arguments");
+    }
+
+    @Test
+    public void testDDSketchFunctions() throws Exception {
+        // Positive analysis: aggregate functions
+        analyzeSuccess("select ddsketch_accumulate(v1) from t0");
+        analyzeSuccess("select ddsketch_accumulate(v1, 0.01) from t0");
+        analyzeSuccess("select ddsketch_accumulate(tf, 0.001) from tall");
+        analyzeSuccess("select ddsketch_accumulate(tf, 0.5) from tall");
+        analyzeSuccess("select ddsketch_accumulate_weighted(v1, v2) from t0");
+        analyzeSuccess("select ddsketch_accumulate_weighted(v1, v2, 0.02) from t0");
+        analyzeSuccess("select ddsketch_combine(v_varbinary) from tbinary");
+        analyzeSuccess("select ddsketch_percentile(v1, 0.5) from t0");
+        analyzeSuccess("select ddsketch_percentile(v1, 0.99, 0.01) from t0");
+        analyzeSuccess("select ddsketch_percentile(v1, [0.5, 0.9, 0.99]) from t0");
+        analyzeSuccess("select ddsketch_percentile(v1, [0.5, 0.9, 0.99], 0.02) from t0");
+        analyzeSuccess("select ddsketch_percentile_weighted(v1, v2, 0.5) from t0");
+        analyzeSuccess("select ddsketch_percentile_weighted(v1, v2, 0.99, 0.01) from t0");
+        analyzeSuccess("select ddsketch_percentile_weighted(v1, v2, [0.5, 0.9, 0.99]) from t0");
+        analyzeSuccess("select ddsketch_percentile_weighted(v1, v2, [0.5, 0.9, 0.99], 0.02) from t0");
+
+        // Positive analysis: scalar functions
+        analyzeSuccess("select ddsketch_empty()");
+        analyzeSuccess("select ddsketch_empty(0.01)");
+        analyzeSuccess("select ddsketch_quantile(v_varbinary, 0.99) from tbinary");
+        analyzeSuccess("select ddsketch_quantile(v_varbinary, [0.5, 0.95, 0.99]) from tbinary");
+        analyzeSuccess("select ddsketch_cdf(v_varbinary, 100.0) from tbinary");
+        analyzeSuccess("select ddsketch_cdf(v_varbinary, [50.0, 100.0, 200.0]) from tbinary");
+        analyzeSuccess("select ddsketch_union(v_varbinary, v_varbinary) from tbinary");
+        analyzeSuccess("select ddsketch_count(v_varbinary) from tbinary");
+        analyzeSuccess("select ddsketch_sum(v_varbinary) from tbinary");
+        analyzeSuccess("select ddsketch_avg(v_varbinary) from tbinary");
+        analyzeSuccess("select ddsketch_min(v_varbinary) from tbinary");
+        analyzeSuccess("select ddsketch_max(v_varbinary) from tbinary");
+
+        // Negative analysis: out-of-range or non-constant relative_accuracy
+        analyzeFail("select ddsketch_accumulate(v1, 0.0001) from t0",
+                "ddsketch relative_accuracy must be a constant in [0.001, 0.5]");
+        analyzeFail("select ddsketch_accumulate(v1, 0.8) from t0",
+                "ddsketch relative_accuracy must be a constant in [0.001, 0.5]");
+        analyzeFail("select ddsketch_accumulate(v1, v2) from t0",
+                "ddsketch relative_accuracy must be a constant in [0.001, 0.5]");
+        analyzeFail("select ddsketch_accumulate(v1, NULL) from t0",
+                "ddsketch relative_accuracy must be a constant in [0.001, 0.5]");
+        analyzeFail("select ddsketch_accumulate_weighted(v1, v2, 0.0001) from t0",
+                "ddsketch relative_accuracy must be a constant in [0.001, 0.5]");
+        analyzeFail("select ddsketch_accumulate_weighted(v1, v2, 0.8) from t0",
+                "ddsketch relative_accuracy must be a constant in [0.001, 0.5]");
+        analyzeFail("select ddsketch_percentile(v1, 0.5, 0.0001) from t0",
+                "ddsketch relative_accuracy must be a constant in [0.001, 0.5]");
+        analyzeFail("select ddsketch_percentile(v1, 0.5, 0.8) from t0",
+                "ddsketch relative_accuracy must be a constant in [0.001, 0.5]");
+        analyzeFail("select ddsketch_percentile_weighted(v1, v2, 0.5, 0.0001) from t0",
+                "ddsketch relative_accuracy must be a constant in [0.001, 0.5]");
+        analyzeFail("select ddsketch_percentile_weighted(v1, v2, 0.5, 0.8) from t0",
+                "ddsketch relative_accuracy must be a constant in [0.001, 0.5]");
+
+        // Negative analysis: out-of-range, empty, or non-constant quantile p
+        analyzeFail("select ddsketch_percentile(v1, -0.1) from t0");
+        analyzeFail("select ddsketch_percentile(v1, 1.2) from t0");
+        analyzeFail("select ddsketch_percentile(v1, []) from t0");
+        analyzeFail("select ddsketch_percentile(v1, [-0.1, 0.5]) from t0");
+        analyzeFail("select ddsketch_percentile(v1, [0.5, 1.2]) from t0");
+        analyzeFail("select ddsketch_percentile(v1, [0.5, NULL]) from t0");
+        analyzeFail("select ddsketch_percentile(v1, v2) from t0");
+        analyzeFail("select ddsketch_percentile_weighted(v1, v2, -0.1) from t0");
+        analyzeFail("select ddsketch_percentile_weighted(v1, v2, 1.2) from t0");
+        analyzeFail("select ddsketch_percentile_weighted(v1, v2, []) from t0");
+
+        // Negative analysis: non-numeric value or weight
+        analyzeFail("select ddsketch_accumulate('a') from tall",
+                "ddsketch_accumulate requires the first parameter (value) to be numeric type");
+        analyzeFail("select ddsketch_accumulate_weighted('a', 1) from tall",
+                "ddsketch_accumulate_weighted requires the first parameter (value) to be numeric type");
+        analyzeFail("select ddsketch_accumulate_weighted(1, 'a') from tall",
+                "ddsketch_accumulate_weighted requires the second parameter (weight) to be numeric type");
+        analyzeFail("select ddsketch_percentile('a', 0.5) from tall",
+                "ddsketch_percentile requires the first parameter (value) to be numeric type");
+        analyzeFail("select ddsketch_percentile_weighted('a', 1, 0.5) from tall",
+                "ddsketch_percentile_weighted requires the first parameter (value) to be numeric type");
+        analyzeFail("select ddsketch_percentile_weighted(1, 'a', 0.5) from tall",
+                "ddsketch_percentile_weighted requires the second parameter (weight) to be numeric type");
+
+        // Negative analysis: DISTINCT (rejected at SQL grammar level and by FunctionAnalyzer guard)
+        analyzeFail("select ddsketch_accumulate(distinct v1) from t0");
+        analyzeFail("select ddsketch_accumulate_weighted(distinct v1, v2) from t0");
+        analyzeFail("select ddsketch_combine(distinct v_varbinary) from tbinary");
+        analyzeFail("select ddsketch_percentile(distinct v1, 0.5) from t0");
+        analyzeFail("select ddsketch_percentile_weighted(distinct v1, v2, 0.5) from t0");
+
+        SlotRef doubleArg = new SlotRef(null, "v1");
+        doubleArg.setType(FloatType.DOUBLE);
+        FunctionCallExpr distinctCall = new FunctionCallExpr(FunctionSet.DDSKETCH_ACCUMULATE,
+                new FunctionParams(true, List.of(doubleArg)));
+        distinctCall.setFn(FunctionAnalyzer.getAnalyzedFunction(getConnectContext(), distinctCall,
+                new Type[] {FloatType.DOUBLE}));
+        distinctCall.setType(distinctCall.getFn().getReturnType());
+        SemanticException distinctErr = Assertions.assertThrows(SemanticException.class,
+                () -> FunctionAnalyzer.analyze(distinctCall));
+        Assertions.assertTrue(distinctErr.getMessage().contains("ddsketch functions do not support DISTINCT"),
+                distinctErr.getMessage());
+
+        // Negative analysis: window functions OVER (...)
+        analyzeFail("select ddsketch_percentile(v1, 0.5) over () from t0");
+        analyzeFail("select ddsketch_accumulate(v1) over () from t0");
+        analyzeFail("select ddsketch_combine(v_varbinary) over () from tbinary");
+
+        // Negative analysis: agg_state combinators on accumulate/combine and AGG_KEYS column definition
+        analyzeFail("select ddsketch_accumulate_state(v1) from t0");
+        analyzeFail("select ddsketch_accumulate_weighted_state(v1, v2) from t0");
+        analyzeFail("select ddsketch_combine_state(v_varbinary) from tbinary");
+        analyzeFail("create table t_agg_ddsketch (k1 int, v1 varbinary ddsketch_combine) " +
+                "aggregate key(k1) distributed by hash(k1) buckets 1 properties('replication_num'='1')");
+
+        // Multi-phase aggregation plan verification (new_planner_agg_stage = 1..4, GROUPING SETS, COUNT(DISTINCT))
+        int prevStage = getConnectContext().getSessionVariable().getNewPlannerAggStage();
+        try {
+            for (int stage = 1; stage <= 4; stage++) {
+                getConnectContext().getSessionVariable().setNewPlanerAggStage(stage);
+                UtFrameUtils.getFragmentPlan(getConnectContext(),
+                        "select v1, ddsketch_percentile(v2, 0.99), ddsketch_percentile(v2, [0.5, 0.99], 0.01), " +
+                        "ddsketch_percentile_weighted(v2, v3, 0.95), ddsketch_accumulate(v2), " +
+                        "ddsketch_accumulate_weighted(v2, v3, 0.02), count(distinct v3) from t0 group by v1");
+            }
+            getConnectContext().getSessionVariable().setNewPlanerAggStage(0);
+            UtFrameUtils.getFragmentPlan(getConnectContext(),
+                    "select v1, v2, ddsketch_percentile(v3, 0.95), ddsketch_accumulate(v3) " +
+                    "from t0 group by grouping sets ((v1), (v1, v2), ())");
+        } finally {
+            getConnectContext().getSessionVariable().setNewPlanerAggStage(prevStage);
+        }
     }
 }

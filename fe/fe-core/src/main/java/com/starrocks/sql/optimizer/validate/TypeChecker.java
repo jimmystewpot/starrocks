@@ -54,6 +54,11 @@ import static com.starrocks.catalog.FunctionSet.ANY_VALUE;
 import static com.starrocks.catalog.FunctionSet.APPROX_COUNT_DISTINCT;
 import static com.starrocks.catalog.FunctionSet.AVG;
 import static com.starrocks.catalog.FunctionSet.BITMAP_UNION_INT;
+import static com.starrocks.catalog.FunctionSet.DDSKETCH_ACCUMULATE;
+import static com.starrocks.catalog.FunctionSet.DDSKETCH_ACCUMULATE_WEIGHTED;
+import static com.starrocks.catalog.FunctionSet.DDSKETCH_COMBINE;
+import static com.starrocks.catalog.FunctionSet.DDSKETCH_PERCENTILE;
+import static com.starrocks.catalog.FunctionSet.DDSKETCH_PERCENTILE_WEIGHTED;
 import static com.starrocks.catalog.FunctionSet.HLL_RAW;
 import static com.starrocks.catalog.FunctionSet.INTERSECT_COUNT;
 import static com.starrocks.catalog.FunctionSet.MAX;
@@ -458,6 +463,43 @@ public class TypeChecker implements PlanValidator.Checker {
             }
         }
 
+        private void checkDDSketchRelativeAccuracy(ScalarOperator accuracyArg, String functionName) {
+            if (!accuracyArg.isConstant() || !(accuracyArg instanceof ConstantOperator)) {
+                throw new StarRocksPlannerException(
+                        String.format("%s ddsketch relative_accuracy must be a constant in [0.001, 0.5] in %s, but got: %s",
+                                PREFIX, functionName, accuracyArg),
+                        ErrorType.USER_ERROR);
+            }
+            ConstantOperator accuracyConst = (ConstantOperator) accuracyArg;
+            if (accuracyConst.isNull()) {
+                throw new StarRocksPlannerException(
+                        String.format("%s ddsketch relative_accuracy must be a constant in [0.001, 0.5] in %s",
+                                PREFIX, functionName),
+                        ErrorType.USER_ERROR);
+            }
+            double alpha = accuracyConst.getDouble();
+            if (!(alpha >= 0.001 && alpha <= 0.5)) {
+                throw new StarRocksPlannerException(
+                        String.format("%s ddsketch relative_accuracy must be a constant in [0.001, 0.5] in %s, but got: %s",
+                                PREFIX, functionName, alpha),
+                        ErrorType.USER_ERROR);
+            }
+        }
+
+        private void checkDDSketchPercentile(List<ScalarOperator> arguments) {
+            checkPercentileParameter(arguments.get(1), DDSKETCH_PERCENTILE);
+            if (arguments.size() == 3) {
+                checkDDSketchRelativeAccuracy(arguments.get(2), DDSKETCH_PERCENTILE);
+            }
+        }
+
+        private void checkDDSketchPercentileWeighted(List<ScalarOperator> arguments) {
+            checkPercentileParameter(arguments.get(2), DDSKETCH_PERCENTILE_WEIGHTED);
+            if (arguments.size() == 4) {
+                checkDDSketchRelativeAccuracy(arguments.get(3), DDSKETCH_PERCENTILE_WEIGHTED);
+            }
+        }
+
         private void checkAggArguments(CallOperator aggCall, boolean isMergeAggFn) {
             String functionName = aggCall.getFunction().functionName();
             List<ScalarOperator> arguments = aggCall.getArguments();
@@ -506,6 +548,41 @@ public class TypeChecker implements PlanValidator.Checker {
                         checkColType(arguments.get(1), aggCall, definedTypes[1], argTypes.get(1));
                     } else {
                         // check args in merge phase
+                    }
+                    break;
+                case DDSKETCH_COMBINE:
+                    if (!isMergeAggFn) {
+                        checkColType(arguments.get(0), aggCall, definedTypes[0], argTypes.get(0));
+                    }
+                    break;
+                case DDSKETCH_ACCUMULATE:
+                    if (!isMergeAggFn) {
+                        checkColType(arguments.get(0), aggCall, definedTypes[0], argTypes.get(0));
+                        if (arguments.size() == 2) {
+                            checkDDSketchRelativeAccuracy(arguments.get(1), DDSKETCH_ACCUMULATE);
+                        }
+                    }
+                    break;
+                case DDSKETCH_ACCUMULATE_WEIGHTED:
+                    if (!isMergeAggFn) {
+                        checkColType(arguments.get(0), aggCall, definedTypes[0], argTypes.get(0));
+                        checkColType(arguments.get(1), aggCall, definedTypes[1], argTypes.get(1));
+                        if (arguments.size() == 3) {
+                            checkDDSketchRelativeAccuracy(arguments.get(2), DDSKETCH_ACCUMULATE_WEIGHTED);
+                        }
+                    }
+                    break;
+                case DDSKETCH_PERCENTILE:
+                    if (!isMergeAggFn) {
+                        checkDDSketchPercentile(arguments);
+                        checkColType(arguments.get(0), aggCall, definedTypes[0], argTypes.get(0));
+                    }
+                    break;
+                case DDSKETCH_PERCENTILE_WEIGHTED:
+                    if (!isMergeAggFn) {
+                        checkDDSketchPercentileWeighted(arguments);
+                        checkColType(arguments.get(0), aggCall, definedTypes[0], argTypes.get(0));
+                        checkColType(arguments.get(1), aggCall, definedTypes[1], argTypes.get(1));
                     }
                     break;
                 case BITMAP_UNION_INT:
