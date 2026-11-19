@@ -140,16 +140,36 @@ Status skip_unknown_field(uint32_t wire_type, const uint8_t*& p, const uint8_t* 
     }
 }
 
-bool validate_wire_count(double c, uint64_t* out) {
-    if (!std::isfinite(c) || c < 0.0 || c > static_cast<double>(DDSketch::kMaxExactDoubleCount) || std::floor(c) != c) {
+inline bool validate_wire_count(double c, uint64_t* out) {
+    if (c == 0.0) {
+        *out = 0;
+        return true;
+    }
+    if (!std::isfinite(c) || c < 0.0 || c > static_cast<double>(DDSketch::kMaxExactDoubleCount)) {
         return false;
     }
-    *out = static_cast<uint64_t>(c);
+    const uint64_t u = static_cast<uint64_t>(c);
+    if (static_cast<double>(u) != c) {
+        return false;
+    }
+    *out = u;
     return true;
 }
 
+inline size_t stepped_sparse_capacity(size_t needed) {
+    if (needed <= 4) {
+        return 4;
+    }
+    if (needed <= 8) {
+        return 8;
+    }
+    return CollapsingLowestDenseStore::kMaxSparseBins;
+}
+
 size_t store_body_serialized_size(const CollapsingLowestDenseStore& store) {
-    const size_t num_bins = store.bins().size();
+    const size_t num_bins = store.is_sparse() ? static_cast<size_t>(static_cast<int64_t>(store.max_index()) -
+                                                                    static_cast<int64_t>(store.min_index()) + 1)
+                                              : store.bins().size();
     const size_t packed_bytes = num_bins * sizeof(double);
     // Field 2: tag (1 byte) + varint(packed_bytes) + packed_bytes
     size_t len = 1 + varint_size(packed_bytes) + packed_bytes;
@@ -169,12 +189,27 @@ uint8_t* serialize_store(uint8_t* p, uint8_t field_tag, const CollapsingLowestDe
     p = write_varint(p, body_len);
 
     // Field 2: packed repeated double contiguous_bin_counts (tag 0x12)
-    const auto& bins = store.bins();
-    const size_t packed_bytes = bins.size() * sizeof(double);
-    *p++ = 0x12;
-    p = write_varint(p, packed_bytes);
-    for (uint64_t count : bins) {
-        p = write_double_le(p, static_cast<double>(count));
+    if (store.is_sparse()) {
+        const int32_t min_idx = store.min_index();
+        const int32_t max_idx = store.max_index();
+        const size_t num_bins = static_cast<size_t>(static_cast<int64_t>(max_idx) - static_cast<int64_t>(min_idx) + 1);
+        const size_t packed_bytes = num_bins * sizeof(double);
+        *p++ = 0x12;
+        p = write_varint(p, packed_bytes);
+        std::memset(p, 0, packed_bytes);
+        for (const auto& entry : store.sparse_bins()) {
+            const size_t rel = static_cast<size_t>(static_cast<int64_t>(entry.index) - static_cast<int64_t>(min_idx));
+            write_double_le(p + rel * sizeof(double), static_cast<double>(entry.count));
+        }
+        p += packed_bytes;
+    } else {
+        const auto& bins = store.bins();
+        const size_t packed_bytes = bins.size() * sizeof(double);
+        *p++ = 0x12;
+        p = write_varint(p, packed_bytes);
+        for (uint64_t count : bins) {
+            p = write_double_le(p, static_cast<double>(count));
+        }
     }
 
     // Field 3: sint32 contiguous_bin_index_offset (tag 0x18), omitted if 0
@@ -183,6 +218,117 @@ uint8_t* serialize_store(uint8_t* p, uint8_t field_tag, const CollapsingLowestDe
         p = write_varint(p, zigzag_encode_sint32(store.offset()));
     }
     return p;
+}
+
+struct FastContiguousStoreView {
+    bool valid = false;
+    int32_t trimmed_offset = 0;
+    const uint8_t* trimmed_packed_doubles = nullptr;
+    size_t trimmed_len = 0;
+    uint64_t total_count = 0;
+    size_t nonzero_count = 0;
+};
+
+// Attempts to parse a Store submessage that uses the canonical packed contiguous encoding (field 2 + optional field 3).
+// Returns false on any non-canonical encoding or validation failure so the caller falls back to parse_store_submessage.
+bool try_parse_fast_contiguous_store(const uint8_t* p, const uint8_t* end, uint32_t max_bins,
+                                     FastContiguousStoreView* out) {
+    const uint8_t* packed_ptr = nullptr;
+    size_t num_bins = 0;
+    bool has_packed = false;
+    int32_t offset = 0;
+
+    while (p < end) {
+        uint64_t tag = 0;
+        if (!read_varint(p, end, &tag).ok()) {
+            return false;
+        }
+        const uint32_t field_num = static_cast<uint32_t>(tag >> 3);
+        const uint32_t wire_type = static_cast<uint32_t>(tag & 0x07);
+        if (field_num == 2 && wire_type == 2 && !has_packed) {
+            uint64_t byte_len = 0;
+            if (!read_varint(p, end, &byte_len).ok()) {
+                return false;
+            }
+            if (byte_len > static_cast<uint64_t>(end - p) || (byte_len % sizeof(double)) != 0) {
+                return false;
+            }
+            num_bins = static_cast<size_t>(byte_len / sizeof(double));
+            if (num_bins > max_bins || num_bins > DDSketch::kMaxWireBins) {
+                return false;
+            }
+            packed_ptr = p;
+            has_packed = true;
+            p += byte_len;
+        } else if (field_num == 3 && wire_type == 0) {
+            uint64_t raw_offset = 0;
+            if (!read_varint(p, end, &raw_offset).ok() || raw_offset > std::numeric_limits<uint32_t>::max()) {
+                return false;
+            }
+            offset = zigzag_decode_sint32(static_cast<uint32_t>(raw_offset));
+        } else {
+            return false;
+        }
+    }
+
+    if (offset < DDSketch::kMinBinIndex || offset > DDSketch::kMaxBinIndex) {
+        return false;
+    }
+    if (!has_packed || num_bins == 0) {
+        out->valid = true;
+        out->trimmed_offset = 0;
+        out->trimmed_packed_doubles = nullptr;
+        out->trimmed_len = 0;
+        out->total_count = 0;
+        out->nonzero_count = 0;
+        return true;
+    }
+
+    const int64_t last_wire_idx = static_cast<int64_t>(offset) + static_cast<int64_t>(num_bins) - 1;
+    if (last_wire_idx < DDSketch::kMinBinIndex || last_wire_idx > DDSketch::kMaxBinIndex) {
+        return false;
+    }
+
+    uint64_t total_count = 0;
+    size_t nonzero_count = 0;
+    size_t first_nz = num_bins;
+    size_t last_nz = 0;
+
+    for (size_t i = 0; i < num_bins; ++i) {
+        double d = 0.0;
+        std::memcpy(&d, packed_ptr + i * sizeof(double), sizeof(double));
+        uint64_t ucount = 0;
+        if (!validate_wire_count(d, &ucount)) {
+            return false;
+        }
+        if (ucount > 0) {
+            if (total_count > DDSketch::kMaxExactDoubleCount - ucount) {
+                return false;
+            }
+            total_count += ucount;
+            if (nonzero_count == 0) {
+                first_nz = i;
+            }
+            last_nz = i;
+            ++nonzero_count;
+        }
+    }
+
+    out->valid = true;
+    if (nonzero_count == 0) {
+        out->trimmed_offset = 0;
+        out->trimmed_packed_doubles = nullptr;
+        out->trimmed_len = 0;
+        out->total_count = 0;
+        out->nonzero_count = 0;
+    } else {
+        out->trimmed_offset = static_cast<int32_t>(static_cast<int64_t>(offset) + static_cast<int64_t>(first_nz));
+        out->trimmed_packed_doubles = packed_ptr + first_nz * sizeof(double);
+        out->trimmed_len = last_nz - first_nz + 1;
+        out->total_count = total_count;
+        out->nonzero_count = nonzero_count;
+    }
+    return true;
 }
 
 Status parse_index_mapping(const uint8_t* p, const uint8_t* end, double* out_gamma, double* out_offset) {
@@ -471,10 +617,37 @@ void CollapsingLowestDenseStore::clear() {
     _offset = 0;
     _total_count = 0;
     std::vector<uint64_t>().swap(_bins);
+    std::vector<SparseBin>().swap(_sparse_bins);
+}
+
+void CollapsingLowestDenseStore::_promote_sparse_to_dense() {
+    if (_sparse_bins.empty()) {
+        return;
+    }
+    const int32_t min_idx = _sparse_bins.front().index;
+    const int32_t max_idx = _sparse_bins.back().index;
+    const size_t len = static_cast<size_t>(static_cast<int64_t>(max_idx) - static_cast<int64_t>(min_idx) + 1);
+    _offset = min_idx;
+    if (len > _bins.capacity()) {
+        _bins.reserve(stepped_capacity(len, _max_bins));
+    }
+    _bins.assign(len, 0);
+    for (const auto& entry : _sparse_bins) {
+        _bins[static_cast<size_t>(static_cast<int64_t>(entry.index) - static_cast<int64_t>(min_idx))] = entry.count;
+    }
+    std::vector<SparseBin>().swap(_sparse_bins);
 }
 
 void CollapsingLowestDenseStore::trim() {
-    if (_total_count == 0 || _bins.empty()) {
+    if (_total_count == 0) {
+        clear();
+        return;
+    }
+    if (!_sparse_bins.empty()) {
+        _offset = _sparse_bins.front().index;
+        return;
+    }
+    if (_bins.empty()) {
         clear();
         return;
     }
@@ -500,11 +673,168 @@ void CollapsingLowestDenseStore::trim() {
     }
 }
 
+uint64_t CollapsingLowestDenseStore::prefix_count(int32_t max_inclusive_index) const {
+    if (_total_count == 0) {
+        return 0;
+    }
+    const int32_t cur_min = min_index();
+    const int32_t cur_max = max_index();
+    if (max_inclusive_index < cur_min) {
+        return 0;
+    }
+    if (max_inclusive_index >= cur_max) {
+        return _total_count;
+    }
+    if (!_sparse_bins.empty()) {
+        uint64_t sum = 0;
+        for (const auto& entry : _sparse_bins) {
+            if (entry.index > max_inclusive_index) {
+                break;
+            }
+            sum += entry.count;
+        }
+        return sum;
+    }
+    const size_t end_idx =
+            static_cast<size_t>(static_cast<int64_t>(max_inclusive_index) - static_cast<int64_t>(_offset)) + 1;
+    if (end_idx <= _bins.size() / 2) {
+        uint64_t sum = 0;
+        for (size_t i = 0; i < end_idx; ++i) {
+            sum += _bins[i];
+        }
+        return sum;
+    }
+    uint64_t tail_sum = 0;
+    for (size_t i = end_idx; i < _bins.size(); ++i) {
+        tail_sum += _bins[i];
+    }
+    return _total_count - tail_sum;
+}
+
+void CollapsingLowestDenseStore::init_from_packed_doubles(int32_t trimmed_offset, const uint8_t* trimmed_packed_doubles,
+                                                          size_t trimmed_len, uint64_t total_count,
+                                                          size_t nonzero_count) {
+    clear();
+    if (total_count == 0 || trimmed_len == 0) {
+        return;
+    }
+    _offset = trimmed_offset;
+    _total_count = total_count;
+    if (nonzero_count > 1 && nonzero_count <= kMaxSparseBins && trimmed_len > kGrowthStep &&
+        _max_bins > kMaxSparseBins) {
+        _sparse_bins.reserve(stepped_sparse_capacity(nonzero_count));
+        for (size_t i = 0; i < trimmed_len; ++i) {
+            double d = 0.0;
+            std::memcpy(&d, trimmed_packed_doubles + i * sizeof(double), sizeof(double));
+            if (d != 0.0) {
+                const int32_t idx =
+                        static_cast<int32_t>(static_cast<int64_t>(trimmed_offset) + static_cast<int64_t>(i));
+                _sparse_bins.push_back(SparseBin{idx, static_cast<uint64_t>(d)});
+            }
+        }
+        return;
+    }
+
+    _bins.reserve(stepped_capacity(trimmed_len, _max_bins));
+    _bins.resize(trimmed_len);
+    for (size_t i = 0; i < trimmed_len; ++i) {
+        double d = 0.0;
+        std::memcpy(&d, trimmed_packed_doubles + i * sizeof(double), sizeof(double));
+        _bins[i] = static_cast<uint64_t>(d);
+    }
+}
+
+void CollapsingLowestDenseStore::merge_from_packed_doubles(int32_t trimmed_offset,
+                                                           const uint8_t* trimmed_packed_doubles, size_t trimmed_len,
+                                                           uint64_t total_count, size_t nonzero_count) {
+    if (total_count == 0 || trimmed_len == 0) {
+        return;
+    }
+    if (is_empty() && trimmed_len <= _max_bins) {
+        init_from_packed_doubles(trimmed_offset, trimmed_packed_doubles, trimmed_len, total_count, nonzero_count);
+        return;
+    }
+    if (nonzero_count <= kMaxSparseBins || trimmed_len > _max_bins) {
+        for (size_t i = 0; i < trimmed_len; ++i) {
+            double d = 0.0;
+            std::memcpy(&d, trimmed_packed_doubles + i * sizeof(double), sizeof(double));
+            if (d != 0.0) {
+                const int32_t idx =
+                        static_cast<int32_t>(static_cast<int64_t>(trimmed_offset) + static_cast<int64_t>(i));
+                add(idx, static_cast<uint64_t>(d));
+            }
+        }
+        trim();
+        return;
+    }
+
+    if (!_sparse_bins.empty()) {
+        _promote_sparse_to_dense();
+    }
+
+    const int64_t a_min = _offset;
+    const int64_t a_max = static_cast<int64_t>(_offset) + static_cast<int64_t>(_bins.size()) - 1;
+    const int64_t b_min = trimmed_offset;
+    const int64_t b_max = static_cast<int64_t>(trimmed_offset) + static_cast<int64_t>(trimmed_len) - 1;
+
+    const int64_t max_idx = std::max(a_max, b_max);
+    const int64_t min_idx = std::min(a_min, b_min);
+    const int64_t max_bins_i64 = static_cast<int64_t>(_max_bins);
+    const int64_t new_min = std::max(min_idx, max_idx - max_bins_i64 + 1);
+    const size_t new_len = static_cast<size_t>(max_idx - new_min + 1);
+
+    if (new_len > _bins.capacity()) {
+        _bins.reserve(stepped_capacity(new_len, _max_bins));
+    }
+
+    if (new_min > a_max) {
+        const uint64_t collapsed_sum = _total_count;
+        _bins.assign(new_len, 0);
+        _bins[0] = collapsed_sum;
+    } else if (new_min > a_min) {
+        const size_t drop = static_cast<size_t>(new_min - a_min);
+        uint64_t collapsed_sum = 0;
+        for (size_t i = 0; i <= drop; ++i) {
+            collapsed_sum += _bins[i];
+        }
+        const size_t kept = _bins.size() - drop;
+        _bins[drop] = collapsed_sum;
+        std::memmove(_bins.data(), _bins.data() + drop, kept * sizeof(uint64_t));
+        _bins.resize(new_len, 0);
+        if (new_len > kept) {
+            std::memset(_bins.data() + kept, 0, (new_len - kept) * sizeof(uint64_t));
+        }
+    } else {
+        const size_t shift = static_cast<size_t>(a_min - new_min);
+        const size_t old_len = _bins.size();
+        _bins.resize(new_len, 0);
+        if (shift > 0) {
+            std::memmove(_bins.data() + shift, _bins.data(), old_len * sizeof(uint64_t));
+            std::memset(_bins.data(), 0, shift * sizeof(uint64_t));
+        }
+    }
+    _offset = static_cast<int32_t>(new_min);
+
+    for (size_t i = 0; i < trimmed_len; ++i) {
+        double d = 0.0;
+        std::memcpy(&d, trimmed_packed_doubles + i * sizeof(double), sizeof(double));
+        if (d == 0.0) {
+            continue;
+        }
+        const uint64_t c = static_cast<uint64_t>(d);
+        const int64_t idx = b_min + static_cast<int64_t>(i);
+        const size_t pos = (idx <= new_min) ? 0 : static_cast<size_t>(idx - new_min);
+        _bins[pos] += c;
+    }
+    _total_count += total_count;
+    trim();
+}
+
 void CollapsingLowestDenseStore::add(int32_t index, uint64_t count) {
     if (count == 0) {
         return;
     }
-    if (_bins.empty()) {
+    if (_total_count == 0) {
         _offset = index;
         _total_count = count;
         if (_bins.capacity() == 0) {
@@ -512,6 +842,66 @@ void CollapsingLowestDenseStore::add(int32_t index, uint64_t count) {
         }
         _bins.assign(1, count);
         return;
+    }
+
+    if (!_sparse_bins.empty()) {
+        size_t pos = 0;
+        while (pos < _sparse_bins.size() && _sparse_bins[pos].index < index) {
+            ++pos;
+        }
+        if (pos < _sparse_bins.size() && _sparse_bins[pos].index == index) {
+            _sparse_bins[pos].count += count;
+            _total_count += count;
+            return;
+        }
+        const int64_t min_idx = std::min<int64_t>(_sparse_bins.front().index, index);
+        const int64_t max_idx = std::max<int64_t>(_sparse_bins.back().index, index);
+        const int64_t span = max_idx - min_idx + 1;
+        if (_sparse_bins.size() < kMaxSparseBins && span <= static_cast<int64_t>(_max_bins)) {
+            if (_sparse_bins.size() == _sparse_bins.capacity()) {
+                _sparse_bins.reserve(stepped_sparse_capacity(_sparse_bins.size() + 1));
+            }
+            _sparse_bins.insert(_sparse_bins.begin() + static_cast<std::ptrdiff_t>(pos), SparseBin{index, count});
+            _offset = _sparse_bins.front().index;
+            _total_count += count;
+            return;
+        }
+        _promote_sparse_to_dense();
+    } else if (_bins.size() <= kGrowthStep && _max_bins > kMaxSparseBins) {
+        const int64_t cur_min = _offset;
+        const int64_t cur_max = static_cast<int64_t>(_offset) + static_cast<int64_t>(_bins.size()) - 1;
+        if (index < cur_min || index > cur_max) {
+            const int64_t min_idx = std::min<int64_t>(cur_min, index);
+            const int64_t max_idx = std::max<int64_t>(cur_max, index);
+            const int64_t span = max_idx - min_idx + 1;
+            if (span > static_cast<int64_t>(kGrowthStep) && span <= static_cast<int64_t>(_max_bins)) {
+                size_t nz = 0;
+                for (uint64_t c : _bins) {
+                    if (c > 0) {
+                        ++nz;
+                    }
+                }
+                if (nz < kMaxSparseBins) {
+                    _sparse_bins.reserve(stepped_sparse_capacity(nz + 1));
+                    if (index < cur_min) {
+                        _sparse_bins.push_back(SparseBin{index, count});
+                    }
+                    for (size_t i = 0; i < _bins.size(); ++i) {
+                        if (_bins[i] > 0) {
+                            _sparse_bins.push_back(
+                                    SparseBin{static_cast<int32_t>(cur_min + static_cast<int64_t>(i)), _bins[i]});
+                        }
+                    }
+                    if (index > cur_max) {
+                        _sparse_bins.push_back(SparseBin{index, count});
+                    }
+                    std::vector<uint64_t>().swap(_bins);
+                    _offset = _sparse_bins.front().index;
+                    _total_count += count;
+                    return;
+                }
+            }
+        }
     }
 
     const int64_t cur_min = _offset;
@@ -589,6 +979,22 @@ void CollapsingLowestDenseStore::merge(const CollapsingLowestDenseStore& other) 
         return;
     }
     if (is_empty()) {
+        if (other.is_sparse()) {
+            const int64_t span = static_cast<int64_t>(other.max_index()) - static_cast<int64_t>(other.min_index()) + 1;
+            if (other._sparse_bins.size() <= kMaxSparseBins && span <= static_cast<int64_t>(_max_bins) &&
+                _max_bins > kMaxSparseBins) {
+                _offset = other._offset;
+                _total_count = other._total_count;
+                _sparse_bins.reserve(stepped_sparse_capacity(other._sparse_bins.size()));
+                _sparse_bins.assign(other._sparse_bins.begin(), other._sparse_bins.end());
+                return;
+            }
+            for (const auto& entry : other._sparse_bins) {
+                add(entry.index, entry.count);
+            }
+            trim();
+            return;
+        }
         if (other._bins.size() <= _max_bins) {
             _offset = other._offset;
             _total_count = other._total_count;
@@ -608,6 +1014,23 @@ void CollapsingLowestDenseStore::merge(const CollapsingLowestDenseStore& other) 
         }
         trim();
         return;
+    }
+
+    if (other.is_sparse()) {
+        for (const auto& entry : other._sparse_bins) {
+            add(entry.index, entry.count);
+        }
+        trim();
+        return;
+    }
+
+    if (is_sparse()) {
+        if (other._bins.size() == 1) {
+            add(other._offset, other._bins[0]);
+            trim();
+            return;
+        }
+        _promote_sparse_to_dense();
     }
 
     const int64_t a_min = _offset;
@@ -692,6 +1115,7 @@ void DDSketch::_init_mapping_from_gamma(double gamma, double index_offset) {
     _gamma = gamma;
     _index_offset = index_offset;
     _multiplier = 1.0 / std::log(_gamma);
+    _bin_norm = 2.0 / (1.0 + _gamma);
 
     const double max_safe_k =
             std::floor(std::log(std::numeric_limits<double>::max() / _gamma) * _multiplier + _index_offset);
@@ -749,13 +1173,9 @@ void DDSketch::clear() {
     _negative_store.clear();
 }
 
-int32_t DDSketch::key(double value) const {
-    const double abs_val = std::abs(value);
+int32_t DDSketch::_key_positive(double abs_val) const {
     if (abs_val > _max_indexable_value) {
         return _max_safe_bin_index;
-    }
-    if (abs_val < _min_indexable_value) {
-        return _min_safe_bin_index;
     }
     double scaled = std::log(abs_val) * _multiplier;
     if (_index_offset != 0.0) {
@@ -771,8 +1191,16 @@ int32_t DDSketch::key(double value) const {
     return static_cast<int32_t>(ceiled);
 }
 
+int32_t DDSketch::key(double value) const {
+    const double abs_val = std::abs(value);
+    if (abs_val < _min_indexable_value) {
+        return _min_safe_bin_index;
+    }
+    return _key_positive(abs_val);
+}
+
 double DDSketch::bin_value(int32_t index) const {
-    const double v = (2.0 / (1.0 + _gamma)) * std::exp((static_cast<double>(index) - _index_offset) / _multiplier);
+    const double v = _bin_norm * std::exp((static_cast<double>(index) - _index_offset) / _multiplier);
     if (!std::isfinite(v)) {
         return std::numeric_limits<double>::max();
     }
@@ -785,11 +1213,31 @@ void DDSketch::add(double value) {
     }
     _ensure_default_mapping();
     if (value >= _min_indexable_value) {
-        _positive_store.add(key(value), 1);
+        _positive_store.add(_key_positive(value), 1);
     } else if (value <= -_min_indexable_value) {
-        _negative_store.add(key(-value), 1);
+        _negative_store.add(_key_positive(-value), 1);
     } else {
         _zero_count += 1;
+    }
+}
+
+void DDSketch::add_batch(const double* values, size_t count) {
+    if (count == 0) {
+        return;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        const double value = values[i];
+        if (!std::isfinite(value)) {
+            continue;
+        }
+        _ensure_default_mapping();
+        if (value >= _min_indexable_value) {
+            _positive_store.add(_key_positive(value), 1);
+        } else if (value <= -_min_indexable_value) {
+            _negative_store.add(_key_positive(-value), 1);
+        } else {
+            _zero_count += 1;
+        }
     }
 }
 
@@ -809,9 +1257,9 @@ Status DDSketch::add_weighted(double value, int64_t weight) {
     }
     _ensure_default_mapping();
     if (value >= _min_indexable_value) {
-        _positive_store.add(key(value), uweight);
+        _positive_store.add(_key_positive(value), uweight);
     } else if (value <= -_min_indexable_value) {
-        _negative_store.add(key(-value), uweight);
+        _negative_store.add(_key_positive(-value), uweight);
     } else {
         _zero_count += uweight;
     }
@@ -829,9 +1277,9 @@ void DDSketch::add(double value, double weight) {
     }
     _ensure_default_mapping();
     if (value >= _min_indexable_value) {
-        _positive_store.add(key(value), uweight);
+        _positive_store.add(_key_positive(value), uweight);
     } else if (value <= -_min_indexable_value) {
-        _negative_store.add(key(-value), uweight);
+        _negative_store.add(_key_positive(-value), uweight);
     } else {
         _zero_count += uweight;
     }
@@ -872,6 +1320,112 @@ Status DDSketch::merge(const DDSketch& other) {
     return Status::OK();
 }
 
+Status DDSketch::merge_serialized(const Slice& src) {
+    if (src.empty()) {
+        return Status::OK();
+    }
+
+    auto fallback_merge = [this, &src]() -> Status {
+        DDSketch tmp;
+        Status st = tmp.deserialize(src);
+        if (!st.ok()) {
+            return st;
+        }
+        return merge(tmp);
+    };
+
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(src.data);
+    const uint8_t* end = p + src.size;
+
+    bool has_mapping = false;
+    double parsed_gamma = 0.0;
+    double parsed_offset = 0.0;
+    uint64_t parsed_zero_count = 0;
+
+    bool has_pos = false;
+    bool has_neg = false;
+    FastContiguousStoreView pos_view;
+    FastContiguousStoreView neg_view;
+
+    while (p < end) {
+        uint64_t tag = 0;
+        if (!read_varint(p, end, &tag).ok()) {
+            return fallback_merge();
+        }
+        const uint32_t field_num = static_cast<uint32_t>(tag >> 3);
+        const uint32_t wire_type = static_cast<uint32_t>(tag & 0x07);
+        if (field_num == 1 && wire_type == 2) {
+            uint64_t len = 0;
+            if (!read_varint(p, end, &len).ok() || len > static_cast<uint64_t>(end - p)) {
+                return fallback_merge();
+            }
+            if (!parse_index_mapping(p, p + len, &parsed_gamma, &parsed_offset).ok()) {
+                return fallback_merge();
+            }
+            has_mapping = true;
+            p += len;
+        } else if (field_num == 2 && wire_type == 2 && !has_pos) {
+            uint64_t len = 0;
+            if (!read_varint(p, end, &len).ok() || len > static_cast<uint64_t>(end - p) ||
+                !try_parse_fast_contiguous_store(p, p + len, _positive_store.max_bins(), &pos_view)) {
+                return fallback_merge();
+            }
+            has_pos = true;
+            p += len;
+        } else if (field_num == 3 && wire_type == 2 && !has_neg) {
+            uint64_t len = 0;
+            if (!read_varint(p, end, &len).ok() || len > static_cast<uint64_t>(end - p) ||
+                !try_parse_fast_contiguous_store(p, p + len, _negative_store.max_bins(), &neg_view)) {
+                return fallback_merge();
+            }
+            has_neg = true;
+            p += len;
+        } else if (field_num == 4 && wire_type == 1) {
+            double zc = 0.0;
+            if (!read_double_le(p, end, &zc).ok() || !validate_wire_count(zc, &parsed_zero_count)) {
+                return fallback_merge();
+            }
+        } else {
+            return fallback_merge();
+        }
+    }
+
+    if (!has_mapping) {
+        return Status::InvalidArgument("ddsketch: missing IndexMapping");
+    }
+    if (pos_view.total_count > kMaxExactDoubleCount - parsed_zero_count ||
+        neg_view.total_count > kMaxExactDoubleCount - parsed_zero_count - pos_view.total_count) {
+        return Status::InvalidArgument("ddsketch: bin count must be an exact non-negative integer <= 2^53");
+    }
+    const uint64_t other_total = parsed_zero_count + pos_view.total_count + neg_view.total_count;
+
+    if (!_mapping_initialized) {
+        _init_mapping_from_gamma(parsed_gamma, parsed_offset);
+        _mapping_initialized = true;
+    } else {
+        const bool gamma_compatible = std::abs(_gamma - parsed_gamma) <= 1e-12 * _gamma;
+        const bool offset_compatible = std::abs(_index_offset - parsed_offset) <= 1e-12;
+        if (!gamma_compatible || !offset_compatible) {
+            return Status::InvalidArgument(
+                    "ddsketch_combine: cannot merge sketches with incompatible IndexMapping (gamma/offset mismatch)");
+        }
+        if (total_count() > kMaxExactDoubleCount - other_total) {
+            return Status::InvalidArgument("ddsketch: merged total count exceeds 2^53");
+        }
+    }
+
+    _zero_count += parsed_zero_count;
+    if (has_pos && pos_view.total_count > 0) {
+        _positive_store.merge_from_packed_doubles(pos_view.trimmed_offset, pos_view.trimmed_packed_doubles,
+                                                  pos_view.trimmed_len, pos_view.total_count, pos_view.nonzero_count);
+    }
+    if (has_neg && neg_view.total_count > 0) {
+        _negative_store.merge_from_packed_doubles(neg_view.trimmed_offset, neg_view.trimmed_packed_doubles,
+                                                  neg_view.trimmed_len, neg_view.total_count, neg_view.nonzero_count);
+    }
+    return Status::OK();
+}
+
 double DDSketch::quantile(double q) const {
     const uint64_t n = total_count();
     if (n == 0 || std::isnan(q) || q < 0.0 || q > 1.0) {
@@ -882,13 +1436,29 @@ double DDSketch::quantile(double q) const {
     uint64_t cumulative = 0;
 
     // 1. Traverse negative store from highest magnitude bin down to 0 (most negative to least negative)
-    const auto& neg_bins = _negative_store.bins();
-    const int32_t neg_offset = _negative_store.offset();
-    for (size_t idx = neg_bins.size(); idx > 0; --idx) {
-        const size_t i = idx - 1;
-        cumulative += neg_bins[i];
-        if (static_cast<double>(cumulative) > rank) {
-            return -bin_value(static_cast<int32_t>(static_cast<int64_t>(neg_offset) + static_cast<int64_t>(i)));
+    const uint64_t neg_total = _negative_store.total_count();
+    if (neg_total > 0) {
+        if (static_cast<double>(neg_total) <= rank) {
+            cumulative = neg_total;
+        } else if (_negative_store.is_sparse()) {
+            const auto& neg_sparse = _negative_store.sparse_bins();
+            for (size_t idx = neg_sparse.size(); idx > 0; --idx) {
+                const auto& entry = neg_sparse[idx - 1];
+                cumulative += entry.count;
+                if (static_cast<double>(cumulative) > rank) {
+                    return -bin_value(entry.index);
+                }
+            }
+        } else {
+            const auto& neg_bins = _negative_store.bins();
+            const int32_t neg_offset = _negative_store.offset();
+            for (size_t idx = neg_bins.size(); idx > 0; --idx) {
+                const size_t i = idx - 1;
+                cumulative += neg_bins[i];
+                if (static_cast<double>(cumulative) > rank) {
+                    return -bin_value(static_cast<int32_t>(static_cast<int64_t>(neg_offset) + static_cast<int64_t>(i)));
+                }
+            }
         }
     }
 
@@ -898,24 +1468,209 @@ double DDSketch::quantile(double q) const {
         return 0.0;
     }
 
-    // 3. Traverse positive store from 0 up to bins.size() - 1
-    const auto& pos_bins = _positive_store.bins();
-    const int32_t pos_offset = _positive_store.offset();
-    for (size_t i = 0; i < pos_bins.size(); ++i) {
-        cumulative += pos_bins[i];
-        if (static_cast<double>(cumulative) > rank) {
-            return bin_value(static_cast<int32_t>(static_cast<int64_t>(pos_offset) + static_cast<int64_t>(i)));
+    // 3. Traverse positive store
+    if (!_positive_store.is_empty()) {
+        if (_positive_store.is_sparse()) {
+            for (const auto& entry : _positive_store.sparse_bins()) {
+                cumulative += entry.count;
+                if (static_cast<double>(cumulative) > rank) {
+                    return bin_value(entry.index);
+                }
+            }
+        } else {
+            const auto& pos_bins = _positive_store.bins();
+            const int32_t pos_offset = _positive_store.offset();
+            const uint64_t pos_total = _positive_store.total_count();
+            if (rank - static_cast<double>(cumulative) >= 0.5 * static_cast<double>(pos_total)) {
+                uint64_t cum_after = n;
+                for (size_t idx = pos_bins.size(); idx > 0; --idx) {
+                    const size_t i = idx - 1;
+                    const uint64_t c = pos_bins[i];
+                    if (c == 0) {
+                        continue;
+                    }
+                    const uint64_t cum_before = cum_after - c;
+                    if (static_cast<double>(cum_before) <= rank) {
+                        return bin_value(
+                                static_cast<int32_t>(static_cast<int64_t>(pos_offset) + static_cast<int64_t>(i)));
+                    }
+                    cum_after = cum_before;
+                }
+            } else {
+                for (size_t i = 0; i < pos_bins.size(); ++i) {
+                    cumulative += pos_bins[i];
+                    if (static_cast<double>(cumulative) > rank) {
+                        return bin_value(
+                                static_cast<int32_t>(static_cast<int64_t>(pos_offset) + static_cast<int64_t>(i)));
+                    }
+                }
+            }
         }
-    }
-
-    if (!pos_bins.empty()) {
-        return bin_value(
-                static_cast<int32_t>(static_cast<int64_t>(pos_offset) + static_cast<int64_t>(pos_bins.size() - 1)));
+        return bin_value(_positive_store.max_index());
     }
     if (_zero_count > 0) {
         return 0.0;
     }
-    return -bin_value(neg_offset);
+    return -bin_value(_negative_store.min_index());
+}
+
+void DDSketch::quantiles(const double* qs, size_t count, double* out) const {
+    if (count == 0) {
+        return;
+    }
+    if (count == 1) {
+        out[0] = quantile(qs[0]);
+        return;
+    }
+    const uint64_t n = total_count();
+    if (n == 0) {
+        for (size_t k = 0; k < count; ++k) {
+            out[k] = std::numeric_limits<double>::quiet_NaN();
+        }
+        return;
+    }
+
+    struct RankTarget {
+        double rank;
+        size_t out_idx;
+    };
+
+    RankTarget stack_targets[32];
+    std::vector<RankTarget> heap_targets;
+    RankTarget* targets = stack_targets;
+    if (count > 32) {
+        heap_targets.resize(count);
+        targets = heap_targets.data();
+    }
+
+    size_t valid_count = 0;
+    bool sorted = true;
+    const double n_minus_1 = static_cast<double>(n - 1);
+    for (size_t k = 0; k < count; ++k) {
+        const double q = qs[k];
+        if (std::isnan(q) || q < 0.0 || q > 1.0) {
+            out[k] = std::numeric_limits<double>::quiet_NaN();
+        } else {
+            const double r = q * n_minus_1;
+            if (valid_count > 0 && r < targets[valid_count - 1].rank) {
+                sorted = false;
+            }
+            targets[valid_count++] = RankTarget{r, k};
+        }
+    }
+    if (valid_count == 0) {
+        return;
+    }
+    if (!sorted) {
+        std::sort(targets, targets + valid_count,
+                  [](const RankTarget& a, const RankTarget& b) { return a.rank < b.rank; });
+    }
+
+    size_t t_idx = 0;
+    uint64_t cumulative = 0;
+
+    // 1. Negative store
+    const uint64_t neg_total = _negative_store.total_count();
+    if (neg_total > 0) {
+        if (static_cast<double>(neg_total) <= targets[t_idx].rank) {
+            cumulative = neg_total;
+        } else if (_negative_store.is_sparse()) {
+            const auto& neg_sparse = _negative_store.sparse_bins();
+            for (size_t idx = neg_sparse.size(); idx > 0; --idx) {
+                const auto& entry = neg_sparse[idx - 1];
+                cumulative += entry.count;
+                if (static_cast<double>(cumulative) > targets[t_idx].rank) {
+                    const double val = -bin_value(entry.index);
+                    do {
+                        out[targets[t_idx++].out_idx] = val;
+                    } while (t_idx<valid_count&& static_cast<double>(cumulative)> targets[t_idx].rank);
+                    if (t_idx == valid_count) {
+                        return;
+                    }
+                }
+            }
+        } else {
+            const auto& neg_bins = _negative_store.bins();
+            const int32_t neg_offset = _negative_store.offset();
+            for (size_t idx = neg_bins.size(); idx > 0; --idx) {
+                const size_t i = idx - 1;
+                const uint64_t c = neg_bins[i];
+                if (c == 0) {
+                    continue;
+                }
+                cumulative += c;
+                if (static_cast<double>(cumulative) > targets[t_idx].rank) {
+                    const double val = -bin_value(
+                            static_cast<int32_t>(static_cast<int64_t>(neg_offset) + static_cast<int64_t>(i)));
+                    do {
+                        out[targets[t_idx++].out_idx] = val;
+                    } while (t_idx<valid_count&& static_cast<double>(cumulative)> targets[t_idx].rank);
+                    if (t_idx == valid_count) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Zero count
+    cumulative += _zero_count;
+    while (t_idx<valid_count&& static_cast<double>(cumulative)> targets[t_idx].rank) {
+        out[targets[t_idx++].out_idx] = 0.0;
+    }
+    if (t_idx == valid_count) {
+        return;
+    }
+
+    // 3. Positive store
+    if (!_positive_store.is_empty()) {
+        if (_positive_store.is_sparse()) {
+            for (const auto& entry : _positive_store.sparse_bins()) {
+                cumulative += entry.count;
+                if (static_cast<double>(cumulative) > targets[t_idx].rank) {
+                    const double val = bin_value(entry.index);
+                    do {
+                        out[targets[t_idx++].out_idx] = val;
+                    } while (t_idx<valid_count&& static_cast<double>(cumulative)> targets[t_idx].rank);
+                    if (t_idx == valid_count) {
+                        return;
+                    }
+                }
+            }
+        } else {
+            const auto& pos_bins = _positive_store.bins();
+            const int32_t pos_offset = _positive_store.offset();
+            for (size_t i = 0; i < pos_bins.size(); ++i) {
+                const uint64_t c = pos_bins[i];
+                if (c == 0) {
+                    continue;
+                }
+                cumulative += c;
+                if (static_cast<double>(cumulative) > targets[t_idx].rank) {
+                    const double val =
+                            bin_value(static_cast<int32_t>(static_cast<int64_t>(pos_offset) + static_cast<int64_t>(i)));
+                    do {
+                        out[targets[t_idx++].out_idx] = val;
+                    } while (t_idx<valid_count&& static_cast<double>(cumulative)> targets[t_idx].rank);
+                    if (t_idx == valid_count) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    double fallback = 0.0;
+    if (!_positive_store.is_empty()) {
+        fallback = bin_value(_positive_store.max_index());
+    } else if (_zero_count > 0) {
+        fallback = 0.0;
+    } else {
+        fallback = -bin_value(_negative_store.min_index());
+    }
+    while (t_idx < valid_count) {
+        out[targets[t_idx++].out_idx] = fallback;
+    }
 }
 
 double DDSketch::cdf(double value) const {
@@ -932,30 +1687,57 @@ double DDSketch::cdf(double value) const {
 
     uint64_t le_count = 0;
     if (value < 0.0) {
-        const auto& neg_bins = _negative_store.bins();
-        const int32_t neg_offset = _negative_store.offset();
-        for (size_t i = 0; i < neg_bins.size(); ++i) {
-            if (neg_bins[i] == 0) {
-                continue;
+        if (!_negative_store.is_empty()) {
+            const int32_t neg_min = _negative_store.min_index();
+            const int32_t neg_max = _negative_store.max_index();
+            const double abs_v = -value;
+            int32_t k = neg_min;
+            if (abs_v >= _min_indexable_value) {
+                const double approx_k = std::ceil(std::log(abs_v / _bin_norm) * _multiplier + _index_offset);
+                if (approx_k > static_cast<double>(neg_max)) {
+                    k = neg_max + 1;
+                } else if (approx_k <= static_cast<double>(neg_min)) {
+                    k = neg_min;
+                } else {
+                    k = static_cast<int32_t>(approx_k);
+                }
             }
-            const int32_t bin_idx = static_cast<int32_t>(static_cast<int64_t>(neg_offset) + static_cast<int64_t>(i));
-            if (-bin_value(bin_idx) <= value) {
-                le_count += neg_bins[i];
+            while (k > neg_min && -bin_value(k - 1) <= value) {
+                --k;
+            }
+            while (k <= neg_max && -bin_value(k) > value) {
+                ++k;
+            }
+            if (k <= neg_min) {
+                le_count = _negative_store.total_count();
+            } else if (k <= neg_max) {
+                le_count = _negative_store.total_count() - _negative_store.prefix_count(k - 1);
             }
         }
     } else if (value < _min_indexable_value) {
         le_count = _negative_store.total_count() + _zero_count;
     } else {
         le_count = _negative_store.total_count() + _zero_count;
-        const auto& pos_bins = _positive_store.bins();
-        const int32_t pos_offset = _positive_store.offset();
-        for (size_t i = 0; i < pos_bins.size(); ++i) {
-            if (pos_bins[i] == 0) {
-                continue;
+        if (!_positive_store.is_empty()) {
+            const int32_t pos_min = _positive_store.min_index();
+            const int32_t pos_max = _positive_store.max_index();
+            const double approx_k = std::floor(std::log(value / _bin_norm) * _multiplier + _index_offset);
+            int32_t k = 0;
+            if (approx_k >= static_cast<double>(pos_max)) {
+                k = pos_max;
+            } else if (approx_k < static_cast<double>(pos_min)) {
+                k = pos_min - 1;
+            } else {
+                k = static_cast<int32_t>(approx_k);
             }
-            const int32_t bin_idx = static_cast<int32_t>(static_cast<int64_t>(pos_offset) + static_cast<int64_t>(i));
-            if (bin_value(bin_idx) <= value) {
-                le_count += pos_bins[i];
+            while (k < pos_max && bin_value(k + 1) <= value) {
+                ++k;
+            }
+            while (k >= pos_min && bin_value(k) > value) {
+                --k;
+            }
+            if (k >= pos_min) {
+                le_count += _positive_store.prefix_count(k);
             }
         }
     }
@@ -968,25 +1750,78 @@ double DDSketch::sum() const {
         return std::numeric_limits<double>::quiet_NaN();
     }
     double total = 0.0;
-    const auto& neg_bins = _negative_store.bins();
-    const int32_t neg_offset = _negative_store.offset();
-    for (size_t idx = neg_bins.size(); idx > 0; --idx) {
-        const size_t i = idx - 1;
-        if (neg_bins[i] == 0) {
-            continue;
+    const double inv_gamma = 1.0 / _gamma;
+    if (!_negative_store.is_empty()) {
+        if (_negative_store.is_sparse()) {
+            const auto& neg_sparse = _negative_store.sparse_bins();
+            for (size_t idx = neg_sparse.size(); idx > 0; --idx) {
+                const auto& entry = neg_sparse[idx - 1];
+                total -= bin_value(entry.index) * static_cast<double>(entry.count);
+            }
+        } else {
+            const auto& neg_bins = _negative_store.bins();
+            const int32_t neg_offset = _negative_store.offset();
+            double cur_val = 0.0;
+            uint32_t steps_left = 0;
+            for (size_t idx = neg_bins.size(); idx > 0; --idx) {
+                const size_t i = idx - 1;
+                const uint64_t c = neg_bins[i];
+                if (c == 0) {
+                    steps_left = 0;
+                    continue;
+                }
+                if (steps_left == 0) {
+                    const int32_t bin_idx =
+                            static_cast<int32_t>(static_cast<int64_t>(neg_offset) + static_cast<int64_t>(i));
+                    cur_val = bin_value(bin_idx);
+                    steps_left = 16;
+                } else {
+                    cur_val *= inv_gamma;
+                    if (!std::isfinite(cur_val) || cur_val == 0.0) {
+                        const int32_t bin_idx =
+                                static_cast<int32_t>(static_cast<int64_t>(neg_offset) + static_cast<int64_t>(i));
+                        cur_val = bin_value(bin_idx);
+                    }
+                    --steps_left;
+                }
+                total -= cur_val * static_cast<double>(c);
+            }
         }
-        const int32_t bin_idx = static_cast<int32_t>(static_cast<int64_t>(neg_offset) + static_cast<int64_t>(i));
-        total -= bin_value(bin_idx) * static_cast<double>(neg_bins[i]);
     }
 
-    const auto& pos_bins = _positive_store.bins();
-    const int32_t pos_offset = _positive_store.offset();
-    for (size_t i = 0; i < pos_bins.size(); ++i) {
-        if (pos_bins[i] == 0) {
-            continue;
+    if (!_positive_store.is_empty()) {
+        if (_positive_store.is_sparse()) {
+            for (const auto& entry : _positive_store.sparse_bins()) {
+                total += bin_value(entry.index) * static_cast<double>(entry.count);
+            }
+        } else {
+            const auto& pos_bins = _positive_store.bins();
+            const int32_t pos_offset = _positive_store.offset();
+            double cur_val = 0.0;
+            uint32_t steps_left = 0;
+            for (size_t i = 0; i < pos_bins.size(); ++i) {
+                const uint64_t c = pos_bins[i];
+                if (c == 0) {
+                    steps_left = 0;
+                    continue;
+                }
+                if (steps_left == 0) {
+                    const int32_t bin_idx =
+                            static_cast<int32_t>(static_cast<int64_t>(pos_offset) + static_cast<int64_t>(i));
+                    cur_val = bin_value(bin_idx);
+                    steps_left = 16;
+                } else {
+                    cur_val *= _gamma;
+                    if (!std::isfinite(cur_val)) {
+                        const int32_t bin_idx =
+                                static_cast<int32_t>(static_cast<int64_t>(pos_offset) + static_cast<int64_t>(i));
+                        cur_val = bin_value(bin_idx);
+                    }
+                    --steps_left;
+                }
+                total += cur_val * static_cast<double>(c);
+            }
         }
-        const int32_t bin_idx = static_cast<int32_t>(static_cast<int64_t>(pos_offset) + static_cast<int64_t>(i));
-        total += bin_value(bin_idx) * static_cast<double>(pos_bins[i]);
     }
 
     if (!std::isfinite(total)) {
@@ -1075,6 +1910,10 @@ Status DDSketch::deserialize(const Slice& src) {
 
     uint32_t pos_wire_entries = 0;
     uint32_t neg_wire_entries = 0;
+    uint32_t pos_submsg_count = 0;
+    uint32_t neg_submsg_count = 0;
+    FastContiguousStoreView fast_pos;
+    FastContiguousStoreView fast_neg;
     std::vector<std::pair<int32_t, uint64_t>> pos_entries;
     std::vector<std::pair<int32_t, uint64_t>> neg_entries;
 
@@ -1123,9 +1962,29 @@ Status DDSketch::deserialize(const Slice& src) {
             if (len > static_cast<uint64_t>(end - p)) {
                 return Status::InvalidArgument("ddsketch: length-delimited field exceeds buffer");
             }
-            st = parse_store_submessage(p, p + len, &pos_wire_entries, &pos_entries);
-            if (!st.ok()) {
-                return st;
+            if (pos_submsg_count == 0 &&
+                try_parse_fast_contiguous_store(p, p + len, _positive_store.max_bins(), &fast_pos)) {
+                pos_submsg_count = 1;
+            } else {
+                if (pos_submsg_count == 1 && fast_pos.valid) {
+                    fast_pos.valid = false;
+                    for (size_t i = 0; i < fast_pos.trimmed_len; ++i) {
+                        double d = 0.0;
+                        std::memcpy(&d, fast_pos.trimmed_packed_doubles + i * sizeof(double), sizeof(double));
+                        if (d > 0.0) {
+                            pos_entries.emplace_back(
+                                    static_cast<int32_t>(static_cast<int64_t>(fast_pos.trimmed_offset) +
+                                                         static_cast<int64_t>(i)),
+                                    static_cast<uint64_t>(d));
+                        }
+                    }
+                    pos_wire_entries = static_cast<uint32_t>(fast_pos.trimmed_len);
+                }
+                ++pos_submsg_count;
+                st = parse_store_submessage(p, p + len, &pos_wire_entries, &pos_entries);
+                if (!st.ok()) {
+                    return st;
+                }
             }
             p += len;
         } else if (field_num == 3) {
@@ -1140,9 +1999,29 @@ Status DDSketch::deserialize(const Slice& src) {
             if (len > static_cast<uint64_t>(end - p)) {
                 return Status::InvalidArgument("ddsketch: length-delimited field exceeds buffer");
             }
-            st = parse_store_submessage(p, p + len, &neg_wire_entries, &neg_entries);
-            if (!st.ok()) {
-                return st;
+            if (neg_submsg_count == 0 &&
+                try_parse_fast_contiguous_store(p, p + len, _negative_store.max_bins(), &fast_neg)) {
+                neg_submsg_count = 1;
+            } else {
+                if (neg_submsg_count == 1 && fast_neg.valid) {
+                    fast_neg.valid = false;
+                    for (size_t i = 0; i < fast_neg.trimmed_len; ++i) {
+                        double d = 0.0;
+                        std::memcpy(&d, fast_neg.trimmed_packed_doubles + i * sizeof(double), sizeof(double));
+                        if (d > 0.0) {
+                            neg_entries.emplace_back(
+                                    static_cast<int32_t>(static_cast<int64_t>(fast_neg.trimmed_offset) +
+                                                         static_cast<int64_t>(i)),
+                                    static_cast<uint64_t>(d));
+                        }
+                    }
+                    neg_wire_entries = static_cast<uint32_t>(fast_neg.trimmed_len);
+                }
+                ++neg_submsg_count;
+                st = parse_store_submessage(p, p + len, &neg_wire_entries, &neg_entries);
+                if (!st.ok()) {
+                    return st;
+                }
             }
             p += len;
         } else if (field_num == 4) {
@@ -1171,13 +2050,23 @@ Status DDSketch::deserialize(const Slice& src) {
 
     CollapsingLowestDenseStore new_pos(_positive_store.max_bins());
     CollapsingLowestDenseStore new_neg(_negative_store.max_bins());
-    Status st = build_store_from_entries(&pos_entries, &new_pos);
-    if (!st.ok()) {
-        return st;
+    if (pos_submsg_count == 1 && fast_pos.valid) {
+        new_pos.init_from_packed_doubles(fast_pos.trimmed_offset, fast_pos.trimmed_packed_doubles, fast_pos.trimmed_len,
+                                         fast_pos.total_count, fast_pos.nonzero_count);
+    } else {
+        Status st = build_store_from_entries(&pos_entries, &new_pos);
+        if (!st.ok()) {
+            return st;
+        }
     }
-    st = build_store_from_entries(&neg_entries, &new_neg);
-    if (!st.ok()) {
-        return st;
+    if (neg_submsg_count == 1 && fast_neg.valid) {
+        new_neg.init_from_packed_doubles(fast_neg.trimmed_offset, fast_neg.trimmed_packed_doubles, fast_neg.trimmed_len,
+                                         fast_neg.total_count, fast_neg.nonzero_count);
+    } else {
+        Status st = build_store_from_entries(&neg_entries, &new_neg);
+        if (!st.ok()) {
+            return st;
+        }
     }
 
     if (new_pos.total_count() > kMaxExactDoubleCount - parsed_zero_count ||

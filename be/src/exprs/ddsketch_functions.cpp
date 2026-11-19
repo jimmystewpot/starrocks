@@ -282,7 +282,6 @@ StatusOr<ColumnPtr> DDSketchFunctions::ddsketch_union(FunctionContext* context, 
     const size_t size = columns[0]->size();
     ColumnBuilder<TYPE_VARBINARY> builder(size);
     DDSketch sk_a;
-    DDSketch sk_b;
     std::vector<uint8_t> buf;
 
     for (size_t row = 0; row < size; ++row) {
@@ -291,8 +290,7 @@ StatusOr<ColumnPtr> DDSketchFunctions::ddsketch_union(FunctionContext* context, 
             continue;
         }
         RETURN_IF_ERROR(sk_a.deserialize(lhs.value(row)));
-        RETURN_IF_ERROR(sk_b.deserialize(rhs.value(row)));
-        RETURN_IF_ERROR(sk_a.merge(sk_b));
+        RETURN_IF_ERROR(sk_a.merge_serialized(rhs.value(row)));
         if (!sk_a.is_mapping_initialized()) {
             builder.append(Slice());
             continue;
