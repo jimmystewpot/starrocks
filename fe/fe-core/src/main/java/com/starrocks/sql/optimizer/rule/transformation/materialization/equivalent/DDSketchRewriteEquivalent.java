@@ -56,14 +56,14 @@ public class DDSketchRewriteEquivalent extends IAggregateRewriteEquivalent {
     }
 
     private static ScalarOperator unwrapDoubleCast(ScalarOperator op) {
-        if (op instanceof CastOperator && op.getType().isDouble()) {
-            return op.getChild(0);
+        while (op instanceof CastOperator && op.getType().isNumericType()) {
+            op = op.getChild(0);
         }
         return op;
     }
 
     private static Optional<Double> extractRelativeAccuracy(ScalarOperator op) {
-        if (op instanceof CastOperator && op.getType().isDouble()) {
+        while (op instanceof CastOperator) {
             op = op.getChild(0);
         }
         if (op instanceof ConstantOperator) {

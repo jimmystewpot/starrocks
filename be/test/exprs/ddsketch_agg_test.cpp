@@ -376,11 +376,10 @@ TEST_F(DDSketchAggTest, TestOneShotPercentileScalarAndWeighted) {
         std::memcpy(&q_val, s0.data + 1 + sizeof(uint32_t), sizeof(double));
         EXPECT_DOUBLE_EQ(0.5, q_val);
         DDSketch proto_check;
-        ASSERT_TRUE(
-                proto_check
-                        .deserialize(Slice(s0.data + 1 + sizeof(uint32_t) + sizeof(double),
-                                           s0.size - (1 + sizeof(uint32_t) + sizeof(double))))
-                        .ok());
+        ASSERT_TRUE(proto_check
+                            .deserialize(Slice(s0.data + 1 + sizeof(uint32_t) + sizeof(double),
+                                               s0.size - (1 + sizeof(uint32_t) + sizeof(double))))
+                            .ok());
         EXPECT_EQ(50u, proto_check.total_count());
 
         // Merge into state3 and finalize

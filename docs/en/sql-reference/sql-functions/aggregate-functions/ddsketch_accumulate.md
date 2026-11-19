@@ -1,6 +1,7 @@
 ---
 displayed_sidebar: docs
 description: "Builds a Datadog DDSketch from numeric column values or weighted values and returns a serialized protobuf sketch as VARBINARY."
+products: [oss, enterprise, cloud, anywhere]
 ---
 
 # ddsketch_accumulate, ddsketch_accumulate_weighted

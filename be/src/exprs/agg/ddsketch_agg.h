@@ -881,7 +881,8 @@ public:
             return;
         }
 
-        const Column* q_col = (src.size() > static_cast<size_t>(kQuantileArgIdx)) ? src[kQuantileArgIdx].get() : nullptr;
+        const Column* q_col =
+                (src.size() > static_cast<size_t>(kQuantileArgIdx)) ? src[kQuantileArgIdx].get() : nullptr;
         std::vector<double> quantiles;
         bool q_ok = false;
         if constexpr (IsArray) {
@@ -902,8 +903,7 @@ public:
         }
 
         const Column* val_col = src[0].get();
-        const size_t est_row_bytes =
-                sizeof(uint8_t) + sizeof(uint32_t) + quantiles.size() * sizeof(double) + 28;
+        const size_t est_row_bytes = sizeof(uint8_t) + sizeof(uint32_t) + quantiles.size() * sizeof(double) + 28;
         result->get_bytes().reserve(result->get_bytes().size() + chunk_size * est_row_bytes);
         DDSketch sketch(alpha);
 

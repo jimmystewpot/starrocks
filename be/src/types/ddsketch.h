@@ -108,6 +108,8 @@ private:
     double _multiplier = 0.0;
     double _min_indexable_value = 0.0;
     double _max_indexable_value = 0.0;
+    int32_t _min_safe_bin_index = kMinBinIndex;
+    int32_t _max_safe_bin_index = kMaxBinIndex;
     uint64_t _zero_count = 0;
     CollapsingLowestDenseStore _positive_store;
     CollapsingLowestDenseStore _negative_store;

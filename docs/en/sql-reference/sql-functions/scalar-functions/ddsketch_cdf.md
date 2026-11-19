@@ -1,6 +1,7 @@
 ---
 displayed_sidebar: docs
 description: "Computes the approximate cumulative distribution ratio P(X <= value) from a serialized Datadog DDSketch VARBINARY."
+products: [oss, enterprise, cloud, anywhere]
 ---
 
 # ddsketch_cdf

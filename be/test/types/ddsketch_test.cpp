@@ -312,10 +312,16 @@ TEST_F(DDSketchTest, TestNegativeZeroAndNonFiniteValues) {
     EXPECT_TRUE(st_weight.is_invalid_argument());
     EXPECT_NE(st_weight.message().find("ddsketch weight exceeds 2^53"), std::string::npos);
 
-    // Extreme values near DBL_MAX are clamped to kMaxBinIndex without crashing
+    // Extreme values near DBL_MAX are clamped to _max_safe_bin_index with finite bin_value
     sketch.add(std::numeric_limits<double>::max());
     sketch.add(-std::numeric_limits<double>::max());
     EXPECT_EQ(6ULL, sketch.total_count());
+    EXPECT_TRUE(std::isfinite(sketch.quantile(0.0)));
+    EXPECT_TRUE(std::isfinite(sketch.quantile(1.0)));
+    EXPECT_DOUBLE_EQ(sketch.min_value(), sketch.quantile(0.0));
+    EXPECT_DOUBLE_EQ(sketch.max_value(), sketch.quantile(1.0));
+    EXPECT_LT(sketch.min_value(), 0.0);
+    EXPECT_GT(sketch.max_value(), 0.0);
 }
 
 TEST_F(DDSketchTest, TestProtobufWireCompatibility) {

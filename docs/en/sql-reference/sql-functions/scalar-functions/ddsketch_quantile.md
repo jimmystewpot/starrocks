@@ -1,6 +1,7 @@
 ---
 displayed_sidebar: docs
 description: "Extracts quantiles, observation counts, and bucket-midpoint summary statistics from a serialized Datadog DDSketch VARBINARY."
+products: [oss, enterprise, cloud, anywhere]
 ---
 
 # ddsketch_quantile, ddsketch_min, ddsketch_max, ddsketch_count, ddsketch_sum, ddsketch_avg, ddsketch_empty

@@ -153,3 +153,39 @@ select round(ddsketch_percentile(val, 0.50), 4),
        round(ddsketch_percentile(val, [0.50, 0.95, 0.99])[2], 4),
        round(ddsketch_percentile(val, [0.50, 0.95, 0.99])[3], 4)
 from t1;
+
+-- 1-phase and 2-phase aggregation nullability on NOT NULL columns when all inputs in a group are ignored
+CREATE TABLE t_not_null_ignored (
+  id BIGINT NOT NULL,
+  grp VARCHAR(8) NOT NULL,
+  val DOUBLE NOT NULL,
+  weight BIGINT NOT NULL,
+  sk VARBINARY NOT NULL
+)
+DUPLICATE KEY(id)
+DISTRIBUTED BY HASH(id) BUCKETS 2
+PROPERTIES ("replication_num" = "1");
+
+insert into t_not_null_ignored values
+  (1, 'EMPTY', 10.0, 0, cast('' as varbinary)),
+  (2, 'EMPTY', 20.0, -5, cast('' as varbinary));
+
+SET new_planner_agg_stage = 1;
+select grp,
+       ddsketch_accumulate_weighted(val, weight),
+       ddsketch_combine(sk),
+       ddsketch_percentile_weighted(val, weight, 0.5),
+       ddsketch_percentile_weighted(val, weight, [0.5, 0.99])
+from t_not_null_ignored
+group by grp;
+
+SET new_planner_agg_stage = 2;
+select grp,
+       ddsketch_accumulate_weighted(val, weight),
+       ddsketch_combine(sk),
+       ddsketch_percentile_weighted(val, weight, 0.5),
+       ddsketch_percentile_weighted(val, weight, [0.5, 0.99])
+from t_not_null_ignored
+group by grp;
+
+SET new_planner_agg_stage = 0;

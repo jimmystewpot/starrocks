@@ -1,6 +1,7 @@
 ---
 displayed_sidebar: docs
 description: "複数行のシリアライズされた Datadog DDSketch VARBINARY 値を決定論的にマージし、単一の結合スケッチとして返します。"
+products: [oss, enterprise, cloud, anywhere]
 ---
 
 # ddsketch_combine

@@ -1,6 +1,7 @@
 ---
 displayed_sidebar: docs
 description: "Computes deterministic relative-error-bounded approximate percentiles or weighted percentiles using Datadog DDSketch."
+products: [oss, enterprise, cloud, anywhere]
 ---
 
 # ddsketch_percentile, ddsketch_percentile_weighted
