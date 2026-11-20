@@ -35,10 +35,16 @@
 // and lambdas inside a variant must repeat the attribute (they do not inherit it).
 #define MFV_SSE42(...) MFV_IMPL(__attribute__((target("sse4.2"))), __VA_ARGS__)
 #define MFV_AVX2(...) MFV_IMPL(__attribute__((target("avx2"))), __VA_ARGS__)
-#define MFV_AVX512F(...) MFV_IMPL(__attribute__((target("avx512f"))), __VA_ARGS__)
-#define MFV_AVX512BW(...) MFV_IMPL(__attribute__((target("avx512f,avx512bw"))), __VA_ARGS__)
-#define MFV_AVX512VL(...) MFV_IMPL(__attribute__((target("avx512f,avx512vl"))), __VA_ARGS__)
-#define MFV_AVX512VLBW(...) MFV_IMPL(__attribute__((target("avx512f,avx512vl,avx512bw"))), __VA_ARGS__)
+// Include `avx512vbmi2` in all AVX-512 target attributes to exclude older Intel
+// CPUs that suffer 512-bit ZMM frequency downclocking (Skylake-X, Skylake-SP,
+// Cascade Lake, Cooper Lake), which support avx512f/bw/vl but lack avx512vbmi2.
+// Non-downclocking AVX-512 generations (Intel Ice Lake+ and AMD Zen 4+) all
+// support avx512vbmi2, so GCC/Clang IFUNC resolution selects the 512-bit clone
+// only on those CPUs and keeps pre-Ice-Lake CPUs on the MFV_AVX2 clone.
+#define MFV_AVX512F(...) MFV_IMPL(__attribute__((target("avx512f,avx512vbmi2"))), __VA_ARGS__)
+#define MFV_AVX512BW(...) MFV_IMPL(__attribute__((target("avx512f,avx512bw,avx512vbmi2"))), __VA_ARGS__)
+#define MFV_AVX512VL(...) MFV_IMPL(__attribute__((target("avx512f,avx512vl,avx512vbmi2"))), __VA_ARGS__)
+#define MFV_AVX512VLBW(...) MFV_IMPL(__attribute__((target("avx512f,avx512vl,avx512bw,avx512vbmi2"))), __VA_ARGS__)
 
 // Use this for the "default" version of a function multi-version *family*
 // (same function name as the sibling MFV_SSE42/MFV_AVX2/MFV_AVX512* variants).
