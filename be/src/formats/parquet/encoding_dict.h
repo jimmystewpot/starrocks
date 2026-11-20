@@ -142,7 +142,7 @@ public:
             }
             DCHECK_EQ(cnt, num_non_nulls) << "count:" << count << " null_cnt:" << count - num_non_nulls;
         } else {
-            SIMD::Expand::expand_load(dst_data, src_data, nulls, count);
+            SIMD::Expand::expand_load(dst_data, src_data, nulls, count, num_non_nulls);
         }
     }
 
