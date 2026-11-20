@@ -88,6 +88,65 @@ inline constexpr std::array<uint8_t, 256> kExpandCountLUT = {
 inline constexpr std::array<uint8_t, 16> kExpandCountLUT64 = {0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4};
 #endif // __x86_64__
 
+#if defined(__ARM_NEON) && defined(__aarch64__)
+constexpr auto make_neon_expand_permute_lut32() {
+    std::array<std::array<uint8_t, 16>, 16> table{};
+    for (uint32_t mask = 0; mask < 16; ++mask) {
+        uint8_t src_idx = 0;
+        for (uint32_t dst_idx = 0; dst_idx < 4; ++dst_idx) {
+            uint8_t base = 0;
+            if (mask & (1u << dst_idx)) {
+                base = static_cast<uint8_t>(src_idx * 4);
+                ++src_idx;
+            }
+            for (uint8_t b = 0; b < 4; ++b) {
+                table[mask][dst_idx * 4 + b] = static_cast<uint8_t>(base + b);
+            }
+        }
+    }
+    return table;
+}
+
+alignas(16) constexpr std::array<std::array<uint8_t, 16>, 16> kNeonExpandPermuteLUT32 =
+        make_neon_expand_permute_lut32();
+
+constexpr auto make_neon_expand_permute_lut64() {
+    std::array<std::array<uint8_t, 16>, 4> table{};
+    for (uint32_t mask = 0; mask < 4; ++mask) {
+        uint8_t src_idx = 0;
+        for (uint32_t dst_idx = 0; dst_idx < 2; ++dst_idx) {
+            uint8_t base = 0;
+            if (mask & (1u << dst_idx)) {
+                base = static_cast<uint8_t>(src_idx * 8);
+                ++src_idx;
+            }
+            for (uint8_t b = 0; b < 8; ++b) {
+                table[mask][dst_idx * 8 + b] = static_cast<uint8_t>(base + b);
+            }
+        }
+    }
+    return table;
+}
+
+alignas(16) constexpr std::array<std::array<uint8_t, 16>, 4> kNeonExpandPermuteLUT64 = make_neon_expand_permute_lut64();
+
+inline constexpr std::array<uint8_t, 16> kNeonCountLUT32 = {0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4};
+inline constexpr std::array<uint8_t, 4> kNeonCountLUT64 = {0, 1, 1, 2};
+inline constexpr uint64_t kNeonAllValidNibbles = 0xffff'ffff'ffff'ffffull;
+
+// Extract 4-bit mask for sub-group k in {0..3} (4 lanes of 4B each) from 64-bit nibble_mask.
+constexpr uint32_t extract_neon_mask4(uint64_t nibble_mask, int k) noexcept {
+    uint32_t c = static_cast<uint32_t>(nibble_mask >> (k * 16 + 3)) & 0x1111u;
+    return ((c * 0x1248u) >> 12) & 0xFu;
+}
+
+// Extract 2-bit mask for sub-group k in {0..7} (2 lanes of 8B each) from 64-bit nibble_mask.
+constexpr uint32_t extract_neon_mask2(uint64_t nibble_mask, int k) noexcept {
+    uint32_t pair_bits = static_cast<uint32_t>(nibble_mask >> (k * 8 + 3)) & 0x11u;
+    return (pair_bits | (pair_bits >> 3)) & 0x3u;
+}
+#endif // __ARM_NEON && __aarch64__
+
 MFV_DEFAULT(void expand_load_selection_i32(int32_t* dst_data, const int32_t* src_data, const uint8_t* nulls,
                                            size_t count, size_t total_valid) {
     expand_load_branchless(dst_data, src_data, nulls, count, total_valid);
@@ -236,51 +295,41 @@ void expand_load_simd(int32_t* dst_data, const int32_t* src_data, const uint8_t*
         return;
     }
 #if defined(__ARM_NEON) && defined(__aarch64__)
-    // NEON 4-element expand using TBL permutation. Function multi-versioning is
-    // x86-only, so dispatch directly here on aarch64.
-    static const uint8_t kNeonExpandLUT[16][4] = {
-            {0, 0, 0, 0},  // 0b0000
-            {0, 0, 0, 0},  // 0b0001
-            {0, 0, 0, 0},  // 0b0010
-            {0, 4, 0, 0},  // 0b0011
-            {0, 0, 0, 0},  // 0b0100
-            {0, 0, 4, 0},  // 0b0101
-            {0, 0, 4, 0},  // 0b0110
-            {0, 4, 8, 0},  // 0b0111
-            {0, 0, 0, 0},  // 0b1000
-            {0, 0, 0, 4},  // 0b1001
-            {0, 0, 0, 4},  // 0b1010
-            {0, 4, 0, 8},  // 0b1011
-            {0, 0, 0, 4},  // 0b1100
-            {0, 0, 4, 8},  // 0b1101
-            {0, 0, 4, 8},  // 0b1110
-            {0, 4, 8, 12}, // 0b1111
-    };
-    static const uint8_t kNeonCountLUT[16] = {0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4};
-
     size_t cnt = 0;
     size_t i = 0;
-    for (; i + 4 <= count && cnt + 4 <= total_valid; i += 4) {
-        uint32_t mask4 = ((nulls[i] == 0) ? 1u : 0u) | ((nulls[i + 1] == 0) ? 2u : 0u) |
-                         ((nulls[i + 2] == 0) ? 4u : 0u) | ((nulls[i + 3] == 0) ? 8u : 0u);
-
-        uint32x4_t src_vec = vld1q_u32(reinterpret_cast<const uint32_t*>(src_data + cnt));
-
-        uint8_t b0 = kNeonExpandLUT[mask4][0];
-        uint8_t b1 = kNeonExpandLUT[mask4][1];
-        uint8_t b2 = kNeonExpandLUT[mask4][2];
-        uint8_t b3 = kNeonExpandLUT[mask4][3];
-        uint8x16_t idx = {b0, static_cast<uint8_t>(b0 + 1), static_cast<uint8_t>(b0 + 2), static_cast<uint8_t>(b0 + 3),
-                          b1, static_cast<uint8_t>(b1 + 1), static_cast<uint8_t>(b1 + 2), static_cast<uint8_t>(b1 + 3),
-                          b2, static_cast<uint8_t>(b2 + 1), static_cast<uint8_t>(b2 + 2), static_cast<uint8_t>(b2 + 3),
-                          b3, static_cast<uint8_t>(b3 + 1), static_cast<uint8_t>(b3 + 2), static_cast<uint8_t>(b3 + 3)};
-
-        uint8x16_t src_bytes = vreinterpretq_u8_u32(src_vec);
-        uint8x16_t dst_bytes = vqtbl1q_u8(src_bytes, idx);
-        uint32x4_t dst_vec = vreinterpretq_u32_u8(dst_bytes);
-        vst1q_u32(reinterpret_cast<uint32_t*>(dst_data + i), dst_vec);
-
-        cnt += kNeonCountLUT[mask4];
+    const uint8x16_t zero16 = vdupq_n_u8(0);
+    for (; i + 16 <= count && cnt < total_valid; i += 16) {
+        uint64_t valid_nibble = SIMD::get_nibble_mask(vceqq_u8(vld1q_u8(nulls + i), zero16));
+        if (valid_nibble == 0) {
+            continue;
+        }
+        if (valid_nibble == kNeonAllValidNibbles) {
+            std::memcpy(dst_data + i, src_data + cnt, 16 * sizeof(int32_t));
+            cnt += 16;
+            continue;
+        }
+        for (int k = 0; k < 4; ++k) {
+            uint32_t mask4 = extract_neon_mask4(valid_nibble, k);
+            if (mask4 == 0) {
+                continue;
+            }
+            size_t sub_i = i + static_cast<size_t>(k) * 4;
+            if (mask4 == 0xFu) {
+                std::memcpy(dst_data + sub_i, src_data + cnt, 4 * sizeof(int32_t));
+                cnt += 4;
+            } else if (cnt + 4 <= total_valid) {
+                uint8x16_t src_bytes = vld1q_u8(reinterpret_cast<const uint8_t*>(src_data + cnt));
+                uint8x16_t idx = vld1q_u8(kNeonExpandPermuteLUT32[mask4].data());
+                uint8x16_t dst_bytes = vqtbl1q_u8(src_bytes, idx);
+                vst1q_u8(reinterpret_cast<uint8_t*>(dst_data + sub_i), dst_bytes);
+                cnt += kNeonCountLUT32[mask4];
+            } else {
+                for (size_t j = 0; j < 4 && cnt < total_valid; ++j) {
+                    dst_data[sub_i + j] = starrocks::unaligned_load<int32_t>(src_data + cnt);
+                    cnt += (mask4 >> j) & 1u;
+                }
+            }
+        }
     }
     for (; i < count && cnt < total_valid; ++i) {
         dst_data[i] = starrocks::unaligned_load<int32_t>(src_data + cnt);
@@ -305,24 +354,41 @@ void expand_load_simd(int64_t* dst_data, const int64_t* src_data, const uint8_t*
         return;
     }
 #if defined(__ARM_NEON) && defined(__aarch64__)
-    static const uint8_t kNeonCountLUT[4] = {0, 1, 1, 2};
-
     size_t cnt = 0;
     size_t i = 0;
-    for (; i + 2 <= count && cnt + 2 <= total_valid; i += 2) {
-        uint8_t n0 = nulls[i];
-        uint8_t n1 = nulls[i + 1];
-        uint32_t mask2 = (n0 == 0 ? 1u : 0u) | (n1 == 0 ? 2u : 0u);
-
-        uint64x2_t src_vec = vld1q_u64(reinterpret_cast<const uint64_t*>(src_data + cnt));
-
-        // For 2 x int64 the only non-identity permutation we need is
-        // "broadcast src[0] to lane 1" (mask 0b10: lane 0 is null, lane 1 valid -> dst[1]=src[0]).
-        uint64x2_t dst_vec = (mask2 == 2) ? vdupq_laneq_u64(src_vec, 0) : src_vec;
-
-        vst1q_u64(reinterpret_cast<uint64_t*>(dst_data + i), dst_vec);
-
-        cnt += kNeonCountLUT[mask2];
+    const uint8x16_t zero16 = vdupq_n_u8(0);
+    for (; i + 16 <= count && cnt < total_valid; i += 16) {
+        uint64_t valid_nibble = SIMD::get_nibble_mask(vceqq_u8(vld1q_u8(nulls + i), zero16));
+        if (valid_nibble == 0) {
+            continue;
+        }
+        if (valid_nibble == kNeonAllValidNibbles) {
+            std::memcpy(dst_data + i, src_data + cnt, 16 * sizeof(int64_t));
+            cnt += 16;
+            continue;
+        }
+        for (int k = 0; k < 8; ++k) {
+            uint32_t mask2 = extract_neon_mask2(valid_nibble, k);
+            if (mask2 == 0) {
+                continue;
+            }
+            size_t sub_i = i + static_cast<size_t>(k) * 2;
+            if (mask2 == 0x3u) {
+                std::memcpy(dst_data + sub_i, src_data + cnt, 2 * sizeof(int64_t));
+                cnt += 2;
+            } else if (cnt + 2 <= total_valid) {
+                uint8x16_t src_bytes = vld1q_u8(reinterpret_cast<const uint8_t*>(src_data + cnt));
+                uint8x16_t idx = vld1q_u8(kNeonExpandPermuteLUT64[mask2].data());
+                uint8x16_t dst_bytes = vqtbl1q_u8(src_bytes, idx);
+                vst1q_u8(reinterpret_cast<uint8_t*>(dst_data + sub_i), dst_bytes);
+                cnt += kNeonCountLUT64[mask2];
+            } else {
+                for (size_t j = 0; j < 2 && cnt < total_valid; ++j) {
+                    dst_data[sub_i + j] = starrocks::unaligned_load<int64_t>(src_data + cnt);
+                    cnt += (mask2 >> j) & 1u;
+                }
+            }
+        }
     }
     for (; i < count && cnt < total_valid; ++i) {
         dst_data[i] = starrocks::unaligned_load<int64_t>(src_data + cnt);
