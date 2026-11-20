@@ -26,6 +26,10 @@
 #include "column/runtime_type_traits.h"
 #include "column/struct_column.h"
 
+#if defined(__ARM_NEON) && defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 namespace starrocks {
 
 struct ColumnBuilder {
@@ -119,42 +123,6 @@ NullColumn::MutablePtr FunctionHelper::union_nullable_column(const ColumnPtr& v1
     return NullColumn::static_pointer_cast(std::move(result));
 }
 
-void FunctionHelper::union_produce_nullable_column(const ColumnPtr& v1, const ColumnPtr& v2,
-                                                   NullColumn::MutablePtr* produce_null_column) {
-    auto* result = (*produce_null_column)->get_data().data();
-
-    if (v1->has_null()) {
-        auto* null1 = down_cast<const NullableColumn*>(v1.get())->null_column()->immutable_data().data();
-
-        int size = v1->size();
-        for (int i = 0; i < size; ++i) {
-            result[i] = result[i] | null1[i];
-        }
-    }
-
-    if (v2->has_null()) {
-        auto* null2 = down_cast<const NullableColumn*>(v2.get())->null_column()->immutable_data().data();
-
-        int size = v2->size();
-        for (int i = 0; i < size; ++i) {
-            result[i] = result[i] | null2[i];
-        }
-    }
-}
-
-void FunctionHelper::union_produce_nullable_column(const ColumnPtr& v1, NullColumn::MutablePtr* produce_null_column) {
-    auto* result = (*produce_null_column)->get_data().data();
-
-    if (v1->has_null()) {
-        const auto* null1 = down_cast<const NullableColumn*>(v1.get())->null_column()->immutable_data().data();
-
-        int size = v1->size();
-        for (int i = 0; i < size; ++i) {
-            result[i] = result[i] | null1[i];
-        }
-    }
-}
-
 MFV_AVX512F(void union_null_column_impl(uint8_t* dest, const uint8_t* v1, const uint8_t* v2, const size_t bytes) {
     constexpr auto SIMD_SIZE = sizeof(__m512i);
     const auto null1_end = v1 + bytes;
@@ -197,10 +165,69 @@ MFV_SSE42(void union_null_column_impl(uint8_t* dest, const uint8_t* v1, const ui
 })
 
 MFV_DEFAULT(void union_null_column_impl(uint8_t* dest, const uint8_t* v1, const uint8_t* v2, const size_t bytes) {
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    constexpr size_t kSimdSize = sizeof(uint8x16_t);
+    constexpr size_t kUnrollSize = kSimdSize * 4;
+    const uint8_t* const null1_end = v1 + bytes;
+    const uint8_t* const null1_unroll_end = v1 + (bytes & ~(kUnrollSize - 1));
+    const uint8_t* const null1_simd_end = v1 + (bytes & ~(kSimdSize - 1));
+
+    for (; v1 < null1_unroll_end; v1 += kUnrollSize, v2 += kUnrollSize, dest += kUnrollSize) {
+        uint8x16_t a0 = vld1q_u8(v1);
+        uint8x16_t a1 = vld1q_u8(v1 + 16);
+        uint8x16_t a2 = vld1q_u8(v1 + 32);
+        uint8x16_t a3 = vld1q_u8(v1 + 48);
+        uint8x16_t b0 = vld1q_u8(v2);
+        uint8x16_t b1 = vld1q_u8(v2 + 16);
+        uint8x16_t b2 = vld1q_u8(v2 + 32);
+        uint8x16_t b3 = vld1q_u8(v2 + 48);
+        vst1q_u8(dest, vorrq_u8(a0, b0));
+        vst1q_u8(dest + 16, vorrq_u8(a1, b1));
+        vst1q_u8(dest + 32, vorrq_u8(a2, b2));
+        vst1q_u8(dest + 48, vorrq_u8(a3, b3));
+    }
+    for (; v1 < null1_simd_end; v1 += kSimdSize, v2 += kSimdSize, dest += kSimdSize) {
+        vst1q_u8(dest, vorrq_u8(vld1q_u8(v1), vld1q_u8(v2)));
+    }
+    for (; v1 < null1_end; ++v1, ++v2, ++dest) {
+        *dest = *v1 | *v2;
+    }
+#else
     for (const auto null1_end = v1 + bytes; v1 < null1_end; ++v1, ++v2, ++dest) {
         *dest = *v1 | *v2;
     }
+#endif
 })
+
+void FunctionHelper::union_produce_nullable_column(const ColumnPtr& v1, const ColumnPtr& v2,
+                                                   NullColumn::MutablePtr* produce_null_column) {
+    uint8_t* __restrict result = (*produce_null_column)->get_data().data();
+
+    if (v1->has_null()) {
+        const uint8_t* __restrict null1 =
+                down_cast<const NullableColumn*>(v1.get())->null_column()->immutable_data().data();
+        const size_t bytes_size = sizeof(NullColumn::ValueType) * v1->size();
+        union_null_column_impl(result, result, null1, bytes_size);
+    }
+
+    if (v2->has_null()) {
+        const uint8_t* __restrict null2 =
+                down_cast<const NullableColumn*>(v2.get())->null_column()->immutable_data().data();
+        const size_t bytes_size = sizeof(NullColumn::ValueType) * v2->size();
+        union_null_column_impl(result, result, null2, bytes_size);
+    }
+}
+
+void FunctionHelper::union_produce_nullable_column(const ColumnPtr& v1, NullColumn::MutablePtr* produce_null_column) {
+    uint8_t* __restrict result = (*produce_null_column)->get_data().data();
+
+    if (v1->has_null()) {
+        const uint8_t* __restrict null1 =
+                down_cast<const NullableColumn*>(v1.get())->null_column()->immutable_data().data();
+        const size_t bytes_size = sizeof(NullColumn::ValueType) * v1->size();
+        union_null_column_impl(result, result, null1, bytes_size);
+    }
+}
 
 NullColumn::MutablePtr FunctionHelper::union_null_column(const NullColumnPtr& v1, const NullColumnPtr& v2) {
     // union null column

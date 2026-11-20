@@ -132,6 +132,134 @@ TEST_F(FunctionHelperTest, testMergeNotNullableColumnMergeWithNullColumn) {
     }
 }
 
+TEST_F(FunctionHelperTest, testUnionNullColumnBoundarySizes) {
+    const std::vector<size_t> kSizes = {0, 1, 15, 16, 31, 32, 63, 64, 65, 128, 4096};
+    auto make_null_col = [](size_t size, int mode) -> NullColumnPtr {
+        auto col = NullColumn::create();
+        col->resize(size);
+        auto* data = col->get_data().data();
+        for (size_t i = 0; i < size; ++i) {
+            switch (mode) {
+            case 0:
+                data[i] = 0;
+                break;
+            case 1:
+                data[i] = 1;
+                break;
+            case 2:
+                data[i] = static_cast<uint8_t>((i % 3 == 0) ? 1 : 0);
+                break;
+            case 3:
+                data[i] = static_cast<uint8_t>(((i * 7 + 3) % 5 == 0) ? 1 : 0);
+                break;
+            }
+        }
+        return col;
+    };
+
+    for (size_t size : kSizes) {
+        for (int m1 = 0; m1 < 4; ++m1) {
+            for (int m2 = 0; m2 < 4; ++m2) {
+                auto c1 = make_null_col(size, m1);
+                auto c2 = make_null_col(size, m2);
+                auto res = FunctionHelper::union_null_column(c1, c2);
+                ASSERT_EQ(res->size(), size);
+                const auto* d1 = c1->immutable_data().data();
+                const auto* d2 = c2->immutable_data().data();
+                const auto* dr = res->immutable_data().data();
+                for (size_t i = 0; i < size; ++i) {
+                    ASSERT_EQ(dr[i], static_cast<uint8_t>(d1[i] | d2[i]))
+                            << "size=" << size << " m1=" << m1 << " m2=" << m2 << " i=" << i;
+                }
+            }
+        }
+    }
+}
+
+TEST_F(FunctionHelperTest, testUnionProduceNullableColumnBoundarySizes) {
+    const std::vector<size_t> kSizes = {0, 1, 15, 16, 31, 32, 63, 64, 65, 128, 4096};
+    // mode 0: non-nullable Int32Column
+    // mode 1: NullableColumn with has_null() == false
+    // mode 2: NullableColumn with pattern A nulls
+    // mode 3: NullableColumn with pattern B nulls
+    // mode 4: NullableColumn with all nulls
+    auto make_col = [](size_t size, int mode, std::vector<uint8_t>* expected_nulls) -> ColumnPtr {
+        expected_nulls->assign(size, 0);
+        auto data_col = Int32Column::create();
+        data_col->resize(size);
+        if (mode == 0) {
+            return data_col;
+        }
+        auto null_col = NullColumn::create();
+        null_col->resize(size);
+        auto* null_data = null_col->get_data().data();
+        bool any_null = false;
+        for (size_t i = 0; i < size; ++i) {
+            uint8_t is_null = 0;
+            if (mode == 2) {
+                is_null = static_cast<uint8_t>((i % 3 == 1) ? 1 : 0);
+            } else if (mode == 3) {
+                is_null = static_cast<uint8_t>(((i * 5 + 2) % 7 == 0) ? 1 : 0);
+            } else if (mode == 4) {
+                is_null = 1;
+            }
+            null_data[i] = is_null;
+            (*expected_nulls)[i] = is_null;
+            any_null = any_null || (is_null != 0);
+        }
+        auto nullable = NullableColumn::create(std::move(data_col), std::move(null_col));
+        nullable->set_has_null(any_null);
+        return nullable;
+    };
+
+    for (size_t size : kSizes) {
+        for (int init_mode : {0, 1}) {
+            // Test 1-input overload
+            for (int m1 = 0; m1 < 5; ++m1) {
+                std::vector<uint8_t> exp1;
+                auto c1 = make_col(size, m1, &exp1);
+                auto produce = NullColumn::create();
+                produce->resize(size);
+                auto* pdata = produce->get_data().data();
+                for (size_t i = 0; i < size; ++i) {
+                    pdata[i] = (init_mode == 1 && (i % 11 == 0)) ? 1 : 0;
+                }
+                FunctionHelper::union_produce_nullable_column(c1, &produce);
+                const auto* out = produce->immutable_data().data();
+                for (size_t i = 0; i < size; ++i) {
+                    uint8_t init_bit = (init_mode == 1 && (i % 11 == 0)) ? 1 : 0;
+                    ASSERT_EQ(out[i], static_cast<uint8_t>(init_bit | exp1[i]))
+                            << "1-arg size=" << size << " init=" << init_mode << " m1=" << m1 << " i=" << i;
+                }
+            }
+
+            // Test 2-input overload
+            for (int m1 = 0; m1 < 5; ++m1) {
+                for (int m2 = 0; m2 < 5; ++m2) {
+                    std::vector<uint8_t> exp1;
+                    std::vector<uint8_t> exp2;
+                    auto c1 = make_col(size, m1, &exp1);
+                    auto c2 = make_col(size, m2, &exp2);
+                    auto produce = NullColumn::create();
+                    produce->resize(size);
+                    auto* pdata = produce->get_data().data();
+                    for (size_t i = 0; i < size; ++i) {
+                        pdata[i] = (init_mode == 1 && (i % 11 == 0)) ? 1 : 0;
+                    }
+                    FunctionHelper::union_produce_nullable_column(c1, c2, &produce);
+                    const auto* out = produce->immutable_data().data();
+                    for (size_t i = 0; i < size; ++i) {
+                        uint8_t init_bit = (init_mode == 1 && (i % 11 == 0)) ? 1 : 0;
+                        ASSERT_EQ(out[i], static_cast<uint8_t>(init_bit | exp1[i] | exp2[i]))
+                                << "2-arg size=" << size << " init=" << init_mode << " m1=" << m1 << " m2=" << m2
+                                << " i=" << i;
+                    }
+                }
+            }
+        }
+    }
+}
+
 TEST_F(FunctionHelperTest, testCreateColumnScalarNullableAndNonNullable) {
     auto non_nullable = FunctionHelper::create_column(TYPE_INT_DESC, false);
     ASSERT_NE(non_nullable, nullptr);
@@ -592,11 +720,11 @@ TEST_F(FunctionHelperTest, ArrayV2ColumnCopyControls) {
             auto source = ColumnHelper::create_column(arg, mode != 0 && mode != 2);
             if (mode < 3) {
                 for (int i = 11; i <= (mode == 2 ? 11 : 33); i += 11) {
-                    Datum value = arg.type == TYPE_INT
-                                          ? Datum(i)
-                                          : arg.type == TYPE_VARCHAR
-                                                    ? Datum(Slice(i == 11 ? "one" : i == 22 ? "two" : "three"))
-                                                    : Datum(DatumArray{Datum(i)});
+                    Datum value = arg.type == TYPE_INT       ? Datum(i)
+                                  : arg.type == TYPE_VARCHAR ? Datum(Slice(i == 11   ? "one"
+                                                                           : i == 22 ? "two"
+                                                                                     : "three"))
+                                                             : Datum(DatumArray{Datum(i)});
                     if (mode == 1 && i == 22)
                         source->append_nulls(1);
                     else
@@ -637,11 +765,11 @@ TEST_F(FunctionHelperTest, MapColumnCopyControls) {
             auto source = ColumnHelper::create_column(arg, mode != 0 && mode != 2);
             if (mode < 3) {
                 for (int i = 11; i <= (mode == 2 ? 11 : 33); i += 11) {
-                    Datum value = arg.type == TYPE_INT
-                                          ? Datum(i)
-                                          : arg.type == TYPE_VARCHAR
-                                                    ? Datum(Slice(i == 11 ? "one" : i == 22 ? "two" : "three"))
-                                                    : Datum(DatumArray{Datum(i)});
+                    Datum value = arg.type == TYPE_INT       ? Datum(i)
+                                  : arg.type == TYPE_VARCHAR ? Datum(Slice(i == 11   ? "one"
+                                                                           : i == 22 ? "two"
+                                                                                     : "three"))
+                                                             : Datum(DatumArray{Datum(i)});
                     if (mode == 1 && i == 22)
                         source->append_nulls(1);
                     else
