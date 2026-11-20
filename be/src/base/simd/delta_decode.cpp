@@ -55,9 +55,13 @@ DD_TARGET_AVX2 void delta_decode_chain_int32_avx2(int32_t* buf, int n, int32_t m
             __m256i s1 = _mm256_add_epi32(v, _mm256_slli_si256(v, 4));
             __m256i s2 = _mm256_add_epi32(s1, _mm256_slli_si256(s1, 8));
             __m256i carry = _mm256_shuffle_epi32(_mm256_permute2x128_si256(s2, s2, 0x08), _MM_SHUFFLE(3, 3, 3, 3));
-            __m256i res = _mm256_add_epi32(_mm256_add_epi32(s2, carry), v_prev);
+            __m256i p = _mm256_add_epi32(s2, carry);
+            // Permute the block total from p before adding v_prev so the 3-cycle cross-lane
+            // vpermd is off the loop-carried dependency chain (reducing it to a 1-cycle vpaddd).
+            __m256i total = _mm256_permutevar8x32_epi32(p, v_perm7);
+            __m256i res = _mm256_add_epi32(p, v_prev);
             _mm256_storeu_si256(reinterpret_cast<__m256i*>(buf + i), res);
-            v_prev = _mm256_permutevar8x32_epi32(res, v_perm7);
+            v_prev = _mm256_add_epi32(v_prev, total);
         }
         last_value = _mm256_extract_epi32(v_prev, 0);
     }
@@ -128,9 +132,13 @@ DD_TARGET_AVX2 void delta_decode_chain_int64_avx2(int64_t* buf, int n, int64_t m
             v = _mm256_add_epi64(v, v_min_delta);
             __m256i s1 = _mm256_add_epi64(v, _mm256_slli_si256(v, 8));
             __m256i carry = _mm256_permute4x64_epi64(_mm256_blend_epi32(v_zero, s1, 0x0C), _MM_SHUFFLE(1, 1, 0, 0));
-            __m256i res = _mm256_add_epi64(_mm256_add_epi64(s1, carry), v_prev);
+            __m256i p = _mm256_add_epi64(s1, carry);
+            // Permute the block total from p before adding v_prev so the 3-cycle cross-lane
+            // vpermq is off the loop-carried dependency chain (reducing it to a 1-cycle vpaddq).
+            __m256i total = _mm256_permute4x64_epi64(p, _MM_SHUFFLE(3, 3, 3, 3));
+            __m256i res = _mm256_add_epi64(p, v_prev);
             _mm256_storeu_si256(reinterpret_cast<__m256i*>(buf + i), res);
-            v_prev = _mm256_permute4x64_epi64(res, _MM_SHUFFLE(3, 3, 3, 3));
+            v_prev = _mm256_add_epi64(v_prev, total);
         }
         last_value = _mm256_extract_epi64(v_prev, 0);
     }
