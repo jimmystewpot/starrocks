@@ -286,4 +286,83 @@ TEST_F(TestHll, AllocateFail) {
     EXPECT_EQ(0, hll_after_fail.estimate_cardinality());
 }
 
+TEST_F(TestHll, MergeAndSerializeRegisterPopulations) {
+    std::vector<uint8_t> buf_a(HLL_REGISTERS_COUNT + 1, 0);
+    std::vector<uint8_t> buf_b(HLL_REGISTERS_COUNT + 1, 0);
+    std::vector<uint8_t> buf_merged(HLL_REGISTERS_COUNT + 1, 0);
+
+    // 1. Sparse register population (> 160 explicit threshold, <= 4096 sparse threshold)
+    {
+        HyperLogLog sparse_a;
+        HyperLogLog sparse_b;
+        for (uint64_t i = 0; i < 600; ++i) {
+            sparse_a.update(hash(i));
+            sparse_b.update(hash(i + 300));
+        }
+        size_t len_a = sparse_a.serialize(buf_a.data());
+        ASSERT_EQ(buf_a[0], HLL_DATA_SPARSE);
+        ASSERT_LT(len_a, static_cast<size_t>(HLL_REGISTERS_COUNT + 1));
+
+        HyperLogLog roundtrip_a(Slice(reinterpret_cast<const char*>(buf_a.data()), len_a));
+        ASSERT_EQ(sparse_a.estimate_cardinality(), roundtrip_a.estimate_cardinality());
+
+        HyperLogLog expected_union;
+        for (uint64_t i = 0; i < 900; ++i) {
+            expected_union.update(hash(i));
+        }
+        sparse_a.merge(sparse_b);
+        ASSERT_EQ(expected_union.estimate_cardinality(), sparse_a.estimate_cardinality());
+    }
+
+    // 2. Medium register population (> 4096 non-zero registers, triggers HLL_DATA_FULL in serialize)
+    {
+        HyperLogLog med_a;
+        HyperLogLog med_b;
+        for (uint64_t i = 0; i < 6000; ++i) {
+            med_a.update(hash(i + 10000));
+            med_b.update(hash(i + 13000));
+        }
+        size_t len_a = med_a.serialize(buf_a.data());
+        size_t len_b = med_b.serialize(buf_b.data());
+        ASSERT_EQ(buf_a[0], HLL_DATA_FULL);
+        ASSERT_EQ(len_a, static_cast<size_t>(HLL_REGISTERS_COUNT + 1));
+        ASSERT_EQ(buf_b[0], HLL_DATA_FULL);
+        ASSERT_EQ(len_b, static_cast<size_t>(HLL_REGISTERS_COUNT + 1));
+
+        HyperLogLog roundtrip_a(Slice(reinterpret_cast<const char*>(buf_a.data()), len_a));
+        ASSERT_EQ(med_a.estimate_cardinality(), roundtrip_a.estimate_cardinality());
+
+        med_a.merge(med_b);
+        size_t len_merged = med_a.serialize(buf_merged.data());
+        ASSERT_EQ(len_merged, static_cast<size_t>(HLL_REGISTERS_COUNT + 1));
+        for (int i = 0; i < HLL_REGISTERS_COUNT; ++i) {
+            ASSERT_EQ(buf_merged[1 + i], std::max(buf_a[1 + i], buf_b[1 + i])) << "register index=" << i;
+        }
+    }
+
+    // 3. Full register population (all or nearly all 16384 registers non-zero)
+    {
+        // Construct two HLL_DATA_FULL payloads with known register values across all 16384 registers
+        buf_a[0] = HLL_DATA_FULL;
+        buf_b[0] = HLL_DATA_FULL;
+        for (int i = 0; i < HLL_REGISTERS_COUNT; ++i) {
+            buf_a[1 + i] = static_cast<uint8_t>((i * 7 + 1) % 32 + 1);
+            buf_b[1 + i] = static_cast<uint8_t>((i * 13 + 5) % 32 + 1);
+        }
+        HyperLogLog full_a(Slice(reinterpret_cast<const char*>(buf_a.data()), HLL_REGISTERS_COUNT + 1));
+        HyperLogLog full_b(Slice(reinterpret_cast<const char*>(buf_b.data()), HLL_REGISTERS_COUNT + 1));
+
+        full_a.merge(full_b);
+        size_t len_merged = full_a.serialize(buf_merged.data());
+        ASSERT_EQ(buf_merged[0], HLL_DATA_FULL);
+        ASSERT_EQ(len_merged, static_cast<size_t>(HLL_REGISTERS_COUNT + 1));
+        for (int i = 0; i < HLL_REGISTERS_COUNT; ++i) {
+            ASSERT_EQ(buf_merged[1 + i], std::max(buf_a[1 + i], buf_b[1 + i])) << "register index=" << i;
+        }
+
+        HyperLogLog roundtrip_merged(Slice(reinterpret_cast<const char*>(buf_merged.data()), len_merged));
+        ASSERT_EQ(full_a.estimate_cardinality(), roundtrip_merged.estimate_cardinality());
+    }
+}
+
 } // namespace starrocks

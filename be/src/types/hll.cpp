@@ -45,8 +45,13 @@
 #include "base/coding.h"
 #include "base/phmap/phmap.h"
 #include "base/simd/multi_version.h"
+#include "base/simd/simd.h"
 #include "common/logging.h"
 #include "gutil/strings/substitute.h"
+
+#if defined(__ARM_NEON) && defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 using std::map;
 using std::string;
@@ -281,9 +286,31 @@ MFV_SSE42(void merge_registers_impl(uint8_t* dest, const uint8_t* other) {
 })
 
 MFV_DEFAULT(void merge_registers_impl(uint8_t* dest, const uint8_t* other) {
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    constexpr int kSimdSize = sizeof(uint8x16_t);
+    constexpr int kUnrollSize = kSimdSize * 4;
+    static_assert(HLL_REGISTERS_COUNT % kUnrollSize == 0);
+    constexpr int loop = HLL_REGISTERS_COUNT / kUnrollSize;
+
+    for (int i = 0; i < loop; ++i, other += kUnrollSize, dest += kUnrollSize) {
+        uint8x16_t a0 = vld1q_u8(dest);
+        uint8x16_t a1 = vld1q_u8(dest + 16);
+        uint8x16_t a2 = vld1q_u8(dest + 32);
+        uint8x16_t a3 = vld1q_u8(dest + 48);
+        uint8x16_t b0 = vld1q_u8(other);
+        uint8x16_t b1 = vld1q_u8(other + 16);
+        uint8x16_t b2 = vld1q_u8(other + 32);
+        uint8x16_t b3 = vld1q_u8(other + 48);
+        vst1q_u8(dest, vmaxq_u8(a0, b0));
+        vst1q_u8(dest + 16, vmaxq_u8(a1, b1));
+        vst1q_u8(dest + 32, vmaxq_u8(a2, b2));
+        vst1q_u8(dest + 48, vmaxq_u8(a3, b3));
+    }
+#else
     for (int i = 0; i < HLL_REGISTERS_COUNT; i++) {
         dest[i] = std::max(dest[i], other[i]);
     }
+#endif
 })
 
 void HyperLogLog::merge(const HyperLogLog& other) {
@@ -393,10 +420,7 @@ size_t HyperLogLog::serialize(uint8_t* dst) const {
     }
     case HLL_DATA_SPARSE:
     case HLL_DATA_FULL: {
-        uint32_t num_non_zero_registers = 0;
-        for (int i = 0; i < HLL_REGISTERS_COUNT; i++) {
-            num_non_zero_registers += (_registers.data[i] != 0);
-        }
+        uint32_t num_non_zero_registers = SIMD::count_nonzero(_registers.data, HLL_REGISTERS_COUNT);
         // each register in sparse format will occupy 3bytes, 2 for index and
         // 1 for register value. So if num_non_zero_registers is greater than
         // 4K we use full encode format.
