@@ -14,6 +14,7 @@
 
 #include "base/simd/expand.h"
 
+#include <array>
 #include <cstring>
 
 #include "base/simd/multi_version.h"
@@ -30,13 +31,50 @@
 namespace SIMD::Expand {
 
 #if defined(__x86_64__)
-// Lookup table for AVX2 expand: for each 8-bit mask, stores the permutation
-// indices needed to scatter `popcount(mask)` valid elements into their final
-// positions. Initialised at startup.
-alignas(32) static uint32_t kExpandPermuteLUT[256][8];
+// Lookup table for AVX2 32-bit expand: for each 8-bit mask, stores the
+// permutation indices needed to scatter `popcount(mask)` valid elements into
+// their final positions.
+constexpr auto make_expand_permute_lut32() {
+    std::array<std::array<uint32_t, 8>, 256> table{};
+    for (uint32_t mask = 0; mask < 256; ++mask) {
+        uint32_t src_idx = 0;
+        for (uint32_t dst_idx = 0; dst_idx < 8; ++dst_idx) {
+            if (mask & (1u << dst_idx)) {
+                table[mask][dst_idx] = src_idx++;
+            } else {
+                table[mask][dst_idx] = 0;
+            }
+        }
+    }
+    return table;
+}
+
+alignas(64) inline constexpr auto kExpandPermuteLUT = make_expand_permute_lut32();
+
+// 4-bit mask -> 8 x int32 permutation indices that treat the 256-bit register
+// as four 64-bit lanes. The permute is done via _mm256_permutevar8x32_epi32
+// because there is no native epi64 permute on AVX2.
+constexpr auto make_expand_permute_lut64() {
+    std::array<std::array<int32_t, 8>, 16> table{};
+    for (uint32_t mask = 0; mask < 16; ++mask) {
+        int32_t src_idx = 0;
+        for (uint32_t dst_idx = 0; dst_idx < 4; ++dst_idx) {
+            int32_t base = 0;
+            if (mask & (1u << dst_idx)) {
+                base = src_idx * 2;
+                ++src_idx;
+            }
+            table[mask][dst_idx * 2] = base;
+            table[mask][dst_idx * 2 + 1] = base + 1;
+        }
+    }
+    return table;
+}
+
+alignas(64) inline constexpr auto kPerm64LUT = make_expand_permute_lut64();
 
 // popcount(mask) for each 8-bit mask, used to advance the source cursor.
-static const uint8_t kExpandCountLUT[256] = {
+inline constexpr std::array<uint8_t, 256> kExpandCountLUT = {
         0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 1, 2, 2, 3, 2,
         3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3,
         3, 4, 3, 4, 4, 5, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5,
@@ -47,23 +85,7 @@ static const uint8_t kExpandCountLUT[256] = {
 };
 
 // popcount for each 4-bit mask, used by the 64-bit AVX2 path.
-static const uint8_t kExpandCountLUT64[16] = {0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4};
-
-struct ExpandLUTInitializer {
-    ExpandLUTInitializer() {
-        for (uint32_t mask = 0; mask < 256; ++mask) {
-            uint32_t src_idx = 0;
-            for (uint32_t dst_idx = 0; dst_idx < 8; ++dst_idx) {
-                if (mask & (1u << dst_idx)) {
-                    kExpandPermuteLUT[mask][dst_idx] = src_idx++;
-                } else {
-                    kExpandPermuteLUT[mask][dst_idx] = 0;
-                }
-            }
-        }
-    }
-};
-static ExpandLUTInitializer g_expand_lut_init;
+inline constexpr std::array<uint8_t, 16> kExpandCountLUT64 = {0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4};
 #endif // __x86_64__
 
 MFV_DEFAULT(void expand_load_selection_i32(int32_t* dst_data, const int32_t* src_data, const uint8_t* nulls,
@@ -75,16 +97,26 @@ MFV_AVX2(void expand_load_selection_i32(int32_t* dst_data, const int32_t* src_da
                                         size_t total_valid) {
     size_t cnt = 0;
     size_t i = 0;
+    const __m128i zero16 = _mm_setzero_si128();
     // Process 8 elements per iteration using AVX2 permute + LUT.
     // Only enter SIMD path while we have >= 8 valid elements remaining so the
     // wide load never reads past the source buffer.
     for (; i + 8 <= count && cnt + 8 <= total_valid; i += 8) {
         __m128i null_vec = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(&nulls[i]));
-        __m128i cmp = _mm_cmpeq_epi8(null_vec, _mm_setzero_si128());
-        uint32_t mask8 = _mm_movemask_epi8(cmp) & 0xFF;
+        __m128i cmp = _mm_cmpeq_epi8(null_vec, zero16);
+        uint32_t mask8 = static_cast<uint32_t>(_mm_movemask_epi8(cmp)) & 0xFFu;
+        if (mask8 == 0) {
+            continue;
+        }
+        if (mask8 == 0xFFu) {
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst_data + i),
+                                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src_data + cnt)));
+            cnt += 8;
+            continue;
+        }
 
         __m256i src_vec = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src_data + cnt));
-        __m256i perm = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(kExpandPermuteLUT[mask8]));
+        __m256i perm = _mm256_load_si256(reinterpret_cast<const __m256i*>(kExpandPermuteLUT[mask8].data()));
         __m256i dst_vec = _mm256_permutevar8x32_epi32(src_vec, perm);
         _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst_data + i), dst_vec);
 
@@ -124,30 +156,9 @@ MFV_DEFAULT(void expand_load_selection_i64(int64_t* dst_data, const int64_t* src
 
 MFV_AVX2(void expand_load_selection_i64(int64_t* dst_data, const int64_t* src_data, const uint8_t* nulls, size_t count,
                                         size_t total_valid) {
-    // 4-bit mask -> 8 x int32 permutation indices that treat the 256-bit
-    // register as four 64-bit lanes. NB: the permute is done via
-    // _mm256_permutevar8x32_epi32 because there is no native epi64 permute on AVX2.
-    static const int32_t kPerm64LUT[16][8] = {
-            {0, 1, 0, 1, 0, 1, 0, 1}, // 0b0000
-            {0, 1, 0, 1, 0, 1, 0, 1}, // 0b0001
-            {0, 1, 0, 1, 0, 1, 0, 1}, // 0b0010
-            {0, 1, 2, 3, 0, 1, 0, 1}, // 0b0011
-            {0, 1, 0, 1, 0, 1, 0, 1}, // 0b0100
-            {0, 1, 0, 1, 2, 3, 0, 1}, // 0b0101
-            {0, 1, 0, 1, 2, 3, 0, 1}, // 0b0110
-            {0, 1, 2, 3, 4, 5, 0, 1}, // 0b0111
-            {0, 1, 0, 1, 0, 1, 0, 1}, // 0b1000
-            {0, 1, 0, 1, 0, 1, 2, 3}, // 0b1001
-            {0, 1, 0, 1, 0, 1, 2, 3}, // 0b1010
-            {0, 1, 2, 3, 0, 1, 4, 5}, // 0b1011
-            {0, 1, 0, 1, 0, 1, 2, 3}, // 0b1100
-            {0, 1, 0, 1, 2, 3, 4, 5}, // 0b1101
-            {0, 1, 0, 1, 2, 3, 4, 5}, // 0b1110
-            {0, 1, 2, 3, 4, 5, 6, 7}, // 0b1111
-    };
-
     size_t cnt = 0;
     size_t i = 0;
+    const __m128i zero16 = _mm_setzero_si128();
     // Process 4 x int64 (256 bits) per iteration with the same safe-load guard
     // as the 32-bit path.
     for (; i + 4 <= count && cnt + 4 <= total_valid; i += 4) {
@@ -156,11 +167,20 @@ MFV_AVX2(void expand_load_selection_i64(int64_t* dst_data, const int64_t* src_da
         uint32_t nulls_packed;
         std::memcpy(&nulls_packed, &nulls[i], sizeof(nulls_packed));
         __m128i null_vec = _mm_cvtsi32_si128(static_cast<int>(nulls_packed));
-        __m128i cmp = _mm_cmpeq_epi8(null_vec, _mm_setzero_si128());
-        uint32_t mask4 = _mm_movemask_epi8(cmp) & 0xF;
+        __m128i cmp = _mm_cmpeq_epi8(null_vec, zero16);
+        uint32_t mask4 = static_cast<uint32_t>(_mm_movemask_epi8(cmp)) & 0x0Fu;
+        if (mask4 == 0) {
+            continue;
+        }
+        if (mask4 == 0x0Fu) {
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst_data + i),
+                                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src_data + cnt)));
+            cnt += 4;
+            continue;
+        }
 
         __m256i src_vec = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src_data + cnt));
-        __m256i perm = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(kPerm64LUT[mask4]));
+        __m256i perm = _mm256_load_si256(reinterpret_cast<const __m256i*>(kPerm64LUT[mask4].data()));
         __m256i dst_vec = _mm256_permutevar8x32_epi32(src_vec, perm);
         _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst_data + i), dst_vec);
 
