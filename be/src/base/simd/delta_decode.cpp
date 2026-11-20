@@ -172,6 +172,33 @@ DD_TARGET_AVX512F void delta_decode_chain_int32_avx512(int32_t* buf, int n, int3
 }
 
 // ==========================================
+// int64 / uint64_t single-pass AVX2 version
+DD_TARGET_AVX2 void delta_decode_chain_int64_avx2(int64_t* buf, int n, int64_t min_delta, int64_t& last_value) {
+    const __m256i v_min_delta = _mm256_set1_epi64x(min_delta);
+    const __m256i v_zero = _mm256_setzero_si256();
+
+    int sz = (n / 4) * 4;
+    if (sz > 0) {
+        __m256i v_prev = _mm256_set1_epi64x(last_value);
+        for (int i = 0; i < sz; i += 4) {
+            __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(buf + i));
+            v = _mm256_add_epi64(v, v_min_delta);
+            __m256i s1 = _mm256_add_epi64(v, _mm256_slli_si256(v, 8));
+            __m256i carry = _mm256_permute4x64_epi64(_mm256_blend_epi32(v_zero, s1, 0x0C), _MM_SHUFFLE(1, 1, 0, 0));
+            __m256i res = _mm256_add_epi64(_mm256_add_epi64(s1, carry), v_prev);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(buf + i), res);
+            v_prev = _mm256_permute4x64_epi64(res, _MM_SHUFFLE(3, 3, 3, 3));
+        }
+        last_value = _mm256_extract_epi64(v_prev, 0);
+    }
+
+    for (int i = sz; i < n; i++) {
+        uint64_t val =
+                static_cast<uint64_t>(buf[i]) + static_cast<uint64_t>(last_value) + static_cast<uint64_t>(min_delta);
+        buf[i] = static_cast<int64_t>(val);
+        last_value = static_cast<int64_t>(val);
+    }
+}
 
 DD_TARGET_AVX512F static __m512i prefix_and_accumulate_int64_avx512(int64_t* p, __m512i s, const __m512i& v_min_delta,
                                                                     const __m512i& v_zero, const __m512i& v_perm7) {
@@ -344,9 +371,15 @@ void delta_decode_chain_int32(int32_t* buf, int n, int32_t min_delta, int32_t& l
 }
 
 void delta_decode_chain_int64(int64_t* buf, int n, int64_t min_delta, int64_t& last_value) {
-#if defined(__x86_64__) && !defined(ADDRESS_SANITIZER)
+#if defined(__x86_64__)
+#if !defined(ADDRESS_SANITIZER)
     if (__builtin_cpu_supports("avx512f")) {
         delta_decode_chain_int64_avx512(buf, n, min_delta, last_value);
+        return;
+    }
+#endif
+    if (__builtin_cpu_supports("avx2")) {
+        delta_decode_chain_int64_avx2(buf, n, min_delta, last_value);
         return;
     }
 #elif defined(__ARM_NEON) && defined(__aarch64__)

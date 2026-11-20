@@ -87,11 +87,13 @@ void delta_decode_chain_int64_scalar(int64_t* buf, int n, int64_t min_delta, int
 // these as a same-named IFUNC family gated behind `#if defined(__AVX512F__)`, so the AVX-512 path
 // only existed when the whole binary was built with -mavx512f and otherwise collapsed to a
 // compile-time pick of the global baseline (it never dispatched at runtime).
+#if defined(__x86_64__)
 void delta_decode_chain_int32_avx2(int32_t* buf, int n, int32_t min_delta, int32_t& last_value);
 void delta_decode_chain_int32_avx2x(int32_t* buf, int n, int32_t min_delta, int32_t& last_value);
+void delta_decode_chain_int64_avx2(int64_t* buf, int n, int64_t min_delta, int64_t& last_value);
 void delta_decode_chain_int32_avx512(int32_t* buf, int n, int32_t min_delta, int32_t& last_value);
 void delta_decode_chain_int64_avx512(int64_t* buf, int n, int64_t min_delta, int64_t& last_value);
-#if defined(__ARM_NEON) && defined(__aarch64__)
+#elif defined(__ARM_NEON) && defined(__aarch64__)
 void delta_decode_chain_int32_neon(int32_t* buf, int n, int32_t min_delta, int32_t& last_value);
 void delta_decode_chain_int64_neon(int64_t* buf, int n, int64_t min_delta, int64_t& last_value);
 #endif
