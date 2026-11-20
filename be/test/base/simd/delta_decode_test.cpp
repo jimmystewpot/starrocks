@@ -82,13 +82,6 @@ TEST_F(DeltaDecodeTest, test_int32) {
         ASSERT_EQ(v.back(), last_value);
     }
 #if !defined(ADDRESS_SANITIZER)
-    if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512vl")) {
-        std::vector<int32_t> v(values);
-        int32_t last_value = 10;
-        delta_decode_chain_int32_avx2x(v.data(), v.size(), 10, last_value);
-        ASSERT_EQ(v, expected);
-        ASSERT_EQ(v.back(), last_value);
-    }
     if (__builtin_cpu_supports("avx512f")) {
         std::vector<int32_t> v(values);
         int32_t last_value = 10;
@@ -266,13 +259,6 @@ TEST_F(DeltaDecodeTest, test_int32_wrapping_overflow) {
         ASSERT_EQ(v.back(), last_val);
     }
 #if !defined(ADDRESS_SANITIZER)
-    if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512vl")) {
-        std::vector<int32_t> v(values);
-        int32_t last_val = start_val;
-        delta_decode_chain_int32_avx2x(v.data(), v.size(), min_delta, last_val);
-        ASSERT_EQ(v, expected);
-        ASSERT_EQ(v.back(), last_val);
-    }
     if (__builtin_cpu_supports("avx512f")) {
         std::vector<int32_t> v(values);
         int32_t last_val = start_val;

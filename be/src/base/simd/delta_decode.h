@@ -89,7 +89,6 @@ void delta_decode_chain_int64_scalar(int64_t* buf, int n, int64_t min_delta, int
 // compile-time pick of the global baseline (it never dispatched at runtime).
 #if defined(__x86_64__)
 void delta_decode_chain_int32_avx2(int32_t* buf, int n, int32_t min_delta, int32_t& last_value);
-void delta_decode_chain_int32_avx2x(int32_t* buf, int n, int32_t min_delta, int32_t& last_value);
 void delta_decode_chain_int64_avx2(int64_t* buf, int n, int64_t min_delta, int64_t& last_value);
 void delta_decode_chain_int32_avx512(int32_t* buf, int n, int32_t min_delta, int32_t& last_value);
 void delta_decode_chain_int64_avx512(int64_t* buf, int n, int64_t min_delta, int64_t& last_value);
