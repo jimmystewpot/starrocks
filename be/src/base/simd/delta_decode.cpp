@@ -34,7 +34,9 @@ namespace starrocks {
 #if defined(__x86_64__)
 
 #define DD_TARGET_AVX2 __attribute__((target("avx2")))
-// int32/int64 512-bit kernels need only AVX-512F (safe to dispatch on avx512f alone, incl. KNL).
+// int32/int64 512-bit kernels use AVX-512F instructions; runtime dispatch additionally requires
+// avx512vbmi2 so pre-Ice Lake CPUs (Skylake-X/SP, Cascade Lake) use the single-pass AVX2 kernels
+// instead of suffering 512-bit ZMM frequency downclocking.
 #define DD_TARGET_AVX512F __attribute__((target("avx512f")))
 
 // =========================
@@ -282,6 +284,8 @@ void delta_decode_chain_int64_neon(int64_t* buf, int n, int64_t min_delta, int64
 //
 // The AVX-512 path is skipped under ASan: it spills zmm registers to a stack slot ASan aligns to 32
 // (not 64) bytes, so the store touches the redzone and traps. See https://github.com/llvm/llvm-project/issues/91565.
+// It also requires avx512vbmi2 so pre-Ice Lake CPUs (Skylake-X/SP, Cascade Lake) dispatch to the
+// single-pass AVX2 kernels instead of suffering 512-bit frequency downclocking.
 
 void delta_decode_chain_int32_scalar(int32_t* buf, int n, int32_t min_delta, int32_t& last_value) {
     delta_decode_chain_scalar_prefetch<int32_t>(buf, n, min_delta, last_value);
@@ -293,8 +297,8 @@ void delta_decode_chain_int64_scalar(int64_t* buf, int n, int64_t min_delta, int
 
 void delta_decode_chain_int32(int32_t* buf, int n, int32_t min_delta, int32_t& last_value) {
 #if defined(__x86_64__)
-#if !defined(ADDRESS_SANITIZER)
-    if (__builtin_cpu_supports("avx512f")) {
+#if !defined(ADDRESS_SANITIZER) && !defined(__SANITIZE_ADDRESS__)
+    if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512vbmi2")) {
         delta_decode_chain_int32_avx512(buf, n, min_delta, last_value);
         return;
     }
@@ -312,8 +316,8 @@ void delta_decode_chain_int32(int32_t* buf, int n, int32_t min_delta, int32_t& l
 
 void delta_decode_chain_int64(int64_t* buf, int n, int64_t min_delta, int64_t& last_value) {
 #if defined(__x86_64__)
-#if !defined(ADDRESS_SANITIZER)
-    if (__builtin_cpu_supports("avx512f")) {
+#if !defined(ADDRESS_SANITIZER) && !defined(__SANITIZE_ADDRESS__)
+    if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512vbmi2")) {
         delta_decode_chain_int64_avx512(buf, n, min_delta, last_value);
         return;
     }

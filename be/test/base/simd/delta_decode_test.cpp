@@ -81,7 +81,7 @@ TEST_F(DeltaDecodeTest, test_int32) {
         ASSERT_EQ(v, expected);
         ASSERT_EQ(v.back(), last_value);
     }
-#if !defined(ADDRESS_SANITIZER)
+#if !defined(ADDRESS_SANITIZER) && !defined(__SANITIZE_ADDRESS__)
     if (__builtin_cpu_supports("avx512f")) {
         std::vector<int32_t> v(values);
         int32_t last_value = 10;
@@ -141,7 +141,7 @@ TEST_F(DeltaDecodeTest, test_int64) {
         ASSERT_EQ(v, expected);
         ASSERT_EQ(v.back(), last_value);
     }
-#if !defined(ADDRESS_SANITIZER)
+#if !defined(ADDRESS_SANITIZER) && !defined(__SANITIZE_ADDRESS__)
     if (__builtin_cpu_supports("avx512f")) {
         std::vector<int64_t> v(values);
         int64_t last_value = 10;
@@ -258,7 +258,7 @@ TEST_F(DeltaDecodeTest, test_int32_wrapping_overflow) {
         ASSERT_EQ(v, expected);
         ASSERT_EQ(v.back(), last_val);
     }
-#if !defined(ADDRESS_SANITIZER)
+#if !defined(ADDRESS_SANITIZER) && !defined(__SANITIZE_ADDRESS__)
     if (__builtin_cpu_supports("avx512f")) {
         std::vector<int32_t> v(values);
         int32_t last_val = start_val;
@@ -320,7 +320,7 @@ TEST_F(DeltaDecodeTest, test_int64_wrapping_overflow) {
         ASSERT_EQ(v, expected);
         ASSERT_EQ(v.back(), last_val);
     }
-#if !defined(ADDRESS_SANITIZER)
+#if !defined(ADDRESS_SANITIZER) && !defined(__SANITIZE_ADDRESS__)
     if (__builtin_cpu_supports("avx512f")) {
         std::vector<int64_t> v(values);
         int64_t last_val = start_val;
