@@ -50,8 +50,14 @@ void expand_load_simd(int64_t* dst_data, const int64_t* src_data, const uint8_t*
 template <class DataType>
 inline void expand_load_branchless(DataType* dst_data, const DataType* src_data, const uint8_t* nulls, size_t count,
                                    size_t total_valid) {
+    if (total_valid == 0) {
+        return;
+    }
+    while (count > 0 && nulls[count - 1] != 0) {
+        --count;
+    }
     size_t cnt = 0;
-    for (size_t i = 0; i < count && cnt < total_valid; ++i) {
+    for (size_t i = 0; i < count; ++i) {
         dst_data[i] = starrocks::unaligned_load<DataType>(src_data + cnt);
         cnt += !nulls[i];
     }
