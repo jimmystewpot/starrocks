@@ -67,14 +67,12 @@ static ExpandLUTInitializer g_expand_lut_init;
 #endif // __x86_64__
 
 MFV_DEFAULT(void expand_load_selection_i32(int32_t* dst_data, const int32_t* src_data, const uint8_t* nulls,
-                                           size_t count) { expand_load_branchless(dst_data, src_data, nulls, count); });
+                                           size_t count, size_t total_valid) {
+    expand_load_branchless(dst_data, src_data, nulls, count, total_valid);
+});
 
-MFV_AVX2(void expand_load_selection_i32(int32_t* dst_data, const int32_t* src_data, const uint8_t* nulls,
-                                        size_t count) {
-    // Pre-calculate total valid elements to avoid reading past src_data.
-    // nulls[i] == 0 means "valid", so count_zero gives total_valid.
-    size_t total_valid = SIMD::count_zero(nulls, count);
-
+MFV_AVX2(void expand_load_selection_i32(int32_t* dst_data, const int32_t* src_data, const uint8_t* nulls, size_t count,
+                                        size_t total_valid) {
     size_t cnt = 0;
     size_t i = 0;
     // Process 8 elements per iteration using AVX2 permute + LUT.
@@ -93,35 +91,39 @@ MFV_AVX2(void expand_load_selection_i32(int32_t* dst_data, const int32_t* src_da
         cnt += kExpandCountLUT[mask8];
     }
     // Scalar tail
-    for (; i < count; ++i) {
+    for (; i < count && cnt < total_valid; ++i) {
         dst_data[i] = starrocks::unaligned_load<int32_t>(src_data + cnt);
         cnt += !nulls[i];
     }
 });
 
 MFV_AVX512VLBW(void expand_load_selection_i32(int32_t* dst_data, const int32_t* src_data, const uint8_t* nulls,
-                                              size_t count) {
+                                              size_t count, size_t total_valid) {
     size_t cnt = 0;
     size_t i = 0;
-    for (; i + 16 <= count; i += 16) {
-        __mmask16 null_mask;
+    for (; i + 16 <= count && cnt < total_valid; i += 16) {
         __m128i mask = _mm_loadu_epi8(&nulls[i]);
-        null_mask = _mm_cmp_epi8_mask(mask, _mm_setzero_si128(), _MM_CMPINT_EQ);
+        __mmask16 null_mask = _mm_cmp_epi8_mask(mask, _mm_setzero_si128(), _MM_CMPINT_EQ);
+        if (null_mask == 0) {
+            continue;
+        }
         __m512i loaded = _mm512_maskz_expandloadu_epi32(null_mask, &src_data[cnt]);
         cnt += _mm_popcnt_u32(null_mask);
         _mm512_storeu_epi32(&dst_data[i], loaded);
     }
-    for (; i < count; ++i) {
+    for (; i < count && cnt < total_valid; ++i) {
         dst_data[i] = starrocks::unaligned_load<int32_t>(src_data + cnt);
         cnt += !nulls[i];
     }
 });
 
 MFV_DEFAULT(void expand_load_selection_i64(int64_t* dst_data, const int64_t* src_data, const uint8_t* nulls,
-                                           size_t count) { expand_load_branchless(dst_data, src_data, nulls, count); });
+                                           size_t count, size_t total_valid) {
+    expand_load_branchless(dst_data, src_data, nulls, count, total_valid);
+});
 
-MFV_AVX2(void expand_load_selection_i64(int64_t* dst_data, const int64_t* src_data, const uint8_t* nulls,
-                                        size_t count) {
+MFV_AVX2(void expand_load_selection_i64(int64_t* dst_data, const int64_t* src_data, const uint8_t* nulls, size_t count,
+                                        size_t total_valid) {
     // 4-bit mask -> 8 x int32 permutation indices that treat the 256-bit
     // register as four 64-bit lanes. NB: the permute is done via
     // _mm256_permutevar8x32_epi32 because there is no native epi64 permute on AVX2.
@@ -144,8 +146,6 @@ MFV_AVX2(void expand_load_selection_i64(int64_t* dst_data, const int64_t* src_da
             {0, 1, 2, 3, 4, 5, 6, 7}, // 0b1111
     };
 
-    size_t total_valid = SIMD::count_zero(nulls, count);
-
     size_t cnt = 0;
     size_t i = 0;
     // Process 4 x int64 (256 bits) per iteration with the same safe-load guard
@@ -166,40 +166,55 @@ MFV_AVX2(void expand_load_selection_i64(int64_t* dst_data, const int64_t* src_da
 
         cnt += kExpandCountLUT64[mask4];
     }
-    for (; i < count; ++i) {
+    for (; i < count && cnt < total_valid; ++i) {
         dst_data[i] = starrocks::unaligned_load<int64_t>(src_data + cnt);
         cnt += !nulls[i];
     }
 });
 
 MFV_AVX512VLBW(void expand_load_selection_i64(int64_t* dst_data, const int64_t* src_data, const uint8_t* nulls,
-                                              size_t count) {
+                                              size_t count, size_t total_valid) {
     size_t cnt = 0;
     size_t i = 0;
-    for (; i + 16 <= count; i += 16) {
+    for (; i + 16 <= count && cnt < total_valid; i += 16) {
         __m128i mask = _mm_loadu_epi8(&nulls[i]);
         __mmask16 null_mask = _mm_cmp_epi8_mask(mask, _mm_setzero_si128(), _MM_CMPINT_EQ);
+        if (null_mask == 0) {
+            continue;
+        }
 
         __m512i loaded;
 
         // process low mask
         __mmask8 mask_lo = null_mask;
-        loaded = _mm512_maskz_expandloadu_epi64(mask_lo, &src_data[cnt]);
-        _mm512_storeu_epi64(&dst_data[i], loaded);
-        cnt += _mm_popcnt_u32(mask_lo);
+        if (mask_lo != 0) {
+            loaded = _mm512_maskz_expandloadu_epi64(mask_lo, &src_data[cnt]);
+            _mm512_storeu_epi64(&dst_data[i], loaded);
+            cnt += _mm_popcnt_u32(mask_lo);
+        }
 
         __mmask8 mask_hi = null_mask >> 8;
-        loaded = _mm512_maskz_expandloadu_epi64(mask_hi, &src_data[cnt]);
-        _mm512_storeu_epi64(&dst_data[i + 8], loaded);
-        cnt += _mm_popcnt_u32(mask_hi);
+        if (mask_hi != 0) {
+            loaded = _mm512_maskz_expandloadu_epi64(mask_hi, &src_data[cnt]);
+            _mm512_storeu_epi64(&dst_data[i + 8], loaded);
+            cnt += _mm_popcnt_u32(mask_hi);
+        }
     }
-    for (; i < count; ++i) {
+    for (; i < count && cnt < total_valid; ++i) {
         dst_data[i] = starrocks::unaligned_load<int64_t>(src_data + cnt);
         cnt += !nulls[i];
     }
 })
 
-void expand_load_simd(int32_t* dst_data, const int32_t* src_data, const uint8_t* nulls, size_t count) {
+void expand_load_simd(int32_t* dst_data, const int32_t* src_data, const uint8_t* nulls, size_t count,
+                      size_t total_valid) {
+    if (total_valid == 0) {
+        return;
+    }
+    if (total_valid >= count) {
+        std::memcpy(dst_data, src_data, count * sizeof(int32_t));
+        return;
+    }
 #if defined(__ARM_NEON) && defined(__aarch64__)
     // NEON 4-element expand using TBL permutation. Function multi-versioning is
     // x86-only, so dispatch directly here on aarch64.
@@ -222,8 +237,6 @@ void expand_load_simd(int32_t* dst_data, const int32_t* src_data, const uint8_t*
             {0, 4, 8, 12}, // 0b1111
     };
     static const uint8_t kNeonCountLUT[16] = {0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4};
-
-    size_t total_valid = SIMD::count_zero(nulls, count);
 
     size_t cnt = 0;
     size_t i = 0;
@@ -249,20 +262,30 @@ void expand_load_simd(int32_t* dst_data, const int32_t* src_data, const uint8_t*
 
         cnt += kNeonCountLUT[mask4];
     }
-    for (; i < count; ++i) {
+    for (; i < count && cnt < total_valid; ++i) {
         dst_data[i] = starrocks::unaligned_load<int32_t>(src_data + cnt);
         cnt += !nulls[i];
     }
 #else
-    expand_load_selection_i32(dst_data, src_data, nulls, count);
+    expand_load_selection_i32(dst_data, src_data, nulls, count, total_valid);
 #endif
 }
 
-void expand_load_simd(int64_t* dst_data, const int64_t* src_data, const uint8_t* nulls, size_t count) {
+void expand_load_simd(int32_t* dst_data, const int32_t* src_data, const uint8_t* nulls, size_t count) {
+    expand_load_simd(dst_data, src_data, nulls, count, SIMD::count_zero(nulls, count));
+}
+
+void expand_load_simd(int64_t* dst_data, const int64_t* src_data, const uint8_t* nulls, size_t count,
+                      size_t total_valid) {
+    if (total_valid == 0) {
+        return;
+    }
+    if (total_valid >= count) {
+        std::memcpy(dst_data, src_data, count * sizeof(int64_t));
+        return;
+    }
 #if defined(__ARM_NEON) && defined(__aarch64__)
     static const uint8_t kNeonCountLUT[4] = {0, 1, 1, 2};
-
-    size_t total_valid = SIMD::count_zero(nulls, count);
 
     size_t cnt = 0;
     size_t i = 0;
@@ -281,13 +304,17 @@ void expand_load_simd(int64_t* dst_data, const int64_t* src_data, const uint8_t*
 
         cnt += kNeonCountLUT[mask2];
     }
-    for (; i < count; ++i) {
+    for (; i < count && cnt < total_valid; ++i) {
         dst_data[i] = starrocks::unaligned_load<int64_t>(src_data + cnt);
         cnt += !nulls[i];
     }
 #else
-    expand_load_selection_i64(dst_data, src_data, nulls, count);
+    expand_load_selection_i64(dst_data, src_data, nulls, count, total_valid);
 #endif
+}
+
+void expand_load_simd(int64_t* dst_data, const int64_t* src_data, const uint8_t* nulls, size_t count) {
+    expand_load_simd(dst_data, src_data, nulls, count, SIMD::count_zero(nulls, count));
 }
 
 } // namespace SIMD::Expand
