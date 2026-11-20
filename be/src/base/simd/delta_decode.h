@@ -42,13 +42,23 @@ static inline bool contains_negative_value(const int32_t* data, size_t size) {
         if (_mm256_movemask_ps(_mm256_castsi256_ps(v))) return true;
     }
 #elif defined(__ARM_NEON) && defined(__aarch64__)
-    int32x4_t v_or0 = vdupq_n_s32(0);
-    int32x4_t v_or1 = vdupq_n_s32(0);
-    for (; i + 8 <= size; i += 8) {
-        v_or0 = vorrq_s32(v_or0, vld1q_s32(data + i));
-        v_or1 = vorrq_s32(v_or1, vld1q_s32(data + i + 4));
+    for (; i + 32 <= size; i += 32) {
+        int32x4_t v0 = vorrq_s32(vld1q_s32(data + i), vld1q_s32(data + i + 4));
+        int32x4_t v1 = vorrq_s32(vld1q_s32(data + i + 8), vld1q_s32(data + i + 12));
+        int32x4_t v2 = vorrq_s32(vld1q_s32(data + i + 16), vld1q_s32(data + i + 20));
+        int32x4_t v3 = vorrq_s32(vld1q_s32(data + i + 24), vld1q_s32(data + i + 28));
+        int32x4_t acc = vorrq_s32(vorrq_s32(v0, v1), vorrq_s32(v2, v3));
+        if (vminvq_s32(acc) < 0) return true;
     }
-    if (vminvq_s32(vorrq_s32(v_or0, v_or1)) < 0) return true;
+    if (i + 8 <= size) {
+        int32x4_t v_or0 = vdupq_n_s32(0);
+        int32x4_t v_or1 = vdupq_n_s32(0);
+        for (; i + 8 <= size; i += 8) {
+            v_or0 = vorrq_s32(v_or0, vld1q_s32(data + i));
+            v_or1 = vorrq_s32(v_or1, vld1q_s32(data + i + 4));
+        }
+        if (vminvq_s32(vorrq_s32(v_or0, v_or1)) < 0) return true;
+    }
 #endif
     for (; i < size; ++i) {
         if (data[i] < 0) return true;
