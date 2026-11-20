@@ -41,9 +41,16 @@
 #include <cstring>
 #include <vector>
 
-#if defined(__ARM_NEON) || defined(__SSE4_2__)
+#if defined(__ARM_NEON) && defined(__aarch64__)
+#include <arm_neon.h>
+#define STARROCKS_HAVE_SIMD_SPLIT
+#elif defined(__ARM_NEON) || defined(__SSE4_2__)
 #include <xsimd/xsimd.hpp>
 #define STARROCKS_HAVE_SIMD_SPLIT
+#endif
+
+#if defined(__AVX2__)
+#include <immintrin.h>
 #endif
 
 namespace starrocks::ByteStreamSplitUtil {
@@ -55,12 +62,10 @@ namespace starrocks::ByteStreamSplitUtil {
 #if defined(__ARM_NEON) || defined(__SSE4_2__)
 template <int kNumStreams>
 void ByteStreamSplitDecodeSimd128(const uint8_t* data, int width, int64_t num_values, int64_t stride, uint8_t* out) {
-    using simd_batch = xsimd::make_sized_batch_t<int8_t, 16>;
-
     assert(width == kNumStreams);
-    static_assert(kNumStreams == 4 || kNumStreams == 8, "Invalid number of streams.");
-    constexpr int kNumStreamsLog2 = (kNumStreams == 8 ? 3 : 2);
-    constexpr int64_t kBlockSize = sizeof(simd_batch) * kNumStreams;
+    static_assert(kNumStreams == 2 || kNumStreams == 4 || kNumStreams == 8, "Invalid number of streams.");
+    constexpr int64_t kSimdBytes = 16;
+    constexpr int64_t kBlockSize = kSimdBytes * kNumStreams;
 
     const int64_t size = num_values * kNumStreams;
     const int64_t num_blocks = size / kBlockSize;
@@ -77,6 +82,40 @@ void ByteStreamSplitDecodeSimd128(const uint8_t* data, int width, int64_t num_va
         }
         memcpy(out + i * kNumStreams, gathered_byte_data, kNumStreams);
     }
+
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    if constexpr (kNumStreams == 2) {
+        for (int64_t i = 0; i < num_blocks; ++i) {
+            uint8x16x2_t v;
+            v.val[0] = vld1q_u8(&data[i * kSimdBytes + 0 * stride]);
+            v.val[1] = vld1q_u8(&data[i * kSimdBytes + 1 * stride]);
+            vst2q_u8(out + i * kBlockSize, v);
+        }
+    } else if constexpr (kNumStreams == 4) {
+        for (int64_t i = 0; i < num_blocks; ++i) {
+            uint8x16x4_t v;
+            for (int j = 0; j < 4; ++j) {
+                v.val[j] = vld1q_u8(&data[i * kSimdBytes + j * stride]);
+            }
+            vst4q_u8(out + i * kBlockSize, v);
+        }
+    } else {
+        for (int64_t i = 0; i < num_blocks; ++i) {
+            uint8x16x4_t lo;
+            uint8x16x4_t hi;
+            for (int j = 0; j < 4; ++j) {
+                uint8x16_t s_lo = vld1q_u8(&data[i * kSimdBytes + j * stride]);
+                uint8x16_t s_hi = vld1q_u8(&data[i * kSimdBytes + (j + 4) * stride]);
+                lo.val[j] = vzip1q_u8(s_lo, s_hi);
+                hi.val[j] = vzip2q_u8(s_lo, s_hi);
+            }
+            vst4q_u8(out + i * kBlockSize, lo);
+            vst4q_u8(out + i * kBlockSize + 64, hi);
+        }
+    }
+#else
+    using simd_batch = xsimd::make_sized_batch_t<int8_t, 16>;
+    constexpr int kNumStreamsLog2 = (kNumStreams == 8 ? 3 : (kNumStreams == 4 ? 2 : 1));
 
     // The blocks get processed hierarchically using the unpack intrinsics.
     // Example with four streams:
@@ -101,26 +140,19 @@ void ByteStreamSplitDecodeSimd128(const uint8_t* data, int width, int64_t num_va
                                    stage[kNumStreamsLog2][j]);
         }
     }
+#endif
 }
 
 template <int kNumStreams>
 void ByteStreamSplitEncodeSimd128(const uint8_t* raw_values, int width, const int64_t num_values,
                                   uint8_t* output_buffer_raw) {
-    using simd_batch = xsimd::make_sized_batch_t<int8_t, 16>;
-
     assert(width == kNumStreams);
-    static_assert(kNumStreams == 4 || kNumStreams == 8, "Invalid number of streams.");
-    constexpr int kBlockSize = sizeof(simd_batch) * kNumStreams;
-
-    simd_batch stage[3][kNumStreams];
-    simd_batch final_result[kNumStreams];
+    static_assert(kNumStreams == 2 || kNumStreams == 4 || kNumStreams == 8, "Invalid number of streams.");
+    constexpr int64_t kSimdBytes = 16;
+    constexpr int64_t kBlockSize = kSimdBytes * kNumStreams;
 
     const int64_t size = num_values * kNumStreams;
     const int64_t num_blocks = size / kBlockSize;
-    int8_t* output_buffer_streams[kNumStreams];
-    for (int i = 0; i < kNumStreams; ++i) {
-        output_buffer_streams[i] = reinterpret_cast<int8_t*>(&output_buffer_raw[num_values * i]);
-    }
 
     // First handle suffix.
     const int64_t num_processed_elements = (num_blocks * kBlockSize) / kNumStreams;
@@ -130,6 +162,42 @@ void ByteStreamSplitEncodeSimd128(const uint8_t* raw_values, int width, const in
             output_buffer_raw[j * num_values + i] = byte_in_value;
         }
     }
+
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    if constexpr (kNumStreams == 2) {
+        for (int64_t block_index = 0; block_index < num_blocks; ++block_index) {
+            uint8x16x2_t v = vld2q_u8(raw_values + block_index * kBlockSize);
+            vst1q_u8(&output_buffer_raw[0 * num_values + block_index * kSimdBytes], v.val[0]);
+            vst1q_u8(&output_buffer_raw[1 * num_values + block_index * kSimdBytes], v.val[1]);
+        }
+    } else if constexpr (kNumStreams == 4) {
+        for (int64_t block_index = 0; block_index < num_blocks; ++block_index) {
+            uint8x16x4_t v = vld4q_u8(raw_values + block_index * kBlockSize);
+            for (int i = 0; i < 4; ++i) {
+                vst1q_u8(&output_buffer_raw[i * num_values + block_index * kSimdBytes], v.val[i]);
+            }
+        }
+    } else {
+        for (int64_t block_index = 0; block_index < num_blocks; ++block_index) {
+            uint8x16x4_t lo = vld4q_u8(raw_values + block_index * kBlockSize);
+            uint8x16x4_t hi = vld4q_u8(raw_values + block_index * kBlockSize + 64);
+            for (int i = 0; i < 4; ++i) {
+                uint8x16_t s_lo = vuzp1q_u8(lo.val[i], hi.val[i]);
+                uint8x16_t s_hi = vuzp2q_u8(lo.val[i], hi.val[i]);
+                vst1q_u8(&output_buffer_raw[i * num_values + block_index * kSimdBytes], s_lo);
+                vst1q_u8(&output_buffer_raw[(i + 4) * num_values + block_index * kSimdBytes], s_hi);
+            }
+        }
+    }
+#else
+    using simd_batch = xsimd::make_sized_batch_t<int8_t, 16>;
+    simd_batch stage[3][kNumStreams];
+    simd_batch final_result[kNumStreams];
+    int8_t* output_buffer_streams[kNumStreams];
+    for (int i = 0; i < kNumStreams; ++i) {
+        output_buffer_streams[i] = reinterpret_cast<int8_t*>(&output_buffer_raw[num_values * i]);
+    }
+
     // The current shuffling algorithm diverges for float and double types but the compiler
     // should be able to remove the branch since only one path is taken for each template
     // instantiation.
@@ -151,72 +219,87 @@ void ByteStreamSplitEncodeSimd128(const uint8_t* raw_values, int width, const in
                                                      (block_index * kNumStreams + i) * sizeof(simd_batch));
         }
 
-        // The shuffling of bytes is performed through the unpack intrinsics.
-        // In my measurements this gives better performance then an implementation
-        // which uses the shuffle intrinsics.
-        for (int stage_lvl = 0; stage_lvl < 2; ++stage_lvl) {
-            for (int i = 0; i < kNumStreams / 2; ++i) {
-                stage[stage_lvl + 1][i * 2] = xsimd::zip_lo(stage[stage_lvl][i * 2], stage[stage_lvl][i * 2 + 1]);
-                stage[stage_lvl + 1][i * 2 + 1] = xsimd::zip_hi(stage[stage_lvl][i * 2], stage[stage_lvl][i * 2 + 1]);
+        if constexpr (kNumStreams == 2) {
+            simd_batch cur0 = stage[0][0];
+            simd_batch cur1 = stage[0][1];
+            for (int step = 0; step < 4; ++step) {
+                simd_batch next0 = xsimd::zip_lo(cur0, cur1);
+                simd_batch next1 = xsimd::zip_hi(cur0, cur1);
+                cur0 = next0;
+                cur1 = next1;
             }
-        }
-        if constexpr (kNumStreams == 8) {
-            // This is the path for 64bits data.
-            simd_batch tmp[8];
-            using int32_batch = xsimd::make_sized_batch_t<int32_t, 4>;
-            // This is a workaround, see: https://github.com/xtensor-stack/xsimd/issues/735
-            auto from_int32_batch = [](int32_batch from) -> simd_batch {
-                simd_batch dest;
-                memcpy(&dest, &from, sizeof(simd_batch));
-                return dest;
-            };
-            auto to_int32_batch = [](simd_batch from) -> int32_batch {
-                int32_batch dest;
-                memcpy(&dest, &from, sizeof(simd_batch));
-                return dest;
-            };
-            for (int i = 0; i < 4; ++i) {
-                tmp[i * 2] =
-                        from_int32_batch(xsimd::zip_lo(to_int32_batch(stage[2][i]), to_int32_batch(stage[2][i + 4])));
-                tmp[i * 2 + 1] =
-                        from_int32_batch(xsimd::zip_hi(to_int32_batch(stage[2][i]), to_int32_batch(stage[2][i + 4])));
-            }
-            for (int i = 0; i < 4; ++i) {
-                final_result[i * 2] =
-                        from_int32_batch(xsimd::zip_lo(to_int32_batch(tmp[i]), to_int32_batch(tmp[i + 4])));
-                final_result[i * 2 + 1] =
-                        from_int32_batch(xsimd::zip_hi(to_int32_batch(tmp[i]), to_int32_batch(tmp[i + 4])));
-            }
+            final_result[0] = cur0;
+            final_result[1] = cur1;
         } else {
-            // This is the path for 32bits data.
-            using int64_batch = xsimd::make_sized_batch_t<int64_t, 2>;
-            // This is a workaround, see: https://github.com/xtensor-stack/xsimd/issues/735
-            auto from_int64_batch = [](int64_batch from) -> simd_batch {
-                simd_batch dest;
-                memcpy(&dest, &from, sizeof(simd_batch));
-                return dest;
-            };
-            auto to_int64_batch = [](simd_batch from) -> int64_batch {
-                int64_batch dest;
-                memcpy(&dest, &from, sizeof(simd_batch));
-                return dest;
-            };
-            simd_batch tmp[4];
-            for (int i = 0; i < 2; ++i) {
-                tmp[i * 2] = xsimd::zip_lo(stage[2][i * 2], stage[2][i * 2 + 1]);
-                tmp[i * 2 + 1] = xsimd::zip_hi(stage[2][i * 2], stage[2][i * 2 + 1]);
+            // The shuffling of bytes is performed through the unpack intrinsics.
+            // In my measurements this gives better performance then an implementation
+            // which uses the shuffle intrinsics.
+            for (int stage_lvl = 0; stage_lvl < 2; ++stage_lvl) {
+                for (int i = 0; i < kNumStreams / 2; ++i) {
+                    stage[stage_lvl + 1][i * 2] = xsimd::zip_lo(stage[stage_lvl][i * 2], stage[stage_lvl][i * 2 + 1]);
+                    stage[stage_lvl + 1][i * 2 + 1] =
+                            xsimd::zip_hi(stage[stage_lvl][i * 2], stage[stage_lvl][i * 2 + 1]);
+                }
             }
-            for (int i = 0; i < 2; ++i) {
-                final_result[i * 2] =
-                        from_int64_batch(xsimd::zip_lo(to_int64_batch(tmp[i]), to_int64_batch(tmp[i + 2])));
-                final_result[i * 2 + 1] =
-                        from_int64_batch(xsimd::zip_hi(to_int64_batch(tmp[i]), to_int64_batch(tmp[i + 2])));
+            if constexpr (kNumStreams == 8) {
+                // This is the path for 64bits data.
+                simd_batch tmp[8];
+                using int32_batch = xsimd::make_sized_batch_t<int32_t, 4>;
+                // This is a workaround, see: https://github.com/xtensor-stack/xsimd/issues/735
+                auto from_int32_batch = [](int32_batch from) -> simd_batch {
+                    simd_batch dest;
+                    memcpy(&dest, &from, sizeof(simd_batch));
+                    return dest;
+                };
+                auto to_int32_batch = [](simd_batch from) -> int32_batch {
+                    int32_batch dest;
+                    memcpy(&dest, &from, sizeof(simd_batch));
+                    return dest;
+                };
+                for (int i = 0; i < 4; ++i) {
+                    tmp[i * 2] = from_int32_batch(
+                            xsimd::zip_lo(to_int32_batch(stage[2][i]), to_int32_batch(stage[2][i + 4])));
+                    tmp[i * 2 + 1] = from_int32_batch(
+                            xsimd::zip_hi(to_int32_batch(stage[2][i]), to_int32_batch(stage[2][i + 4])));
+                }
+                for (int i = 0; i < 4; ++i) {
+                    final_result[i * 2] =
+                            from_int32_batch(xsimd::zip_lo(to_int32_batch(tmp[i]), to_int32_batch(tmp[i + 4])));
+                    final_result[i * 2 + 1] =
+                            from_int32_batch(xsimd::zip_hi(to_int32_batch(tmp[i]), to_int32_batch(tmp[i + 4])));
+                }
+            } else {
+                // This is the path for 32bits data.
+                using int64_batch = xsimd::make_sized_batch_t<int64_t, 2>;
+                // This is a workaround, see: https://github.com/xtensor-stack/xsimd/issues/735
+                auto from_int64_batch = [](int64_batch from) -> simd_batch {
+                    simd_batch dest;
+                    memcpy(&dest, &from, sizeof(simd_batch));
+                    return dest;
+                };
+                auto to_int64_batch = [](simd_batch from) -> int64_batch {
+                    int64_batch dest;
+                    memcpy(&dest, &from, sizeof(simd_batch));
+                    return dest;
+                };
+                simd_batch tmp[4];
+                for (int i = 0; i < 2; ++i) {
+                    tmp[i * 2] = xsimd::zip_lo(stage[2][i * 2], stage[2][i * 2 + 1]);
+                    tmp[i * 2 + 1] = xsimd::zip_hi(stage[2][i * 2], stage[2][i * 2 + 1]);
+                }
+                for (int i = 0; i < 2; ++i) {
+                    final_result[i * 2] =
+                            from_int64_batch(xsimd::zip_lo(to_int64_batch(tmp[i]), to_int64_batch(tmp[i + 2])));
+                    final_result[i * 2 + 1] =
+                            from_int64_batch(xsimd::zip_hi(to_int64_batch(tmp[i]), to_int64_batch(tmp[i + 2])));
+                }
             }
         }
         for (int i = 0; i < kNumStreams; ++i) {
             xsimd::store_unaligned(&output_buffer_streams[i][block_index * sizeof(simd_batch)], final_result[i]);
         }
     }
+#endif
 }
 
 #endif
@@ -225,8 +308,8 @@ void ByteStreamSplitEncodeSimd128(const uint8_t* raw_values, int width, const in
 template <int kNumStreams>
 void ByteStreamSplitDecodeAvx2(const uint8_t* data, int width, int64_t num_values, int64_t stride, uint8_t* out) {
     assert(width == kNumStreams);
-    static_assert(kNumStreams == 4 || kNumStreams == 8, "Invalid number of streams.");
-    constexpr int kNumStreamsLog2 = (kNumStreams == 8 ? 3 : 2);
+    static_assert(kNumStreams == 2 || kNumStreams == 4 || kNumStreams == 8, "Invalid number of streams.");
+    constexpr int kNumStreamsLog2 = (kNumStreams == 8 ? 3 : (kNumStreams == 4 ? 2 : 1));
     constexpr int64_t kBlockSize = sizeof(__m256i) * kNumStreams;
 
     const int64_t size = num_values * kNumStreams;
@@ -282,7 +365,7 @@ void ByteStreamSplitDecodeAvx2(const uint8_t* data, int width, int64_t num_value
                     _mm256_permute2x128_si256(stage[kNumStreamsLog2][4], stage[kNumStreamsLog2][5], 0b00110001);
             final_result[7] =
                     _mm256_permute2x128_si256(stage[kNumStreamsLog2][6], stage[kNumStreamsLog2][7], 0b00110001);
-        } else {
+        } else if constexpr (kNumStreams == 4) {
             // path for float, 128i index:
             //   {0x00, 0x04}, {0x01, 0x05}, {0x02, 0x06}, {0x03, 0x07}
             final_result[0] =
@@ -293,6 +376,13 @@ void ByteStreamSplitDecodeAvx2(const uint8_t* data, int width, int64_t num_value
                     _mm256_permute2x128_si256(stage[kNumStreamsLog2][0], stage[kNumStreamsLog2][1], 0b00110001);
             final_result[3] =
                     _mm256_permute2x128_si256(stage[kNumStreamsLog2][2], stage[kNumStreamsLog2][3], 0b00110001);
+        } else {
+            // path for int16/float16, 128i index:
+            //   {0x00, 0x02}, {0x01, 0x03}
+            final_result[0] =
+                    _mm256_permute2x128_si256(stage[kNumStreamsLog2][0], stage[kNumStreamsLog2][1], 0b00100000);
+            final_result[1] =
+                    _mm256_permute2x128_si256(stage[kNumStreamsLog2][0], stage[kNumStreamsLog2][1], 0b00110001);
         }
 
         for (int j = 0; j < kNumStreams; ++j) {
@@ -306,11 +396,8 @@ template <int kNumStreams>
 void ByteStreamSplitEncodeAvx2(const uint8_t* raw_values, int width, const int64_t num_values,
                                uint8_t* output_buffer_raw) {
     assert(width == kNumStreams);
-    static_assert(kNumStreams == 4 || kNumStreams == 8, "Invalid number of streams.");
+    static_assert(kNumStreams == 2 || kNumStreams == 4 || kNumStreams == 8, "Invalid number of streams.");
     constexpr int kBlockSize = sizeof(__m256i) * kNumStreams;
-
-    if constexpr (kNumStreams == 8) // Back to SSE, currently no path for double.
-        return ByteStreamSplitEncodeSimd128<kNumStreams>(raw_values, width, num_values, output_buffer_raw);
 
     const int64_t size = num_values * kNumStreams;
     if (size < kBlockSize) // Back to SSE for small size
@@ -332,41 +419,102 @@ void ByteStreamSplitEncodeAvx2(const uint8_t* raw_values, int width, const int64
         }
     }
 
-    // Path for float.
-    // 1. Processed hierarchically to 32i block using the unpack intrinsics.
-    // 2. Pack 128i block using _mm256_permutevar8x32_epi32.
-    // 3. Pack final 256i block with _mm256_permute2x128_si256.
-    constexpr int kNumUnpack = 3;
-    __m256i stage[kNumUnpack + 1][kNumStreams];
-    static const __m256i kPermuteMask = _mm256_set_epi32(0x07, 0x03, 0x06, 0x02, 0x05, 0x01, 0x04, 0x00);
-    __m256i permute[kNumStreams];
-    __m256i final_result[kNumStreams];
-
-    for (int64_t block_index = 0; block_index < num_blocks; ++block_index) {
-        for (int i = 0; i < kNumStreams; ++i) {
-            stage[0][i] = _mm256_loadu_si256(&raw_values_simd[block_index * kNumStreams + i]);
+    if constexpr (kNumStreams == 2) {
+        // Path for 16-bit data (32 x 2-byte elements = 64 bytes per iteration):
+        // 1. In-lane byte shuffle separates even (stream 0) and odd (stream 1) bytes into 64-bit halves.
+        // 2. _mm256_permute4x64_epi64 groups the two 64-bit stream-0 halves into low 128 bits and stream-1 halves into high 128 bits.
+        // 3. _mm256_permute2x128_si256 concatenates the 16-byte stream segments across the two input vectors.
+        const __m256i kShuffleMask = _mm256_set_epi8(15, 13, 11, 9, 7, 5, 3, 1, 14, 12, 10, 8, 6, 4, 2, 0, 15, 13, 11,
+                                                     9, 7, 5, 3, 1, 14, 12, 10, 8, 6, 4, 2, 0);
+        for (int64_t block_index = 0; block_index < num_blocks; ++block_index) {
+            __m256i v0 = _mm256_loadu_si256(&raw_values_simd[block_index * 2]);
+            __m256i v1 = _mm256_loadu_si256(&raw_values_simd[block_index * 2 + 1]);
+            __m256i s0 = _mm256_shuffle_epi8(v0, kShuffleMask);
+            __m256i s1 = _mm256_shuffle_epi8(v1, kShuffleMask);
+            __m256i p0 = _mm256_permute4x64_epi64(s0, 0b11011000);
+            __m256i p1 = _mm256_permute4x64_epi64(s1, 0b11011000);
+            __m256i final0 = _mm256_permute2x128_si256(p0, p1, 0b00100000);
+            __m256i final1 = _mm256_permute2x128_si256(p0, p1, 0b00110001);
+            _mm256_storeu_si256(&output_buffer_streams[0][block_index], final0);
+            _mm256_storeu_si256(&output_buffer_streams[1][block_index], final1);
         }
+    } else if constexpr (kNumStreams == 4) {
+        // Path for float.
+        // 1. Processed hierarchically to 32i block using the unpack intrinsics.
+        // 2. Pack 128i block using _mm256_permutevar8x32_epi32.
+        // 3. Pack final 256i block with _mm256_permute2x128_si256.
+        constexpr int kNumUnpack = 3;
+        __m256i stage[kNumUnpack + 1][kNumStreams];
+        static const __m256i kPermuteMask = _mm256_set_epi32(0x07, 0x03, 0x06, 0x02, 0x05, 0x01, 0x04, 0x00);
+        __m256i permute[kNumStreams];
+        __m256i final_result[kNumStreams];
 
-        for (int stage_lvl = 0; stage_lvl < kNumUnpack; ++stage_lvl) {
-            for (int i = 0; i < kNumStreams / 2; ++i) {
-                stage[stage_lvl + 1][i * 2] =
-                        _mm256_unpacklo_epi8(stage[stage_lvl][i * 2], stage[stage_lvl][i * 2 + 1]);
-                stage[stage_lvl + 1][i * 2 + 1] =
-                        _mm256_unpackhi_epi8(stage[stage_lvl][i * 2], stage[stage_lvl][i * 2 + 1]);
+        for (int64_t block_index = 0; block_index < num_blocks; ++block_index) {
+            for (int i = 0; i < kNumStreams; ++i) {
+                stage[0][i] = _mm256_loadu_si256(&raw_values_simd[block_index * kNumStreams + i]);
+            }
+
+            for (int stage_lvl = 0; stage_lvl < kNumUnpack; ++stage_lvl) {
+                for (int i = 0; i < kNumStreams / 2; ++i) {
+                    stage[stage_lvl + 1][i * 2] =
+                            _mm256_unpacklo_epi8(stage[stage_lvl][i * 2], stage[stage_lvl][i * 2 + 1]);
+                    stage[stage_lvl + 1][i * 2 + 1] =
+                            _mm256_unpackhi_epi8(stage[stage_lvl][i * 2], stage[stage_lvl][i * 2 + 1]);
+                }
+            }
+
+            for (int i = 0; i < kNumStreams; ++i) {
+                permute[i] = _mm256_permutevar8x32_epi32(stage[kNumUnpack][i], kPermuteMask);
+            }
+
+            final_result[0] = _mm256_permute2x128_si256(permute[0], permute[2], 0b00100000);
+            final_result[1] = _mm256_permute2x128_si256(permute[0], permute[2], 0b00110001);
+            final_result[2] = _mm256_permute2x128_si256(permute[1], permute[3], 0b00100000);
+            final_result[3] = _mm256_permute2x128_si256(permute[1], permute[3], 0b00110001);
+
+            for (int i = 0; i < kNumStreams; ++i) {
+                _mm256_storeu_si256(&output_buffer_streams[i][block_index], final_result[i]);
             }
         }
+    } else {
+        // Path for double / int64 (32 x 8-byte elements = 256 bytes per iteration across 8 streams):
+        // 1. Load 8 x 256-bit vectors and use _mm256_permute2x128_si256 so low 128-bit lanes hold
+        //    elements 0..15 and high 128-bit lanes hold elements 16..31.
+        // 2. Two stages of in-lane _mm256_unpacklo_epi8 / _mm256_unpackhi_epi8 group 4-byte stream runs.
+        // 3. Two stages of in-lane _mm256_unpacklo_epi32 / _mm256_unpackhi_epi32 assemble all 32 bytes
+        //    of each stream across the low and high 128-bit lanes.
+        __m256i stage[3][8];
+        __m256i tmp[8];
+        __m256i final_result[8];
 
-        for (int i = 0; i < kNumStreams; ++i) {
-            permute[i] = _mm256_permutevar8x32_epi32(stage[kNumUnpack][i], kPermuteMask);
-        }
-
-        final_result[0] = _mm256_permute2x128_si256(permute[0], permute[2], 0b00100000);
-        final_result[1] = _mm256_permute2x128_si256(permute[0], permute[2], 0b00110001);
-        final_result[2] = _mm256_permute2x128_si256(permute[1], permute[3], 0b00100000);
-        final_result[3] = _mm256_permute2x128_si256(permute[1], permute[3], 0b00110001);
-
-        for (int i = 0; i < kNumStreams; ++i) {
-            _mm256_storeu_si256(&output_buffer_streams[i][block_index], final_result[i]);
+        for (int64_t block_index = 0; block_index < num_blocks; ++block_index) {
+            __m256i loaded[8];
+            for (int i = 0; i < 8; ++i) {
+                loaded[i] = _mm256_loadu_si256(&raw_values_simd[block_index * 8 + i]);
+            }
+            for (int i = 0; i < 4; ++i) {
+                stage[0][i * 2] = _mm256_permute2x128_si256(loaded[i], loaded[i + 4], 0b00100000);
+                stage[0][i * 2 + 1] = _mm256_permute2x128_si256(loaded[i], loaded[i + 4], 0b00110001);
+            }
+            for (int stage_lvl = 0; stage_lvl < 2; ++stage_lvl) {
+                for (int i = 0; i < 4; ++i) {
+                    stage[stage_lvl + 1][i * 2] =
+                            _mm256_unpacklo_epi8(stage[stage_lvl][i * 2], stage[stage_lvl][i * 2 + 1]);
+                    stage[stage_lvl + 1][i * 2 + 1] =
+                            _mm256_unpackhi_epi8(stage[stage_lvl][i * 2], stage[stage_lvl][i * 2 + 1]);
+                }
+            }
+            for (int i = 0; i < 4; ++i) {
+                tmp[i * 2] = _mm256_unpacklo_epi32(stage[2][i], stage[2][i + 4]);
+                tmp[i * 2 + 1] = _mm256_unpackhi_epi32(stage[2][i], stage[2][i + 4]);
+            }
+            for (int i = 0; i < 4; ++i) {
+                final_result[i * 2] = _mm256_unpacklo_epi32(tmp[i], tmp[i + 4]);
+                final_result[i * 2 + 1] = _mm256_unpackhi_epi32(tmp[i], tmp[i + 4]);
+            }
+            for (int i = 0; i < 8; ++i) {
+                _mm256_storeu_si256(&output_buffer_streams[i][block_index], final_result[i]);
+            }
         }
     }
 }
@@ -536,7 +684,7 @@ inline void ByteStreamSplitEncode(const uint8_t* raw_values, int width, const in
         memcpy(out, raw_values, num_values);
         return;
     case 2:
-        return ByteStreamSplitEncodeScalar<2>(raw_values, width, num_values, out);
+        return ByteStreamSplitEncodePerhapsSimd<2>(raw_values, width, num_values, out);
     case 4:
         return ByteStreamSplitEncodePerhapsSimd<4>(raw_values, width, num_values, out);
     case 8:
@@ -559,7 +707,7 @@ inline void ByteStreamSplitDecode(const uint8_t* data, int width, int64_t num_va
         memcpy(out, data, num_values);
         return;
     case 2:
-        return ByteStreamSplitDecodeScalar<2>(data, width, num_values, stride, out);
+        return ByteStreamSplitDecodePerhapsSimd<2>(data, width, num_values, stride, out);
     case 4:
         return ByteStreamSplitDecodePerhapsSimd<4>(data, width, num_values, stride, out);
     case 8:
