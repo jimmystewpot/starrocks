@@ -50,6 +50,7 @@ import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.PhysicalPartition;
 import com.starrocks.catalog.Replica;
+import com.starrocks.catalog.Table;
 import com.starrocks.clone.ColocateMatchResult.Status;
 import com.starrocks.clone.TabletSchedCtx.Priority;
 import com.starrocks.common.Config;
@@ -85,6 +86,7 @@ public class ColocateTableBalancer extends LeaderDaemon {
     private static final Logger LOG = LogManager.getLogger(ColocateTableBalancer.class);
 
     private static final long CHECK_INTERVAL_MS = 20 * 1000L; // 20 second
+    private static final long MIN_LOCK_HOLD_TIME_MS = 100L;
 
     private ColocateTableBalancer(long intervalMs) {
         super("colocate-group-clone-checker", intervalMs);
@@ -379,7 +381,7 @@ public class ColocateTableBalancer extends LeaderDaemon {
                     globalStateMgr.getEditLog().logColocateBackendsPerBucketSeq(info, wal -> {
                         colocateIndex.addBackendsPerBucketSeq(gid, balancedBackendsPerBucketSeq);
                     });
-                    colocateIndex.markGroupUnstable(groupId, true);
+                    colocateIndex.markGroupUnstable(gid, true);
                     LOG.info("balance colocate per group , group id {}, " +
                                     "now backends per bucket sequence is: {}, " +
                                     "bucket sequence before balance: {}", gid, balancedBackendsPerBucketSeq,
@@ -426,17 +428,17 @@ public class ColocateTableBalancer extends LeaderDaemon {
                 continue;
             }
 
+            int numOfTabletsPerBucket = colocateIndex.getNumOfTabletsPerBucket(groupId);
+            // if this group has groups colocated with in other databases, we should add them up
+            for (GroupId otherGroupId : coGroupsInOtherDb) {
+                numOfTabletsPerBucket += colocateIndex.getNumOfTabletsPerBucket(otherGroupId);
+            }
             for (int i = 0; i < backendsPerBucketSeq.size(); i++) {
                 for (long backendId : backendsPerBucketSeq.get(i)) {
                     distInfoPerBackendMap.putIfAbsent(backendId,
                             AllGroupsReplicaDistInfoPerBe.createNewDistInfoObj(backendId));
                     AllGroupsReplicaDistInfoPerBe distInfoPerBe = distInfoPerBackendMap.get(backendId);
                     distInfoPerBe.totalNumOfBucketsAssigned++;
-                    int numOfTabletsPerBucket = colocateIndex.getNumOfTabletsPerBucket(groupId);
-                    // if this group has groups colocated with in other databases, we should add them up
-                    for (GroupId otherGroupId : coGroupsInOtherDb) {
-                        numOfTabletsPerBucket += colocateIndex.getNumOfTabletsPerBucket(otherGroupId);
-                    }
                     distInfoPerBe.totalNumOfReplicasAssigned += numOfTabletsPerBucket;
                     distInfoPerBe.replicaNumToGroupsMap
                             .computeIfAbsent(numOfTabletsPerBucket, k -> Sets.newHashSet())
@@ -731,6 +733,55 @@ public class ColocateTableBalancer extends LeaderDaemon {
                 tablet.getId(), tablet.getReplicaInfos(), bucketSeq);
     }
 
+    private enum RevalidateOutcome {
+        OK,
+        ABORT_GROUP,
+        SKIP_TABLE,
+        SKIP_PARTITION
+    }
+
+    private static final class GroupMatchContext {
+        Database db;
+        List<Set<Long>> backendBucketsSeq;
+        OlapTable olapTable;
+        Partition partition;
+    }
+
+    private RevalidateOutcome revalidateGroupAndTable(GroupId groupId, long tableId,
+                                                      GlobalStateMgr globalStateMgr,
+                                                      ColocateTableIndex colocateIndex,
+                                                      GroupMatchContext ctx) {
+        ctx.db = globalStateMgr.getLocalMetastore().getDbIncludeRecycleBin(groupId.dbId);
+        if (ctx.db == null) {
+            return RevalidateOutcome.ABORT_GROUP;
+        }
+        ctx.backendBucketsSeq = colocateIndex.getBackendsPerBucketSeqSet(groupId);
+        if (ctx.backendBucketsSeq.isEmpty()) {
+            return RevalidateOutcome.ABORT_GROUP;
+        }
+        Table table = globalStateMgr.getLocalMetastore().getTableIncludeRecycleBin(ctx.db, tableId);
+        if (!(table instanceof OlapTable) || !colocateIndex.isColocateGroupTable(groupId, tableId)) {
+            return RevalidateOutcome.SKIP_TABLE;
+        }
+        ctx.olapTable = (OlapTable) table;
+        return RevalidateOutcome.OK;
+    }
+
+    private RevalidateOutcome revalidateGroupTableAndPartition(GroupId groupId, long tableId, long partitionId,
+                                                               GlobalStateMgr globalStateMgr,
+                                                               ColocateTableIndex colocateIndex,
+                                                               GroupMatchContext ctx) {
+        RevalidateOutcome outcome = revalidateGroupAndTable(groupId, tableId, globalStateMgr, colocateIndex, ctx);
+        if (outcome != RevalidateOutcome.OK) {
+            return outcome;
+        }
+        ctx.partition = globalStateMgr.getLocalMetastore().getPartitionIncludeRecycleBin(ctx.olapTable, partitionId);
+        if (ctx.partition == null) {
+            return RevalidateOutcome.SKIP_PARTITION;
+        }
+        return RevalidateOutcome.OK;
+    }
+
     private ColocateMatchResult doMatchOneGroup(GroupId groupId,
                                  boolean isUrgent,
                                  GlobalStateMgr globalStateMgr,
@@ -738,80 +789,108 @@ public class ColocateTableBalancer extends LeaderDaemon {
                                  TabletScheduler tabletScheduler) {
         long checkStartTime = System.currentTimeMillis();
         List<Long> tableIds = colocateIndex.getAllTableIds(groupId);
-        Database db = globalStateMgr.getLocalMetastore().getDbIncludeRecycleBin(groupId.dbId);
-        if (db == null) {
+        GroupMatchContext ctx = new GroupMatchContext();
+        ctx.db = globalStateMgr.getLocalMetastore().getDbIncludeRecycleBin(groupId.dbId);
+        if (ctx.db == null) {
             return new ColocateMatchResult(0, Status.UNKNOWN);
         }
 
-        List<Set<Long>> backendBucketsSeq = colocateIndex.getBackendsPerBucketSeqSet(groupId);
-        if (backendBucketsSeq.isEmpty()) {
+        ctx.backendBucketsSeq = colocateIndex.getBackendsPerBucketSeqSet(groupId);
+        if (ctx.backendBucketsSeq.isEmpty()) {
             return new ColocateMatchResult(0, Status.UNKNOWN);
         }
 
         boolean isGroupStable = true;
+        boolean isAborted = false;
         // set the config to a local variable to avoid config params changed.
         int partitionBatchNum = Config.tablet_checker_partition_batch_num;
+        long maxLockHoldTimeMs = Math.max(Config.tablet_checker_lock_time_per_cycle_ms, MIN_LOCK_HOLD_TIME_MS);
         boolean disableColocateBalance = Config.tablet_sched_disable_colocate_balance;
         SystemInfoService infoService = globalStateMgr.getNodeMgr().getClusterInfo();
         int partitionChecked = 0;
-        YieldableLock lock = YieldableLock.lockDatabase(db.getId(), LockType.READ);
-        try {
-            TABLE:
-            for (Long tableId : tableIds) {
-                OlapTable olapTable = (OlapTable) globalStateMgr.getLocalMetastore().getTableIncludeRecycleBin(db, tableId);
-                if (olapTable == null || !colocateIndex.isColocateTable(olapTable.getId())) {
-                    continue;
+        long totalHeldTimeNs = 0L;
+        TABLE:
+        for (Long tableId : tableIds) {
+            if (isUrgent && !globalStateMgr.getTabletChecker().isUrgentTable(ctx.db.getId(), tableId)) {
+                continue;
+            }
+
+            YieldableLock lock = YieldableLock.lockTableWithIntensiveDbLock(ctx.db.getId(), tableId, LockType.READ);
+            try {
+                RevalidateOutcome tableOutcome =
+                        revalidateGroupAndTable(groupId, tableId, globalStateMgr, colocateIndex, ctx);
+                if (tableOutcome == RevalidateOutcome.ABORT_GROUP) {
+                    isAborted = true;
+                    break TABLE;
+                } else if (tableOutcome != RevalidateOutcome.OK) {
+                    continue TABLE;
+                }
+                if (isUrgent && !globalStateMgr.getTabletChecker().isUrgentTable(ctx.db.getId(), tableId)) {
+                    continue TABLE;
                 }
 
-                if ((isUrgent && !globalStateMgr.getTabletChecker().isUrgentTable(db.getId(), tableId))) {
-                    continue;
-                }
-
-                for (Partition partition : globalStateMgr.getLocalMetastore().getPartitionsIncludeRecycleBin(olapTable)) {
-                    partitionChecked++;
+                List<Long> partitionIds = globalStateMgr.getLocalMetastore()
+                        .getPartitionsIncludeRecycleBin(ctx.olapTable)
+                        .stream().map(Partition::getId).collect(Collectors.toList());
+                PARTITION:
+                for (Long partitionId : partitionIds) {
+                    ctx.partition = globalStateMgr.getLocalMetastore()
+                            .getPartitionIncludeRecycleBin(ctx.olapTable, partitionId);
+                    if (ctx.partition == null) {
+                        continue PARTITION;
+                    }
 
                     boolean isPartitionUrgent =
-                            globalStateMgr.getTabletChecker().isPartitionUrgent(db.getId(), tableId, partition.getId());
+                            globalStateMgr.getTabletChecker().isPartitionUrgent(ctx.db.getId(), tableId, partitionId);
                     boolean isUrgentPartitionHealthy = true;
                     if ((isUrgent && !isPartitionUrgent) || (!isUrgent && isPartitionUrgent)) {
                         continue;
                     }
 
-                    if (partitionChecked % partitionBatchNum == 0) {
+                    partitionChecked++;
+                    if (partitionChecked % partitionBatchNum == 0
+                            || lock.getCurrentHoldTimeMs() >= maxLockHoldTimeMs) {
                         // release lock, so that lock can be acquired by other threads.
                         lock.refresh();
-                        if (globalStateMgr.getLocalMetastore().getDbIncludeRecycleBin(groupId.dbId) == null) {
-                            return new ColocateMatchResult(lock.getHeldTimeNs(), Status.UNKNOWN);
-                        }
-                        if (globalStateMgr.getLocalMetastore().getTableIncludeRecycleBin(db, olapTable.getId()) == null) {
+                        RevalidateOutcome refreshOutcome = revalidateGroupTableAndPartition(
+                                groupId, tableId, partitionId, globalStateMgr, colocateIndex, ctx);
+                        if (refreshOutcome == RevalidateOutcome.ABORT_GROUP) {
+                            isAborted = true;
+                            break TABLE;
+                        } else if (refreshOutcome == RevalidateOutcome.SKIP_TABLE) {
                             continue TABLE;
-                        }
-                        if (globalStateMgr.getLocalMetastore().getPartitionIncludeRecycleBin(olapTable, partition.getId()) ==
-                                null) {
-                            continue;
+                        } else if (refreshOutcome == RevalidateOutcome.SKIP_PARTITION) {
+                            continue PARTITION;
                         }
                     }
                     short replicationNum =
-                            globalStateMgr.getLocalMetastore().getReplicationNumIncludeRecycleBin(olapTable.getPartitionInfo(),
-                                    partition.getId());
+                            globalStateMgr.getLocalMetastore().getReplicationNumIncludeRecycleBin(
+                                    ctx.olapTable.getPartitionInfo(), ctx.partition.getId());
                     if (replicationNum == (short) -1) {
                         continue;
                     }
 
-                    PhysicalPartition physicalPartition = partition.getDefaultPhysicalPartition();
+                    PhysicalPartition physicalPartition = ctx.partition.getDefaultPhysicalPartition();
                     long visibleVersion = physicalPartition.getVisibleVersion();
                     // Here we only get VISIBLE indexes. All other indexes are not queryable.
                     // So it does not matter if tablets of other indexes are not matched.
                     for (MaterializedIndex index : physicalPartition.getLatestMaterializedIndices(IndexExtState.VISIBLE)) {
-                        Preconditions.checkState(backendBucketsSeq.size() == index.getTablets().size(),
-                                backendBucketsSeq.size() + " v.s. " + index.getTablets().size());
+                        if (physicalPartition.getIndex(index.getId()) != index
+                                || ctx.backendBucketsSeq.size() != index.getTablets().size()) {
+                            isAborted = true;
+                            break TABLE;
+                        }
 
                         BalanceStat balanceStat = BalanceStat.BALANCED_STAT;
 
                         int idx = 0;
                         for (Long tabletId : index.getTabletIdsInOrder()) {
                             LocalTablet tablet = (LocalTablet) index.getTablet(tabletId);
-                            Set<Long> bucketSeq = backendBucketsSeq.get(idx);
+                            if (tablet == null) {
+                                idx++;
+                                continue;
+                            }
+                            Set<Long> bucketSeq = ctx.backendBucketsSeq.get(idx);
 
                             // check tablet colocate status
                             TabletHealthStatus st = TabletChecker.getColocateTabletHealthStatus(tablet, visibleVersion,
@@ -827,7 +906,8 @@ public class ColocateTableBalancer extends LeaderDaemon {
                             }
                             if (st == TabletHealthStatus.COLOCATE_MISMATCH && balanceStat.isBalanced()) {
                                 balanceStat =
-                                        BalanceStat.createColocationGroupBalanceStat(tabletId, tablet.getBackendIds(), bucketSeq);
+                                        BalanceStat.createColocationGroupBalanceStat(
+                                                tabletId, tablet.getBackendIds(), bucketSeq);
                             }
 
                             // Tablet has already been scheduled, no need to schedule again
@@ -850,7 +930,7 @@ public class ColocateTableBalancer extends LeaderDaemon {
                                                 tablet.getId(), st);
                                         TabletSchedCtx tabletCtx = new TabletSchedCtx(
                                                 TabletSchedCtx.Type.REPAIR,
-                                                db.getId(), tableId, physicalPartition.getId(),
+                                                ctx.db.getId(), tableId, physicalPartition.getId(),
                                                 index.getId(), tablet.getId(),
                                                 System.currentTimeMillis());
                                         // the tablet status will be checked and set again when being scheduled
@@ -885,6 +965,36 @@ public class ColocateTableBalancer extends LeaderDaemon {
                                                             Lists.newArrayList(),
                                                     bucketSeq);
                                         }
+
+                                        if (Thread.currentThread().isInterrupted()) {
+                                            isAborted = true;
+                                            break TABLE;
+                                        }
+                                        if (result.second > 0) {
+                                            RevalidateOutcome yieldOutcome = revalidateGroupTableAndPartition(
+                                                    groupId, tableId, partitionId, globalStateMgr, colocateIndex, ctx);
+                                            if (yieldOutcome == RevalidateOutcome.ABORT_GROUP) {
+                                                isAborted = true;
+                                                break TABLE;
+                                            } else if (yieldOutcome == RevalidateOutcome.SKIP_TABLE) {
+                                                continue TABLE;
+                                            } else if (yieldOutcome == RevalidateOutcome.SKIP_PARTITION) {
+                                                continue PARTITION;
+                                            }
+                                            replicationNum = globalStateMgr.getLocalMetastore()
+                                                    .getReplicationNumIncludeRecycleBin(
+                                                            ctx.olapTable.getPartitionInfo(), partitionId);
+                                            if (replicationNum == (short) -1) {
+                                                continue PARTITION;
+                                            }
+                                            physicalPartition = ctx.partition.getDefaultPhysicalPartition();
+                                            visibleVersion = physicalPartition.getVisibleVersion();
+                                            if (physicalPartition.getIndex(index.getId()) != index
+                                                    || ctx.backendBucketsSeq.size() != index.getTablets().size()) {
+                                                isAborted = true;
+                                                break TABLE;
+                                            }
+                                        }
                                     }
                                 } else {
                                     tablet.setLastStatusCheckTime(checkStartTime);
@@ -905,19 +1015,23 @@ public class ColocateTableBalancer extends LeaderDaemon {
 
                     if (isUrgentPartitionHealthy && isPartitionUrgent) {
                         globalStateMgr.getTabletChecker().removeFromUrgentTable(
-                                new TabletChecker.RepairTabletInfo(db.getId(), tableId,
-                                        Lists.newArrayList(partition.getId())));
+                                new TabletChecker.RepairTabletInfo(ctx.db.getId(), tableId,
+                                        Lists.newArrayList(ctx.partition.getId())));
                     }
                 } // end for partitions
-            } // end for tables
+            } finally {
+                lock.close();
+                totalHeldTimeNs += lock.getHeldTimeNs();
+            }
+        } // end for tables
 
-        } finally {
-            lock.close();
+        if (isAborted) {
+            return new ColocateMatchResult(totalHeldTimeNs, Status.UNKNOWN);
         }
 
         // The scope tracks actually-held time, so the blocking-add wait windows are
         // already excluded.
-        return new ColocateMatchResult(lock.getHeldTimeNs(),
+        return new ColocateMatchResult(totalHeldTimeNs,
                 isGroupStable ? Status.STABLE : Status.UNSTABLE);
     }
 
@@ -950,16 +1064,25 @@ public class ColocateTableBalancer extends LeaderDaemon {
         // check each group
         Set<GroupId> groupIds = colocateIndex.getAllGroupIds();
         for (GroupId groupId : groupIds) {
-            ColocateMatchResult urgentResult = matchOneGroupUrgent(groupId, globalStateMgr, colocateIndex, tabletScheduler);
-            lockTotalTime += urgentResult.lockTotalTime;
+            try {
+                ColocateMatchResult urgentResult =
+                        matchOneGroupUrgent(groupId, globalStateMgr, colocateIndex, tabletScheduler);
+                lockTotalTime += urgentResult.lockTotalTime;
 
-            ColocateMatchResult nonUrgentResult = matchOneGroupNonUrgent(groupId, globalStateMgr, colocateIndex, tabletScheduler);
-            lockTotalTime += nonUrgentResult.lockTotalTime;
+                ColocateMatchResult nonUrgentResult =
+                        matchOneGroupNonUrgent(groupId, globalStateMgr, colocateIndex, tabletScheduler);
+                lockTotalTime += nonUrgentResult.lockTotalTime;
 
-            if (urgentResult.status == Status.UNSTABLE || nonUrgentResult.status == Status.UNSTABLE) {
-                colocateIndex.markGroupUnstable(groupId, true);
-            } else if (urgentResult.status == Status.STABLE && nonUrgentResult.status == Status.STABLE) {
-                colocateIndex.markGroupStable(groupId, true);
+                if (urgentResult.status == Status.UNSTABLE || nonUrgentResult.status == Status.UNSTABLE) {
+                    colocateIndex.markGroupUnstable(groupId, true);
+                } else if (urgentResult.status == Status.STABLE && nonUrgentResult.status == Status.STABLE) {
+                    colocateIndex.markGroupStable(groupId, true);
+                }
+            } catch (RuntimeException e) {
+                LOG.warn("Failed to match colocate group {}, skip it this round", groupId, e);
+                if (Thread.currentThread().isInterrupted()) {
+                    break;
+                }
             }
         } // end for groups
 

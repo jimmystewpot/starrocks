@@ -1118,4 +1118,128 @@ public class ColocateTableIndexTest {
         ColocateTableIndex.GroupId unknown = new ColocateTableIndex.GroupId(1L, 2L);
         Assertions.assertFalse(colocateTableIndex.isRangeColocateGroup(unknown));
     }
+
+    @Test
+    public void testGetNumOfTabletsPerBucketUnderIntensiveTableReadLockAndPeerWriteLock() throws Exception {
+        ConnectContext connectContext = UtFrameUtils.createDefaultCtx();
+        CreateDbStmt createDbStmt = (CreateDbStmt) UtFrameUtils.parseStmtWithNewParser(
+                "create database db_lock_hierarchy;", connectContext);
+        GlobalStateMgr.getCurrentState().getLocalMetastore().createDb(createDbStmt.getFullDbName());
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("db_lock_hierarchy");
+
+        String sql1 = "CREATE TABLE db_lock_hierarchy.t1 (k1 int, v1 int) DUPLICATE KEY(k1)\n" +
+                "PARTITION BY RANGE(k1) (PARTITION p1 VALUES LESS THAN ('10'), PARTITION p2 VALUES LESS THAN ('20'))\n" +
+                "DISTRIBUTED BY HASH(k1) BUCKETS 2\n" +
+                "PROPERTIES(\"colocate_with\"=\"grp_hierarchy\", \"replication_num\" = \"1\");";
+        StarRocksAssert.utCreateTableWithRetry(
+                (CreateTableStmt) UtFrameUtils.parseStmtWithNewParser(sql1, connectContext));
+
+        String sql2 = "CREATE TABLE db_lock_hierarchy.t2 (k1 int, v1 int) DUPLICATE KEY(k1)\n" +
+                "DISTRIBUTED BY HASH(k1) BUCKETS 2\n" +
+                "PROPERTIES(\"colocate_with\"=\"grp_hierarchy\", \"replication_num\" = \"1\");";
+        StarRocksAssert.utCreateTableWithRetry(
+                (CreateTableStmt) UtFrameUtils.parseStmtWithNewParser(sql2, connectContext));
+
+        OlapTable t1 = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore()
+                .getTable(db.getFullName(), "t1");
+        OlapTable t2 = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore()
+                .getTable(db.getFullName(), "t2");
+        ColocateTableIndex colocateIndex = GlobalStateMgr.getCurrentState().getColocateTableIndex();
+        ColocateTableIndex.GroupId groupId = colocateIndex.getGroup(t1.getId());
+
+        // Hold an exclusive WRITE lock on peer table t2 from a background thread to prove
+        // getNumOfTabletsPerBucket does not block on peer table WRITE locks or violate DB IS hierarchy.
+        java.util.concurrent.CountDownLatch peerWriteLocked = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch releasePeerWrite = new java.util.concurrent.CountDownLatch(1);
+        Thread peerWriter = new Thread(() -> {
+            com.starrocks.common.util.concurrent.lock.Locker peerLocker =
+                    new com.starrocks.common.util.concurrent.lock.Locker();
+            peerLocker.lockTableWithIntensiveDbLock(
+                    db.getId(), t2.getId(), com.starrocks.common.util.concurrent.lock.LockType.WRITE);
+            try {
+                peerWriteLocked.countDown();
+                releasePeerWrite.await(10, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                peerLocker.unLockTableWithIntensiveDbLock(
+                        db.getId(), t2.getId(), com.starrocks.common.util.concurrent.lock.LockType.WRITE);
+            }
+        });
+        peerWriter.start();
+        Assertions.assertTrue(peerWriteLocked.await(5, java.util.concurrent.TimeUnit.SECONDS));
+
+        // Simulate TabletScheduler.scheduleTablet holding IS on DB + READ on t1
+        com.starrocks.common.util.concurrent.lock.Locker locker =
+                new com.starrocks.common.util.concurrent.lock.Locker();
+        locker.lockTableWithIntensiveDbLock(
+                db.getId(), t1.getId(), com.starrocks.common.util.concurrent.lock.LockType.READ);
+        try {
+            int tabletsPerBucket = colocateIndex.getNumOfTabletsPerBucket(groupId);
+            Assertions.assertEquals(3, tabletsPerBucket);
+        } finally {
+            locker.unLockTableWithIntensiveDbLock(
+                    db.getId(), t1.getId(), com.starrocks.common.util.concurrent.lock.LockType.READ);
+            releasePeerWrite.countDown();
+            peerWriter.join(5000);
+        }
+
+        // Also verify a dropped table in group2Tables is skipped cleanly
+        DropTableStmt dropTableStmt = (DropTableStmt) UtFrameUtils.parseStmtWithNewParser(
+                "DROP TABLE db_lock_hierarchy.t2;", connectContext);
+        GlobalStateMgr.getCurrentState().getLocalMetastore().dropTable(dropTableStmt);
+        Assertions.assertEquals(2, colocateIndex.getNumOfTabletsPerBucket(groupId));
+
+        com.starrocks.common.lock.LockTestUtils.assertNoLockInvariantViolations();
+        colocateIndex.removeTable(t1.getId(), t1, false);
+        colocateIndex.removeTable(t2.getId(), t2, false);
+    }
+
+    @Test
+    public void testIsColocateGroupTableAtomicCheck() {
+        ColocateTableIndex colocateIndex = new ColocateTableIndex();
+        ColocateTableIndex.GroupId gid1 = new ColocateTableIndex.GroupId(100L, 200L);
+        ColocateTableIndex.GroupId gid2 = new ColocateTableIndex.GroupId(100L, 201L);
+
+        Assertions.assertFalse(colocateIndex.isColocateGroupTable(gid1, 999L));
+        Assertions.assertFalse(colocateIndex.isColocateGroupTable(null, 999L));
+
+        Map<Long, ColocateTableIndex.GroupId> table2Group = Deencapsulation.getField(colocateIndex, "table2Group");
+        table2Group.put(300L, gid1);
+        Assertions.assertTrue(colocateIndex.isColocateGroupTable(gid1, 300L));
+        Assertions.assertFalse(colocateIndex.isColocateGroupTable(gid2, 300L));
+    }
+
+    @Test
+    public void testGetNumOfTabletsPerBucketSkipsNonOlapTableEntry() throws Exception {
+        ConnectContext connectContext = UtFrameUtils.createDefaultCtx();
+        CreateDbStmt createDbStmt = (CreateDbStmt) UtFrameUtils.parseStmtWithNewParser(
+                "create database db_non_olap;", connectContext);
+        GlobalStateMgr.getCurrentState().getLocalMetastore().createDb(createDbStmt.getFullDbName());
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("db_non_olap");
+
+        String sql = "CREATE TABLE db_non_olap.t1 (k1 int, v1 int) DUPLICATE KEY(k1)\n" +
+                "DISTRIBUTED BY HASH(k1) BUCKETS 2\n" +
+                "PROPERTIES(\"colocate_with\"=\"grp_non_olap\", \"replication_num\" = \"1\");";
+        StarRocksAssert.utCreateTableWithRetry(
+                (CreateTableStmt) UtFrameUtils.parseStmtWithNewParser(sql, connectContext));
+
+        OlapTable t1 = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore()
+                .getTable(db.getFullName(), "t1");
+        ColocateTableIndex colocateIndex = GlobalStateMgr.getCurrentState().getColocateTableIndex();
+        ColocateTableIndex.GroupId groupId = colocateIndex.getGroup(t1.getId());
+
+        Table nonOlapTable = new Table(987654321L, "v_dummy", Table.TableType.VIEW, new ArrayList<>());
+        db.registerTableUnlocked(nonOlapTable);
+        com.google.common.collect.Multimap<ColocateTableIndex.GroupId, Long> group2Tables =
+                Deencapsulation.getField(colocateIndex, "group2Tables");
+        group2Tables.put(groupId, nonOlapTable.getId());
+        try {
+            Assertions.assertEquals(1, colocateIndex.getNumOfTabletsPerBucket(groupId));
+        } finally {
+            group2Tables.remove(groupId, nonOlapTable.getId());
+            db.dropTable(nonOlapTable.getName());
+            colocateIndex.removeTable(t1.getId(), t1, false);
+        }
+    }
 }
