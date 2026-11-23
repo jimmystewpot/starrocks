@@ -129,6 +129,8 @@ void test_expand_load() {
 }
 
 PARALLEL_TEST(ExpandTest, All) {
+    test_expand_load<int8_t>();
+    test_expand_load<int16_t>();
     test_expand_load<int32_t>();
     test_expand_load<int64_t>();
     test_expand_load<float>();
@@ -169,6 +171,8 @@ void test_expand_load_misaligned() {
 }
 
 PARALLEL_TEST(ExpandTest, Misaligned) {
+    test_expand_load_misaligned<int8_t>();
+    test_expand_load_misaligned<int16_t>();
     test_expand_load_misaligned<int32_t>();
     test_expand_load_misaligned<int64_t>();
     test_expand_load_misaligned<float>();
