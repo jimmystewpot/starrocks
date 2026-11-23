@@ -20,7 +20,7 @@ select length(ddsketch_empty()), length(ddsketch_empty(0.02)), ddsketch_count(dd
        ddsketch_avg(ddsketch_empty()), ddsketch_min(ddsketch_empty()), ddsketch_max(ddsketch_empty());
 
 -- Exact formula verification on small weighted dataset: (10.0, 25), (20.0, 25), (50.0, 45), (100.0, 5)
--- gamma = 1.01/0.99, k(10)=116 (v=10.0747), k(20)=150 (v=19.8867), k(50)=196 (v=49.9030), k(100)=231 (v=100.4946)
+-- gamma = 1.01/0.99, k(10)=115 (v=10.0747), k(20)=149 (v=19.8867), k(50)=195 (v=49.9030), k(100)=230 (v=100.4946)
 with small_sk as (
   select ddsketch_accumulate_weighted(v, w) as s
   from (

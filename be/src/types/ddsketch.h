@@ -86,18 +86,24 @@ public:
     static constexpr double kMinRelativeAccuracy = 0.001;
     static constexpr double kMaxRelativeAccuracy = 0.5;
     static constexpr uint32_t kDefaultMaxBins = 2048;
+    static constexpr uint32_t kMaxScaledBins = 32768;
     static constexpr uint64_t kMaxExactDoubleCount = 9007199254740992ULL; // 2^53
     static constexpr uint32_t kMaxWireBins = 65536;
     static constexpr int32_t kMinBinIndex = -1073741823;
     static constexpr int32_t kMaxBinIndex = 1073741823;
 
+    static constexpr uint32_t kInterpolationNone = 0;
+    static constexpr uint32_t kInterpolationCubic = 3;
+
+    static uint32_t default_max_bins_for_accuracy(double relative_accuracy);
+
     // Default constructor leaves _mapping_initialized = false (adopts first merged initialized sketch,
     // or initializes with kDefaultRelativeAccuracy = 0.01 on first add() or serialize()).
     DDSketch();
-    explicit DDSketch(double relative_accuracy, uint32_t max_bins = kDefaultMaxBins);
+    explicit DDSketch(double relative_accuracy, uint32_t max_bins = 0);
 
     static Status validate_relative_accuracy(double relative_accuracy);
-    void reinit(double relative_accuracy, uint32_t max_bins = kDefaultMaxBins);
+    void reinit(double relative_accuracy, uint32_t max_bins = 0);
     void clear();
 
     void add(double value);
@@ -119,7 +125,8 @@ public:
     bool is_mapping_initialized() const { return _mapping_initialized; }
     double gamma() const { return _gamma; }
     double index_offset() const { return _index_offset; }
-    double relative_accuracy() const { return (_gamma - 1.0) / (_gamma + 1.0); }
+    uint32_t interpolation() const { return _interpolation; }
+    double relative_accuracy() const { return _relative_accuracy; }
 
     int32_t key(double value) const;
     double bin_value(int32_t index) const;
@@ -130,15 +137,19 @@ public:
     Status deserialize(const Slice& src);
 
 private:
-    void _init_mapping_from_gamma(double gamma, double index_offset);
+    void _init_mapping_from_gamma(double gamma, double index_offset, uint32_t interpolation = kInterpolationNone);
     void _ensure_default_mapping();
     int32_t _key_positive(double abs_val) const;
+    double _mapping_log(double value) const;
+    double _mapping_exp(double value) const;
 
     bool _mapping_initialized = false;
+    uint32_t _interpolation = kInterpolationNone;
     double _gamma = (1.0 + kDefaultRelativeAccuracy) / (1.0 - kDefaultRelativeAccuracy);
     double _index_offset = 0.0;
+    double _relative_accuracy = kDefaultRelativeAccuracy;
     double _multiplier = 0.0;
-    double _bin_norm = 2.0 / (1.0 + (1.0 + kDefaultRelativeAccuracy) / (1.0 - kDefaultRelativeAccuracy));
+    double _bin_norm = 1.0 + kDefaultRelativeAccuracy;
     double _min_indexable_value = 0.0;
     double _max_indexable_value = 0.0;
     int32_t _min_safe_bin_index = kMinBinIndex;

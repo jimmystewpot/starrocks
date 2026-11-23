@@ -26,7 +26,7 @@ select length(ddsketch_empty()), length(ddsketch_empty(0.02)), ddsketch_count(dd
 11	11	0	None	None	None	None	None
 -- !result
 -- Exact formula verification on small weighted dataset: (10.0, 25), (20.0, 25), (50.0, 45), (100.0, 5)
--- gamma = 1.01/0.99, k(10)=116 (v=10.0747), k(20)=150 (v=19.8867), k(50)=196 (v=49.9030), k(100)=231 (v=100.4946)
+-- gamma = 1.01/0.99, k(10)=115 (v=10.0747), k(20)=149 (v=19.8867), k(50)=195 (v=49.9030), k(100)=230 (v=100.4946)
 with small_sk as (
   select ddsketch_accumulate_weighted(v, w) as s
   from (
@@ -65,7 +65,7 @@ select grp,
        ddsketch_cdf(s, [250.0, 500.0, 750.0])
 from grp_sk;
 -- result:
-A	1000	0.99	1002.428	497.7794	982.5779	497.7794	944.0493	982.5779	0.502	[0.249,0.502,0.75]
+A	1000	1.01	1002.428	497.7794	982.5779	497.7794	944.0493	982.5779	0.502	[0.249,0.502,0.75]
 -- !result
 -- Determinism: ddsketch_combine across groups vs ddsketch_union pairwise vs full table ddsketch_accumulate
 with a as (select ddsketch_accumulate(val) as s from t1 where grp = 'A'),

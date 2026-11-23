@@ -594,14 +594,14 @@ TEST_F(DDSketchTest, TestMalformedAndAdversarialPayloads) {
         EXPECT_NE(st.message().find("ddsketch: missing IndexMapping"), std::string::npos);
     }
     {
-        // Unsupported interpolation != 0
+        // Unsupported interpolation (e.g. LINEAR = 1, QUADRATIC = 2)
         std::string proto;
         append_length_delimited(&proto, 1, make_index_mapping_msg(valid_gamma, 0.0, 1));
         DDSketch sketch;
         Status st = sketch.deserialize(Slice(proto));
         EXPECT_TRUE(st.is_invalid_argument());
-        EXPECT_NE(st.message().find("ddsketch: unsupported IndexMapping interpolation mode; only NONE (logarithmic) is "
-                                    "supported"),
+        EXPECT_NE(st.message().find("ddsketch: unsupported IndexMapping interpolation mode; only NONE (logarithmic) "
+                                    "and CUBIC are supported"),
                   std::string::npos);
     }
     for (double bad_gamma :
@@ -799,6 +799,217 @@ TEST_F(DDSketchTest, TestUnalignedBuffersAndTruncationFuzz) {
             (void)m.cdf(10.0);
             (void)m.sum();
         }
+    }
+}
+
+namespace {
+
+std::string hex_to_bytes(const char* hex) {
+    std::string out;
+    auto hex_nibble = [](char c) -> uint8_t {
+        if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');
+        if (c >= 'a' && c <= 'f') return static_cast<uint8_t>(10 + (c - 'a'));
+        if (c >= 'A' && c <= 'F') return static_cast<uint8_t>(10 + (c - 'A'));
+        return 0;
+    };
+    for (size_t i = 0; hex[i] != '\0' && hex[i + 1] != '\0'; i += 2) {
+        uint8_t b = static_cast<uint8_t>((hex_nibble(hex[i]) << 4) | hex_nibble(hex[i + 1]));
+        out.push_back(static_cast<char>(b));
+    }
+    return out;
+}
+
+} // namespace
+
+// Golden fixtures generated directly by official com.datadoghq:sketches-java:0.8.3
+// (DDSketchProtoBinding.toProto(sketch).toByteArray()).
+TEST_F(DDSketchTest, TestOfficialDatadogJavaGoldenFixtures) {
+    struct GoldenCase {
+        const char* name;
+        const char* hex;
+        uint64_t count;
+        double sum;
+        double avg;
+        double p0;
+        double p50;
+        double p90;
+        double p99;
+        double p100;
+    };
+
+    const GoldenCase cases[] = {
+            // Case 1: LogarithmicMapping(0.01), single observation 100.0 (UnboundedSizeDenseStore)
+            {"log_single_100_alpha_0_01_dense", "0a0909fd4a815abf52f03f120d1208000000000000f03f18cc031a00", 1ULL,
+             100.49456770856492, 100.49456770856492, 100.49456770856492, 100.49456770856492, 100.49456770856492,
+             100.49456770856492, 100.49456770856492},
+            // Case 2: LogarithmicMapping(0.01), {0.005, 0.5, 1.0, 10.0, 100.0, 1000.0} (SparseStore)
+            {"log_powers_and_fractions_alpha_0_01_sparse",
+             "0a0909fd4a815abf52f03f12520a0c08910411000000000000f03f0a0b084511000000000000f03f0a0b080011000000000000f03"
+             "f"
+             "0a0c08e60111000000000000f03f0a0c08cc0311000000000000f03f0a0c08b20511000000000000f03f1a00",
+             6ULL, 1114.5138529928140, 185.75230883213567, 0.0050406192044765320, 1.0100000000000000,
+             100.49456770856492, 100.49456770856492, 1002.4280085221300},
+            // Case 3: LogarithmicMapping(0.01), {-500.0, -10.0, -1.0, 0.0, 0.0, 1.0, 10.0, 500.0} (SparseStore)
+            {"log_signed_and_zero_alpha_0_01_sparse",
+             "0a0909fd4a815abf52f03f12290a0b080011000000000000f03f0a0c08e60111000000000000f03f0a0c08ec0411000000000000f"
+             "0"
+             "3f1a290a0b080011000000000000f03f0a0c08e60111000000000000f03f0a0c08ec0411000000000000f03f21000000000000004"
+             "0",
+             8ULL, 0.0, 0.0, -497.77940145581560, 0.0, 10.074696689511330, 10.074696689511330, 497.77940145581560},
+            // Case 4: LogarithmicMapping(0.01), [10.0 .. 25.0] (UnboundedSizeDenseStore contiguous counts)
+            {"log_contiguous_10_to_25_alpha_0_01_dense",
+             "0a0909fd4a815abf52f03f12f60212f002000000000000f03f0000000000000000000000000000000000000000000000000000000"
+             "0"
+             "0000f03f0000000000000000000000000000000000000000000000000000000000000000000000000000f03f00000000000000000"
+             "0"
+             "000000000000000000000000000000000000000000f03f00000000000000000000000000000000000000000000f03f00000000000"
+             "0"
+             "000000000000000000000000000000000000000000000000f03f00000000000000000000000000000000000000000000f03f00000"
+             "0"
+             "00000000000000000000000000000000000000f03f00000000000000000000000000000000000000000000f03f000000000000000"
+             "0"
+             "0000000000000000000000000000f03f0000000000000000000000000000f03f00000000000000000000000000000000000000000"
+             "0"
+             "00f03f0000000000000000000000000000f03f0000000000000000000000000000f03f0000000000000000000000000000f03f000"
+             "0"
+             "000000000000000000000000f03f18e6011a00",
+             16ULL, 279.47307544471540, 17.467067215294712, 10.074696689511330, 16.946212143511012, 22.875222481776756,
+             23.808809768044550, 24.780498769903320},
+            // Case 5: LogarithmicMapping(0.001), 100x 1.0 + 20 log-spaced up to 1000.0 (SparseStore)
+            {"log_bimodal_1_to_1000_alpha_0_001_sparse",
+             "0a0909830052403308f03f12a5020a0b08001100000000000059400a0c08d80211000000000000f03f0a0c08b2051100000000000"
+             "0"
+             "f03f0a0c088c0811000000000000f03f0a0c08e40a11000000000000f03f0a0c08be0d11000000000000f03f0a0c0898101100000"
+             "0"
+             "000000f03f0a0c08f01211000000000000f03f0a0c08ca1511000000000000f03f0a0c08a41811000000000000f03f0a0c08fc1a1"
+             "1"
+             "000000000000f03f0a0c08d61d11000000000000f03f0a0c08b02011000000000000f03f0a0c088a2311000000000000f03f0a0c0"
+             "8"
+             "e22511000000000000f03f0a0c08bc2811000000000000f03f0a0c08962b11000000000000f03f0a0c08ee2d11000000000000f03"
+             "f"
+             "0a0c08c83011000000000000f03f0a0c08a23311000000000000f03f0a0c08fa3511000000000000f03f1a00",
+             120ULL, 3520.4500898422425, 29.337084082018688, 1.0010000000000000, 1.0010000000000000, 15.847320319275351,
+             501.19817027865133, 999.24680714442010},
+            // Case 6: Default Java CubicallyInterpolatedMapping(0.01) + SparseStore
+            {"cubic_default_java_mixed_alpha_0_01_sparse",
+             "0a0b09c2f1e7e9ed51f03f180312530a0c088b0111000000000000f03f0a0b080011000000000000f03f0a0c08f80211000000000"
+             "0"
+             "00f03f0a0c08d00311000000000000f03f0a0c08b80511000000000000f03f0a0c08c40811000000000000f03f1a1b0a0b0800110"
+             "0"
+             "0000000000f03f0a0c08ac0411000000000000f03f21000000000000f03f",
+             9ULL, 51046.604341873810, 5671.8449268748680, -248.76017323768866, 1.0100000000000000, 995.08612904744850,
+             995.08612904744850, 50158.312820030056},
+            // Case 7: Default Java DDSketches.unboundedDense(0.01) over [10.0 .. 25.0] (contiguous dense + CUBIC)
+            {"cubic_default_java_contiguous_10_to_25_alpha_0_01_dense",
+             "0a0b09c2f1e7e9ed51f03f180312fe0212f802000000000000f03f000000000000000000000000000000000000000000000000000"
+             "0"
+             "000000000000000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f0000000000000"
+             "0"
+             "0000000000000000000000000000000000000000000000f03f0000000000000000000000000000000000000000000000000000000"
+             "0"
+             "0000f03f00000000000000000000000000000000000000000000f03f00000000000000000000000000000000000000000000f03f0"
+             "0"
+             "0000000000000000000000000000000000000000000000000000000000f03f0000000000000000000000000000f03f00000000000"
+             "0"
+             "00000000000000000000000000000000f03f00000000000000000000000000000000000000000000f03f000000000000000000000"
+             "0"
+             "000000f03f00000000000000000000000000000000000000000000f03f0000000000000000000000000000f03f000000000000000"
+             "0"
+             "000000000000f03f0000000000000000000000000000f03f18e8011a00",
+             16ULL, 280.16044981553650, 17.510028113471030, 10.044983161068599, 17.156494165845820, 23.068115741661620,
+             24.002636914918774, 24.977983750285134},
+    };
+
+    for (const auto& tc : cases) {
+        SCOPED_TRACE(tc.name);
+        const std::string wire = hex_to_bytes(tc.hex);
+
+        // 1. Direct deserialize() from official Java 0.8.3 protobuf bytes
+        DDSketch decoded;
+        Status st = decoded.deserialize(Slice(wire));
+        ASSERT_TRUE(st.ok()) << tc.name << ": " << st.to_string();
+        EXPECT_EQ(tc.count, decoded.total_count());
+        EXPECT_NEAR(tc.sum, decoded.sum(), 1e-9);
+        EXPECT_NEAR(tc.avg, decoded.avg(), 1e-9);
+        EXPECT_NEAR(tc.p0, decoded.quantile(0.0), 1e-11);
+        EXPECT_NEAR(tc.p50, decoded.quantile(0.5), 1e-11);
+        EXPECT_NEAR(tc.p90, decoded.quantile(0.9), 1e-11);
+        EXPECT_NEAR(tc.p99, decoded.quantile(0.99), 1e-11);
+        EXPECT_NEAR(tc.p100, decoded.quantile(1.0), 1e-11);
+
+        // 2. Direct merge_serialized() from official Java 0.8.3 protobuf bytes
+        DDSketch merged;
+        Status st_m = merged.merge_serialized(Slice(wire));
+        ASSERT_TRUE(st_m.ok()) << tc.name << ": " << st_m.to_string();
+        EXPECT_EQ(tc.count, merged.total_count());
+        EXPECT_NEAR(tc.p50, merged.quantile(0.5), 1e-11);
+        EXPECT_NEAR(tc.p99, merged.quantile(0.99), 1e-11);
+
+        // 3. Re-serialize from C++ (including CUBIC interpolation tag 0x18 0x03) and re-decode
+        std::string reserialized = serialize_sketch(decoded);
+        DDSketch roundtrip;
+        ASSERT_TRUE(roundtrip.deserialize(Slice(reserialized)).ok());
+        EXPECT_EQ(decoded.interpolation(), roundtrip.interpolation());
+        EXPECT_EQ(tc.count, roundtrip.total_count());
+        EXPECT_NEAR(tc.sum, roundtrip.sum(), 1e-9);
+        EXPECT_NEAR(tc.p0, roundtrip.quantile(0.0), 1e-11);
+        EXPECT_NEAR(tc.p50, roundtrip.quantile(0.5), 1e-11);
+        EXPECT_NEAR(tc.p90, roundtrip.quantile(0.9), 1e-11);
+        EXPECT_NEAR(tc.p99, roundtrip.quantile(0.99), 1e-11);
+        EXPECT_NEAR(tc.p100, roundtrip.quantile(1.0), 1e-11);
+    }
+
+    // 4. Verify native C++ accumulation produces identical quantile, sum, and avg to Java 0.8.3
+    {
+        DDSketch native_single(0.01);
+        native_single.add(100.0);
+        EXPECT_EQ(230, native_single.key(100.0));
+        EXPECT_NEAR(100.49456770856492, native_single.quantile(0.5), 1e-12);
+
+        DDSketch native_powers(0.01);
+        for (double v : {0.005, 0.5, 1.0, 10.0, 100.0, 1000.0}) {
+            native_powers.add(v);
+        }
+        EXPECT_EQ(6ULL, native_powers.total_count());
+        EXPECT_NEAR(1114.5138529928140, native_powers.sum(), 1e-9);
+        EXPECT_NEAR(185.75230883213567, native_powers.avg(), 1e-9);
+        EXPECT_NEAR(0.0050406192044765320, native_powers.quantile(0.0), 1e-12);
+        EXPECT_NEAR(1.0100000000000000, native_powers.quantile(0.5), 1e-12);
+        EXPECT_NEAR(100.49456770856492, native_powers.quantile(0.9), 1e-12);
+        EXPECT_NEAR(1002.4280085221300, native_powers.quantile(1.0), 1e-11);
+    }
+
+    // 5. Verify native C++ accumulation at alpha = 0.001 over [1.0 .. 1000.0] matches Java 0.8.3 without collapsing
+    {
+        DDSketch native_001(0.001);
+        for (int i = 0; i < 100; ++i) {
+            native_001.add(1.0);
+        }
+        for (int i = 1; i <= 20; ++i) {
+            native_001.add(std::pow(1000.0, static_cast<double>(i) / 20.0));
+        }
+        EXPECT_EQ(120ULL, native_001.total_count());
+        EXPECT_NEAR(3520.4500898422425, native_001.sum(), 1e-9);
+        EXPECT_NEAR(29.337084082018688, native_001.avg(), 1e-9);
+        EXPECT_NEAR(1.001, native_001.quantile(0.0), 1e-11);
+        EXPECT_NEAR(1.001, native_001.quantile(0.5), 1e-11);
+        EXPECT_NEAR(15.847320319275351, native_001.quantile(0.9), 1e-11);
+        EXPECT_NEAR(501.19817027865133, native_001.quantile(0.99), 1e-11);
+        EXPECT_NEAR(999.24680714442010, native_001.quantile(1.0), 1e-11);
+    }
+
+    // 6. Verify merging a CUBIC sketch with a NONE (logarithmic) sketch fails with incompatible IndexMapping
+    {
+        DDSketch cubic_sk;
+        ASSERT_TRUE(cubic_sk.deserialize(Slice(hex_to_bytes(cases[5].hex))).ok());
+        EXPECT_EQ(DDSketch::kInterpolationCubic, cubic_sk.interpolation());
+
+        DDSketch log_sk(0.01);
+        log_sk.add(100.0);
+        EXPECT_EQ(DDSketch::kInterpolationNone, log_sk.interpolation());
+
+        EXPECT_TRUE(cubic_sk.merge(log_sk).is_invalid_argument());
+        EXPECT_TRUE(log_sk.merge(cubic_sk).is_invalid_argument());
     }
 }
 
