@@ -89,6 +89,7 @@ set(BASE_TEST_FILES
     string/string_search_test.cpp
     string/string_searcher_test.cpp
     string/string_util_test.cpp
+    string/byte_set_test.cpp
     string/trim_test.cpp
     string/string_parser_test.cpp
     string/slice_test.cpp
