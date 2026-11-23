@@ -14,8 +14,10 @@
 
 #include "exprs/like_predicate.h"
 
+#include <algorithm>
 #include <memory>
 
+#include "base/string/offset_string_cmp.h"
 #include "base/string/volnitsky.h"
 #include "base/utility/defer_op.h"
 #include "exprs/binary_function.h"
@@ -125,6 +127,17 @@ Status LikePredicate::setup_like_state(FunctionContext* context, LikePredicateSt
     auto pattern = ColumnHelper::get_const_value<TYPE_VARCHAR>(column);
     std::string pattern_str = pattern.to_string();
     std::string search_string;
+
+    if (pattern.empty()) {
+        state->set_search_string("");
+        state->function = &constant_equals_fn;
+        return Status::OK();
+    }
+    if (std::all_of(pattern_str.begin(), pattern_str.end(), [](char c) { return c == '%'; })) {
+        state->set_search_string("");
+        state->function = &constant_starts_with_fn;
+        return Status::OK();
+    }
 
     if (RE2::FullMatch(pattern_str, LIKE_ENDS_WITH_RE, &search_string)) {
         remove_escape_character(&search_string);
@@ -285,54 +298,93 @@ StatusOr<ColumnPtr> LikePredicate::match_fn_with_long_constant_pattern(FunctionC
     return result.build(all_const);
 }
 
-// constant_ends
-DEFINE_BINARY_FUNCTION_WITH_IMPL(ConstantEndsImpl, value, pattern) {
-    return (value.size >= pattern.size) && (pattern == Slice(value.data + value.size - pattern.size, pattern.size));
+namespace {
+
+template <OffsetStringMatchMode Mode>
+static StatusOr<ColumnPtr> evaluate_constant_pattern(const ColumnPtr& value_col, const Slice& pattern) {
+    if (value_col->only_null()) {
+        return ColumnHelper::create_const_null_column(value_col->size());
+    }
+
+    if (value_col->is_constant()) {
+        Slice haystack = ColumnHelper::get_const_value<TYPE_VARCHAR>(value_col);
+        bool matched = false;
+        if constexpr (Mode == OffsetStringMatchMode::STARTS_WITH) {
+            matched = haystack.starts_with(pattern);
+        } else if constexpr (Mode == OffsetStringMatchMode::ENDS_WITH) {
+            matched = haystack.ends_with(pattern);
+        } else {
+            matched = (haystack == pattern);
+        }
+        auto res = RunTimeColumnType<TYPE_BOOLEAN>::create();
+        res->append(matched);
+        return ConstColumn::create(std::move(res), value_col->size());
+    }
+
+    const BinaryColumn* haystack = nullptr;
+    NullColumnPtr res_null = nullptr;
+    if (value_col->is_nullable()) {
+        const auto* haystack_null = ColumnHelper::as_raw_column<NullableColumn>(value_col);
+        haystack = ColumnHelper::as_raw_column<BinaryColumn>(haystack_null->data_column());
+        res_null = haystack_null->null_column();
+    } else {
+        haystack = ColumnHelper::as_raw_column<BinaryColumn>(value_col);
+    }
+
+    const size_t num_rows = haystack->size();
+    auto res = RunTimeColumnType<TYPE_BOOLEAN>::create();
+    res->resize_uninitialized(num_rows);
+    uint8_t* __restrict dst = res->get_data().data();
+
+    const uint8_t* const base_ptr = haystack->raw_bytes();
+    const size_t total_bytes = haystack->get_immutable_bytes().size();
+    haystack->get_offset().visit_storage([&](const auto& offsets_buf) {
+        using OffsetT = typename std::decay_t<decltype(offsets_buf)>::value_type;
+        eval_offset_string_const<Mode, OffsetT, uint8_t>(offsets_buf.data(), base_ptr, total_bytes, pattern, num_rows,
+                                                         dst);
+    });
+
+    if (value_col->has_null()) {
+        return NullableColumn::create(std::move(res), std::move(res_null));
+    }
+    return res;
+}
+
+} // namespace
+
+StatusOr<ColumnPtr> LikePredicate::match_constant_starts_with(const ColumnPtr& value_col, const Slice& pattern) {
+    return evaluate_constant_pattern<OffsetStringMatchMode::STARTS_WITH>(value_col, pattern);
+}
+
+StatusOr<ColumnPtr> LikePredicate::match_constant_ends_with(const ColumnPtr& value_col, const Slice& pattern) {
+    return evaluate_constant_pattern<OffsetStringMatchMode::ENDS_WITH>(value_col, pattern);
+}
+
+StatusOr<ColumnPtr> LikePredicate::match_constant_equals(const ColumnPtr& value_col, const Slice& pattern) {
+    return evaluate_constant_pattern<OffsetStringMatchMode::EQUALS>(value_col, pattern);
 }
 
 StatusOr<ColumnPtr> LikePredicate::constant_ends_with_fn(FunctionContext* context, const starrocks::Columns& columns) {
     auto state = shared_state(context);
-
-    const auto& value = VECTORIZED_FN_ARGS(0);
-    auto pattern = state->_search_string_column;
-
-    return VectorizedStrictBinaryFunction<ConstantEndsImpl>::evaluate<TYPE_VARCHAR, TYPE_BOOLEAN>(value, pattern);
-}
-
-// constant_starts
-DEFINE_BINARY_FUNCTION_WITH_IMPL(ConstantStartsImpl, value, pattern) {
-    return (value.size >= pattern.size) && (pattern == Slice(value.data, pattern.size));
+    return match_constant_ends_with(VECTORIZED_FN_ARGS(0), state->search_string_sv);
 }
 
 StatusOr<ColumnPtr> LikePredicate::constant_starts_with_fn(FunctionContext* context,
                                                            const starrocks::Columns& columns) {
     auto state = shared_state(context);
-
-    const auto& value = VECTORIZED_FN_ARGS(0);
-    auto pattern = state->_search_string_column;
-
-    return VectorizedStrictBinaryFunction<ConstantStartsImpl>::evaluate<TYPE_VARCHAR, TYPE_BOOLEAN>(value, pattern);
-}
-
-// constant_equals
-DEFINE_BINARY_FUNCTION_WITH_IMPL(ConstantEqualsImpl, value, pattern) {
-    return value == pattern;
+    return match_constant_starts_with(VECTORIZED_FN_ARGS(0), state->search_string_sv);
 }
 
 StatusOr<ColumnPtr> LikePredicate::constant_equals_fn(FunctionContext* context, const starrocks::Columns& columns) {
     auto state = shared_state(context);
-
-    const auto& value = VECTORIZED_FN_ARGS(0);
-    auto pattern = state->_search_string_column;
-
-    return VectorizedStrictBinaryFunction<ConstantEqualsImpl>::evaluate<TYPE_VARCHAR, TYPE_BOOLEAN>(value, pattern);
+    return match_constant_equals(VECTORIZED_FN_ARGS(0), state->search_string_sv);
 }
 
 StatusOr<ColumnPtr> LikePredicate::constant_substring_fn(FunctionContext* context, const starrocks::Columns& columns) {
     RETURN_IF_COLUMNS_ONLY_NULL(columns);
     auto state = shared_state(context);
 
-    Slice needle = ColumnHelper::get_const_value<TYPE_VARCHAR>(state->_search_string_column);
+    Slice needle = state->search_string_sv;
     auto res = RunTimeColumnType<TYPE_BOOLEAN>::create();
 
     if (columns[0]->is_constant()) {
@@ -566,7 +618,7 @@ StatusOr<ColumnPtr> LikePredicate::regex_match_full(FunctionContext* context, co
             remove_escape_character(&str_pattern);
             auto pattern_slice = Slice(str_pattern);
             pattern_slice.remove_suffix(1);
-            result.append(ConstantStartsImpl::apply<Slice, Slice, bool>(value_viewer.value(row), pattern_slice));
+            result.append(value_viewer.value(row).starts_with(pattern_slice));
             break;
         }
         case FastPathType::END_WITH: {
@@ -574,7 +626,7 @@ StatusOr<ColumnPtr> LikePredicate::regex_match_full(FunctionContext* context, co
             remove_escape_character(&str_pattern);
             auto pattern_slice = Slice(str_pattern);
             pattern_slice.remove_prefix(1);
-            result.append(ConstantEndsImpl::apply<Slice, Slice, bool>(value_viewer.value(row), pattern_slice));
+            result.append(value_viewer.value(row).ends_with(pattern_slice));
             break;
         }
         case FastPathType::SUBSTRING: {
