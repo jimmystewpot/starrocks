@@ -1011,6 +1011,32 @@ TEST_F(DDSketchTest, TestOfficialDatadogJavaGoldenFixtures) {
         EXPECT_TRUE(cubic_sk.merge(log_sk).is_invalid_argument());
         EXPECT_TRUE(log_sk.merge(cubic_sk).is_invalid_argument());
     }
+
+    // 7. Regression test: reusing a single DDSketch across rows (as scalar evaluators do) must reset the decoding
+    // bin limit independently for each payload rather than inheriting a larger max_bins from a prior 0.001 sketch.
+    {
+        const double gamma_001 = (1.0 + 0.01) / (1.0 - 0.01);
+        std::string store_3000;
+        append_tag(&store_3000, 2, 2);
+        append_varint(&store_3000, 3000ULL * sizeof(double));
+        for (int i = 0; i < 3000; ++i) {
+            append_double_le(&store_3000, 1.0);
+        }
+        std::string wire_3000_alpha_001;
+        append_length_delimited(&wire_3000_alpha_001, 1, make_index_mapping_msg(gamma_001));
+        append_length_delimited(&wire_3000_alpha_001, 2, store_3000);
+
+        DDSketch fresh_decoded;
+        ASSERT_TRUE(fresh_decoded.deserialize(Slice(wire_3000_alpha_001)).ok());
+
+        DDSketch reused;
+        ASSERT_TRUE(reused.deserialize(Slice(hex_to_bytes(cases[4].hex))).ok()); // alpha = 0.001 -> max_bins = 20480
+        ASSERT_TRUE(reused.deserialize(Slice(wire_3000_alpha_001)).ok());        // alpha = 0.01 -> must reset to 2048
+
+        EXPECT_DOUBLE_EQ(fresh_decoded.min_value(), reused.min_value());
+        EXPECT_DOUBLE_EQ(fresh_decoded.quantile(0.5), reused.quantile(0.5));
+        EXPECT_EQ(serialize_sketch(fresh_decoded), serialize_sketch(reused));
+    }
 }
 
 } // namespace starrocks
