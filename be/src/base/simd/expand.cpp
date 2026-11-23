@@ -30,6 +30,62 @@
 
 namespace SIMD::Expand {
 
+#if defined(__x86_64__) || (defined(__ARM_NEON) && defined(__aarch64__))
+// popcount(mask) for each 8-bit mask, used to advance the source cursor.
+inline constexpr std::array<uint8_t, 256> kExpandCountLUT = {
+        0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 1, 2, 2, 3, 2,
+        3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3,
+        3, 4, 3, 4, 4, 5, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5,
+        6, 3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 2, 3, 3, 4,
+        3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 3, 4, 4, 5, 4, 5, 5, 6, 4,
+        5, 5, 6, 5, 6, 6, 7, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6,
+        6, 7, 3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7, 4, 5, 5, 6, 5, 6, 6, 7, 5, 6, 6, 7, 6, 7, 7, 8,
+};
+
+// popcount for each 4-bit mask.
+inline constexpr std::array<uint8_t, 16> kExpandCountLUT64 = {0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4};
+
+// 8-bit mask -> packed 8 x uint8 byte shuffle indices for 1-byte elements.
+// Two 8-byte entries (low 8 rows and high 8 rows, with the high half offset by
+// popcount(mask_lo) * 0x0101010101010101ULL) form a 16-byte shuffle control
+// vector for _mm_shuffle_epi8 (AVX2) or vqtbl1q_u8 (ARM64 NEON).
+constexpr auto make_expand_permute_lut8() {
+    std::array<uint64_t, 256> table{};
+    for (uint32_t mask = 0; mask < 256; ++mask) {
+        uint64_t word = 0;
+        uint64_t src_idx = 0;
+        for (uint32_t dst_idx = 0; dst_idx < 8; ++dst_idx) {
+            uint64_t idx = (mask & (1u << dst_idx)) ? src_idx++ : 0;
+            word |= (idx << (dst_idx * 8));
+        }
+        table[mask] = word;
+    }
+    return table;
+}
+
+alignas(64) inline constexpr auto kExpandPermuteLUT8 = make_expand_permute_lut8();
+
+// 4-bit mask -> packed 8 x uint8 byte shuffle indices for 4 x 2-byte elements.
+// Two 8-byte entries (low 4 lanes and high 4 lanes, with the high half offset
+// by (2 * popcount(mask_lo)) * 0x0101010101010101ULL) form a 16-byte shuffle
+// control vector for 8 x int16_t elements.
+constexpr auto make_expand_permute_lut16() {
+    std::array<uint64_t, 16> table{};
+    for (uint32_t mask = 0; mask < 16; ++mask) {
+        uint64_t word = 0;
+        uint64_t src_idx = 0;
+        for (uint32_t dst_idx = 0; dst_idx < 4; ++dst_idx) {
+            uint64_t base = (mask & (1u << dst_idx)) ? (src_idx++ * 2) : 0;
+            word |= (base << (dst_idx * 16)) | ((base + 1) << (dst_idx * 16 + 8));
+        }
+        table[mask] = word;
+    }
+    return table;
+}
+
+alignas(64) inline constexpr auto kExpandPermuteLUT16 = make_expand_permute_lut16();
+#endif // __x86_64__ || (__ARM_NEON && __aarch64__)
+
 #if defined(__x86_64__)
 // Lookup table for AVX2 32-bit expand: for each 8-bit mask, stores the
 // permutation indices needed to scatter `popcount(mask)` valid elements into
@@ -72,20 +128,6 @@ constexpr auto make_expand_permute_lut64() {
 }
 
 alignas(64) inline constexpr auto kPerm64LUT = make_expand_permute_lut64();
-
-// popcount(mask) for each 8-bit mask, used to advance the source cursor.
-inline constexpr std::array<uint8_t, 256> kExpandCountLUT = {
-        0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 1, 2, 2, 3, 2,
-        3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3,
-        3, 4, 3, 4, 4, 5, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5,
-        6, 3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 2, 3, 3, 4,
-        3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 3, 4, 4, 5, 4, 5, 5, 6, 4,
-        5, 5, 6, 5, 6, 6, 7, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6,
-        6, 7, 3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7, 4, 5, 5, 6, 5, 6, 6, 7, 5, 6, 6, 7, 6, 7, 7, 8,
-};
-
-// popcount for each 4-bit mask, used by the 64-bit AVX2 path.
-inline constexpr std::array<uint8_t, 16> kExpandCountLUT64 = {0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4};
 #endif // __x86_64__
 
 #if defined(__ARM_NEON) && defined(__aarch64__)
@@ -146,6 +188,98 @@ constexpr uint32_t extract_neon_mask2(uint64_t nibble_mask, int k) noexcept {
     return (pair_bits | (pair_bits >> 3)) & 0x3u;
 }
 #endif // __ARM_NEON && __aarch64__
+
+MFV_DEFAULT(void expand_load_selection_i8(int8_t* dst_data, const int8_t* src_data, const uint8_t* nulls, size_t count,
+                                          size_t total_valid) {
+    expand_load_branchless(dst_data, src_data, nulls, count, total_valid);
+});
+
+MFV_AVX2(void expand_load_selection_i8(int8_t* dst_data, const int8_t* src_data, const uint8_t* nulls, size_t count,
+                                       size_t total_valid) {
+    size_t cnt = 0;
+    size_t i = 0;
+    const __m128i zero16 = _mm_setzero_si128();
+    for (; i + 16 <= count && cnt < total_valid; i += 16) {
+        __m128i null_vec = _mm_loadu_si128(reinterpret_cast<const __m128i*>(&nulls[i]));
+        uint32_t mask16 = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(null_vec, zero16)));
+        if (mask16 == 0) {
+            continue;
+        }
+        if (mask16 == 0xFFFFu) {
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst_data + i),
+                             _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_data + cnt)));
+            cnt += 16;
+            continue;
+        }
+        if (cnt + 16 <= total_valid) {
+            uint32_t mask_lo = mask16 & 0xFFu;
+            uint32_t mask_hi = (mask16 >> 8) & 0xFFu;
+            uint8_t pop_lo = kExpandCountLUT[mask_lo];
+            uint64_t idx_lo = kExpandPermuteLUT8[mask_lo];
+            uint64_t idx_hi = kExpandPermuteLUT8[mask_hi] + static_cast<uint64_t>(pop_lo) * 0x0101010101010101ULL;
+            __m128i src_vec = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_data + cnt));
+            __m128i shuf = _mm_set_epi64x(static_cast<int64_t>(idx_hi), static_cast<int64_t>(idx_lo));
+            __m128i dst_vec = _mm_shuffle_epi8(src_vec, shuf);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst_data + i), dst_vec);
+            cnt += pop_lo + kExpandCountLUT[mask_hi];
+        } else {
+            for (size_t j = 0; j < 16 && cnt < total_valid; ++j) {
+                dst_data[i + j] = src_data[cnt];
+                cnt += (mask16 >> j) & 1u;
+            }
+        }
+    }
+    for (; i < count && cnt < total_valid; ++i) {
+        dst_data[i] = src_data[cnt];
+        cnt += !nulls[i];
+    }
+});
+
+MFV_DEFAULT(void expand_load_selection_i16(int16_t* dst_data, const int16_t* src_data, const uint8_t* nulls,
+                                           size_t count, size_t total_valid) {
+    expand_load_branchless(dst_data, src_data, nulls, count, total_valid);
+});
+
+MFV_AVX2(void expand_load_selection_i16(int16_t* dst_data, const int16_t* src_data, const uint8_t* nulls, size_t count,
+                                        size_t total_valid) {
+    size_t cnt = 0;
+    size_t i = 0;
+    const __m128i zero16 = _mm_setzero_si128();
+    for (; i + 8 <= count && cnt < total_valid; i += 8) {
+        __m128i null_vec = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(&nulls[i]));
+        uint32_t mask8 = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(null_vec, zero16))) & 0xFFu;
+        if (mask8 == 0) {
+            continue;
+        }
+        if (mask8 == 0xFFu) {
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst_data + i),
+                             _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_data + cnt)));
+            cnt += 8;
+            continue;
+        }
+        if (cnt + 8 <= total_valid) {
+            uint32_t mask_lo = mask8 & 0x0Fu;
+            uint32_t mask_hi = (mask8 >> 4) & 0x0Fu;
+            uint8_t pop_lo = kExpandCountLUT64[mask_lo];
+            uint64_t idx_lo = kExpandPermuteLUT16[mask_lo];
+            uint64_t idx_hi = kExpandPermuteLUT16[mask_hi] + static_cast<uint64_t>(2u * pop_lo) * 0x0101010101010101ULL;
+            __m128i src_vec = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src_data + cnt));
+            __m128i shuf = _mm_set_epi64x(static_cast<int64_t>(idx_hi), static_cast<int64_t>(idx_lo));
+            __m128i dst_vec = _mm_shuffle_epi8(src_vec, shuf);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst_data + i), dst_vec);
+            cnt += pop_lo + kExpandCountLUT64[mask_hi];
+        } else {
+            for (size_t j = 0; j < 8 && cnt < total_valid; ++j) {
+                dst_data[i + j] = starrocks::unaligned_load<int16_t>(src_data + cnt);
+                cnt += (mask8 >> j) & 1u;
+            }
+        }
+    }
+    for (; i < count && cnt < total_valid; ++i) {
+        dst_data[i] = starrocks::unaligned_load<int16_t>(src_data + cnt);
+        cnt += !nulls[i];
+    }
+});
 
 MFV_DEFAULT(void expand_load_selection_i32(int32_t* dst_data, const int32_t* src_data, const uint8_t* nulls,
                                            size_t count, size_t total_valid) {
@@ -284,6 +418,126 @@ MFV_AVX512VLBW(void expand_load_selection_i64(int64_t* dst_data, const int64_t* 
         cnt += !nulls[i];
     }
 })
+
+void expand_load_simd(int8_t* dst_data, const int8_t* src_data, const uint8_t* nulls, size_t count,
+                      size_t total_valid) {
+    if (total_valid == 0) {
+        return;
+    }
+    if (total_valid >= count) {
+        std::memcpy(dst_data, src_data, count * sizeof(int8_t));
+        return;
+    }
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    size_t cnt = 0;
+    size_t i = 0;
+    const uint8x16_t zero16 = vdupq_n_u8(0);
+    for (; i + 16 <= count && cnt < total_valid; i += 16) {
+        uint64_t valid_nibble = SIMD::get_nibble_mask(vceqq_u8(vld1q_u8(nulls + i), zero16));
+        if (valid_nibble == 0) {
+            continue;
+        }
+        if (valid_nibble == kNeonAllValidNibbles) {
+            std::memcpy(dst_data + i, src_data + cnt, 16 * sizeof(int8_t));
+            cnt += 16;
+            continue;
+        }
+        uint32_t mask_lo = extract_neon_mask4(valid_nibble, 0) | (extract_neon_mask4(valid_nibble, 1) << 4);
+        uint32_t mask_hi = extract_neon_mask4(valid_nibble, 2) | (extract_neon_mask4(valid_nibble, 3) << 4);
+        if (cnt + 16 <= total_valid) {
+            uint8_t pop_lo = kExpandCountLUT[mask_lo];
+            uint64_t idx_lo = kExpandPermuteLUT8[mask_lo];
+            uint64_t idx_hi = kExpandPermuteLUT8[mask_hi] + static_cast<uint64_t>(pop_lo) * 0x0101010101010101ULL;
+            uint8x16_t src_bytes = vld1q_u8(reinterpret_cast<const uint8_t*>(src_data + cnt));
+            uint8x16_t idx = vreinterpretq_u8_u64(vcombine_u64(vcreate_u64(idx_lo), vcreate_u64(idx_hi)));
+            uint8x16_t dst_bytes = vqtbl1q_u8(src_bytes, idx);
+            vst1q_u8(reinterpret_cast<uint8_t*>(dst_data + i), dst_bytes);
+            cnt += pop_lo + kExpandCountLUT[mask_hi];
+        } else {
+            uint32_t mask16 = mask_lo | (mask_hi << 8);
+            for (size_t j = 0; j < 16 && cnt < total_valid; ++j) {
+                dst_data[i + j] = src_data[cnt];
+                cnt += (mask16 >> j) & 1u;
+            }
+        }
+    }
+    for (; i < count && cnt < total_valid; ++i) {
+        dst_data[i] = src_data[cnt];
+        cnt += !nulls[i];
+    }
+#else
+    expand_load_selection_i8(dst_data, src_data, nulls, count, total_valid);
+#endif
+}
+
+void expand_load_simd(int8_t* dst_data, const int8_t* src_data, const uint8_t* nulls, size_t count) {
+    expand_load_simd(dst_data, src_data, nulls, count, SIMD::count_zero(nulls, count));
+}
+
+void expand_load_simd(int16_t* dst_data, const int16_t* src_data, const uint8_t* nulls, size_t count,
+                      size_t total_valid) {
+    if (total_valid == 0) {
+        return;
+    }
+    if (total_valid >= count) {
+        std::memcpy(dst_data, src_data, count * sizeof(int16_t));
+        return;
+    }
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    size_t cnt = 0;
+    size_t i = 0;
+    const uint8x16_t zero16 = vdupq_n_u8(0);
+    for (; i + 16 <= count && cnt < total_valid; i += 16) {
+        uint64_t valid_nibble = SIMD::get_nibble_mask(vceqq_u8(vld1q_u8(nulls + i), zero16));
+        if (valid_nibble == 0) {
+            continue;
+        }
+        if (valid_nibble == kNeonAllValidNibbles) {
+            std::memcpy(dst_data + i, src_data + cnt, 16 * sizeof(int16_t));
+            cnt += 16;
+            continue;
+        }
+        for (int half = 0; half < 2; ++half) {
+            uint32_t mask_lo = extract_neon_mask4(valid_nibble, half * 2);
+            uint32_t mask_hi = extract_neon_mask4(valid_nibble, half * 2 + 1);
+            uint32_t mask8 = mask_lo | (mask_hi << 4);
+            if (mask8 == 0) {
+                continue;
+            }
+            size_t sub_i = i + static_cast<size_t>(half) * 8;
+            if (mask8 == 0xFFu) {
+                std::memcpy(dst_data + sub_i, src_data + cnt, 8 * sizeof(int16_t));
+                cnt += 8;
+            } else if (cnt + 8 <= total_valid) {
+                uint8_t pop_lo = kExpandCountLUT64[mask_lo];
+                uint64_t idx_lo = kExpandPermuteLUT16[mask_lo];
+                uint64_t idx_hi =
+                        kExpandPermuteLUT16[mask_hi] + static_cast<uint64_t>(2u * pop_lo) * 0x0101010101010101ULL;
+                uint8x16_t src_bytes = vld1q_u8(reinterpret_cast<const uint8_t*>(src_data + cnt));
+                uint8x16_t idx = vreinterpretq_u8_u64(vcombine_u64(vcreate_u64(idx_lo), vcreate_u64(idx_hi)));
+                uint8x16_t dst_bytes = vqtbl1q_u8(src_bytes, idx);
+                vst1q_u8(reinterpret_cast<uint8_t*>(dst_data + sub_i), dst_bytes);
+                cnt += pop_lo + kExpandCountLUT64[mask_hi];
+            } else {
+                for (size_t j = 0; j < 8 && cnt < total_valid; ++j) {
+                    dst_data[sub_i + j] = starrocks::unaligned_load<int16_t>(src_data + cnt);
+                    cnt += (mask8 >> j) & 1u;
+                }
+            }
+        }
+    }
+    for (; i < count && cnt < total_valid; ++i) {
+        dst_data[i] = starrocks::unaligned_load<int16_t>(src_data + cnt);
+        cnt += !nulls[i];
+    }
+#else
+    expand_load_selection_i16(dst_data, src_data, nulls, count, total_valid);
+#endif
+}
+
+void expand_load_simd(int16_t* dst_data, const int16_t* src_data, const uint8_t* nulls, size_t count) {
+    expand_load_simd(dst_data, src_data, nulls, count, SIMD::count_zero(nulls, count));
+}
 
 void expand_load_simd(int32_t* dst_data, const int32_t* src_data, const uint8_t* nulls, size_t count,
                       size_t total_valid) {

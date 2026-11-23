@@ -40,6 +40,11 @@ namespace SIMD::Expand {
 // Every expand_load variant reads `src_data` without assuming it is aligned for DataType (vector loads are
 // unaligned, scalar ones go through starrocks::unaligned_load), so it may point into a byte buffer such as a
 // parquet page, where the values start wherever the definition levels end.
+void expand_load_simd(int8_t* dst_data, const int8_t* src_data, const uint8_t* nulls, size_t count);
+void expand_load_simd(int8_t* dst_data, const int8_t* src_data, const uint8_t* nulls, size_t count, size_t total_valid);
+void expand_load_simd(int16_t* dst_data, const int16_t* src_data, const uint8_t* nulls, size_t count);
+void expand_load_simd(int16_t* dst_data, const int16_t* src_data, const uint8_t* nulls, size_t count,
+                      size_t total_valid);
 void expand_load_simd(int32_t* dst_data, const int32_t* src_data, const uint8_t* nulls, size_t count);
 void expand_load_simd(int32_t* dst_data, const int32_t* src_data, const uint8_t* nulls, size_t count,
                       size_t total_valid);
@@ -77,7 +82,13 @@ void expand_load(DataType* dst_data, const DataType* src_data, const uint8_t* nu
         std::memcpy(dst_data, src_data, count * sizeof(DataType));
         return;
     }
-    if constexpr (sizeof(DataType) == 4) {
+    if constexpr (sizeof(DataType) == 1) {
+        expand_load_simd(reinterpret_cast<int8_t*>(dst_data), reinterpret_cast<const int8_t*>(src_data), nulls, count,
+                         total_valid);
+    } else if constexpr (sizeof(DataType) == 2) {
+        expand_load_simd(reinterpret_cast<int16_t*>(dst_data), reinterpret_cast<const int16_t*>(src_data), nulls, count,
+                         total_valid);
+    } else if constexpr (sizeof(DataType) == 4) {
         expand_load_simd(reinterpret_cast<int32_t*>(dst_data), reinterpret_cast<const int32_t*>(src_data), nulls, count,
                          total_valid);
     } else if constexpr (sizeof(DataType) == 8) {
