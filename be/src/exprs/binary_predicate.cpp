@@ -105,6 +105,35 @@ struct BinaryPredFunc {
     static inline ResultType apply(const LType& l, const RType& r) {
         return CMP()(l, r);
     }
+
+    template <typename ResultType, typename OffsetT>
+    static void eval_binary_vector_const(const OffsetT* __restrict offsets, const uint8_t* __restrict lhs_base,
+                                         size_t lhs_total_bytes, const Slice& rhs, int size, ResultType* __restrict dst)
+        requires(std::is_same_v<CMP, std::equal_to<Slice>> || std::is_same_v<CMP, std::not_equal_to<Slice>>)
+    {
+        BinaryStringEqNeKernel<std::is_same_v<CMP, std::not_equal_to<Slice>>>::template eval_binary_vector_const<
+                ResultType, OffsetT>(offsets, lhs_base, lhs_total_bytes, rhs, size, dst);
+    }
+
+    template <typename ResultType, typename OffsetT>
+    static void eval_binary_const_vector(const Slice& lhs, const OffsetT* __restrict offsets,
+                                         const uint8_t* __restrict rhs_base, size_t rhs_total_bytes, int size,
+                                         ResultType* __restrict dst)
+        requires(std::is_same_v<CMP, std::equal_to<Slice>> || std::is_same_v<CMP, std::not_equal_to<Slice>>)
+    {
+        BinaryStringEqNeKernel<std::is_same_v<CMP, std::not_equal_to<Slice>>>::template eval_binary_const_vector<
+                ResultType, OffsetT>(lhs, offsets, rhs_base, rhs_total_bytes, size, dst);
+    }
+
+    template <typename ResultType, typename OffsetT1, typename OffsetT2>
+    static void eval_binary_vector_vector(const OffsetT1* __restrict off1, const uint8_t* __restrict base1,
+                                          const OffsetT2* __restrict off2, const uint8_t* __restrict base2, int size,
+                                          ResultType* __restrict dst)
+        requires(std::is_same_v<CMP, std::equal_to<Slice>> || std::is_same_v<CMP, std::not_equal_to<Slice>>)
+    {
+        BinaryStringEqNeKernel<std::is_same_v<CMP, std::not_equal_to<Slice>>>::template eval_binary_vector_vector<
+                ResultType, OffsetT1, OffsetT2>(off1, base1, off2, base2, size, dst);
+    }
 };
 
 template <LogicalType Type, typename OP>
@@ -423,30 +452,62 @@ public:
         ASSIGN_OR_RETURN(auto l, _children[0]->evaluate_checked(context, ptr));
         ASSIGN_OR_RETURN(auto r, _children[1]->evaluate_checked(context, ptr));
 
-        ColumnViewer<Type> v1(l);
-        ColumnViewer<Type> v2(r);
-        Columns list = {l, r};
-
-        size_t size = list[0]->size();
-        ColumnBuilder<TYPE_BOOLEAN> builder(size);
-        for (int row = 0; row < size; ++row) {
-            auto null1 = v1.is_null(row);
-            auto null2 = v2.is_null(row);
-
-            if (null1 & null2) {
-                // all null = true
-                builder.append(true);
-            } else if (null1 ^ null2) {
-                // one null = false
-                builder.append(false);
-            } else {
-                // all not null = value eq
-                using CppType = RunTimeCppType<Type>;
-                builder.append(OP::template apply<CppType, CppType, bool>(v1.value(row), v2.value(row)));
-            }
+        if (l->only_null() && r->only_null()) {
+            return ColumnHelper::create_const_column<TYPE_BOOLEAN>(true, l->size());
         }
 
-        return builder.build(ColumnHelper::is_all_const(list));
+        auto eval_is_null = [](const ColumnPtr& col) -> ColumnPtr {
+            if (!col->is_nullable() || !col->has_null()) {
+                return ColumnHelper::create_const_column<TYPE_BOOLEAN>(false, col->size());
+            }
+            const auto* nullable = ColumnHelper::as_raw_column<NullableColumn>(col);
+            const size_t n = col->size();
+            auto res = BooleanColumn::create();
+            res->resize_uninitialized(n);
+            const uint8_t* src_null = nullable->immutable_null_column_data().data();
+            uint8_t* dst = res->get_data().data();
+            for (size_t i = 0; i < n; ++i) {
+                dst[i] = static_cast<uint8_t>(src_null[i] != 0);
+            }
+            return res;
+        };
+        if (l->only_null()) {
+            return eval_is_null(r);
+        }
+        if (r->only_null()) {
+            return eval_is_null(l);
+        }
+
+        const ColumnPtr& data1 = FunctionHelper::get_data_column_of_nullable(l);
+        const ColumnPtr& data2 = FunctionHelper::get_data_column_of_nullable(r);
+        ColumnPtr res = UnpackConstColumnBinaryFunction<OP>::template evaluate<Type, Type, TYPE_BOOLEAN>(data1, data2);
+        if (!l->has_null() && !r->has_null()) {
+            return res;
+        }
+
+        const size_t size = l->size();
+        auto mut_res = Column::mutate(std::move(res));
+        uint8_t* dst = ColumnHelper::cast_to_raw<TYPE_BOOLEAN>(mut_res.get())->get_data().data();
+        if (l->has_null() && !r->has_null()) {
+            const uint8_t* n1 = ColumnHelper::as_raw_column<NullableColumn>(l)->immutable_null_column_data().data();
+            for (size_t i = 0; i < size; ++i) {
+                dst[i] &= static_cast<uint8_t>(n1[i] == 0);
+            }
+        } else if (!l->has_null() && r->has_null()) {
+            const uint8_t* n2 = ColumnHelper::as_raw_column<NullableColumn>(r)->immutable_null_column_data().data();
+            for (size_t i = 0; i < size; ++i) {
+                dst[i] &= static_cast<uint8_t>(n2[i] == 0);
+            }
+        } else {
+            const uint8_t* n1 = ColumnHelper::as_raw_column<NullableColumn>(l)->immutable_null_column_data().data();
+            const uint8_t* n2 = ColumnHelper::as_raw_column<NullableColumn>(r)->immutable_null_column_data().data();
+            for (size_t i = 0; i < size; ++i) {
+                const bool b1 = (n1[i] != 0);
+                const bool b2 = (n2[i] != 0);
+                dst[i] = static_cast<uint8_t>((b1 & b2) | (!(b1 | b2) & (dst[i] != 0)));
+            }
+        }
+        return mut_res;
     }
 #ifdef STARROCKS_JIT_ENABLE
 
