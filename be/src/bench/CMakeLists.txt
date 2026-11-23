@@ -67,3 +67,4 @@ target_sources(bitshuffle_page_bench PRIVATE ${SRC_DIR}/service/mem_hook.cpp)
 ADD_BE_BENCH(${SRC_DIR}/bench/gather_bench)
 # Use the same malloc hooks as starrocks_be so allocator behavior matches production.
 target_sources(gather_bench PRIVATE ${SRC_DIR}/service/mem_hook.cpp)
+ADD_BE_BENCH(${SRC_DIR}/bench/string_trim_bench)
