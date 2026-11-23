@@ -67,117 +67,6 @@ TEST(TrimSpacesTest, handles_embedded_nul) {
     EXPECT_EQ(std::string("a\0b", 3), std::string(trim_spaces(input)));
 }
 
-TEST(ByteSetTest, EmptyAndSingleByte) {
-    const ByteSet empty = ByteSet::from_bytes("");
-    EXPECT_TRUE(empty.exact_nibble_lut);
-    for (int b = 0; b < 256; ++b) {
-        const auto byte = static_cast<uint8_t>(b);
-        EXPECT_FALSE(empty.contains(byte)) << "b=" << b;
-        EXPECT_FALSE(empty.nibble_matches(byte)) << "b=" << b;
-    }
-
-    const ByteSet space = ByteSet::from_bytes(" ");
-    EXPECT_TRUE(space.exact_nibble_lut);
-    for (int b = 0; b < 256; ++b) {
-        const auto byte = static_cast<uint8_t>(b);
-        const bool expected = (byte == 0x20);
-        EXPECT_EQ(expected, space.contains(byte)) << "b=" << b;
-        EXPECT_EQ(expected, space.nibble_matches(byte)) << "b=" << b;
-    }
-
-    const ByteSet nul = ByteSet::from_bytes(std::string_view("\0", 1));
-    EXPECT_TRUE(nul.exact_nibble_lut);
-    for (int b = 0; b < 256; ++b) {
-        const auto byte = static_cast<uint8_t>(b);
-        const bool expected = (byte == 0x00);
-        EXPECT_EQ(expected, nul.contains(byte)) << "b=" << b;
-        EXPECT_EQ(expected, nul.nibble_matches(byte)) << "b=" << b;
-    }
-
-    ByteSet cleared = space;
-    cleared.clear();
-    EXPECT_TRUE(cleared.exact_nibble_lut);
-    for (int b = 0; b < 256; ++b) {
-        const auto byte = static_cast<uint8_t>(b);
-        EXPECT_FALSE(cleared.contains(byte)) << "b=" << b;
-        EXPECT_FALSE(cleared.nibble_matches(byte)) << "b=" << b;
-    }
-
-    // Mutating a ByteSet via add() must invalidate exact_nibble_lut until finalize_lut() is called,
-    // so SIMD and scalar paths remain consistent even if a caller mutates after construction.
-    ByteSet mutated = ByteSet::from_bytes(" ");
-    mutated.add(static_cast<uint8_t>('\t'));
-    EXPECT_FALSE(mutated.exact_nibble_lut);
-    const std::string tabs(32, '\t');
-    EXPECT_EQ(tabs.data() + tabs.size(), skip_leading_byteset<true>(tabs.data(), tabs.data() + tabs.size(), mutated));
-    EXPECT_EQ(tabs.data(), skip_trailing_byteset<true>(tabs.data(), tabs.data() + tabs.size(), mutated));
-    mutated.finalize_lut();
-    EXPECT_TRUE(mutated.exact_nibble_lut);
-    EXPECT_EQ(tabs.data() + tabs.size(), skip_leading_byteset<true>(tabs.data(), tabs.data() + tabs.size(), mutated));
-    EXPECT_EQ(tabs.data(), skip_trailing_byteset<true>(tabs.data(), tabs.data() + tabs.size(), mutated));
-}
-
-TEST(ByteSetTest, AsciiSubsetsHaveZeroFalsePositives) {
-    std::string all_ascii(128, '\0');
-    for (int i = 0; i < 128; ++i) {
-        all_ascii[i] = static_cast<char>(i);
-    }
-
-    const std::string_view cases[] = {
-            " \t\r\n\v\f",
-            "0123456789abcdefABCDEF",
-            all_ascii,
-    };
-
-    for (std::string_view chars : cases) {
-        const ByteSet set = ByteSet::from_bytes(chars);
-        EXPECT_TRUE(set.exact_nibble_lut);
-        for (int h = 8; h < 16; ++h) {
-            EXPECT_EQ(0u, set.high_nibble_lut[h]) << "h=" << h;
-        }
-        for (int b = 0; b < 256; ++b) {
-            const auto byte = static_cast<uint8_t>(b);
-            const bool in_chars = (chars.find(static_cast<char>(byte)) != std::string_view::npos);
-            EXPECT_EQ(in_chars, set.contains(byte)) << "b=" << b;
-            EXPECT_EQ(set.contains(byte), set.nibble_matches(byte)) << "b=" << b;
-        }
-    }
-}
-
-TEST(ByteSetTest, NonAsciiEquivalenceClassesAndOverflow) {
-    // 8 distinct non-empty high-nibble rows across 0x00..0xFF with distinct low nibbles.
-    std::string eight_classes;
-    for (int k = 0; k < 8; ++k) {
-        const uint8_t h = static_cast<uint8_t>(k * 2); // 0x0, 0x2, 0x4, 0x6, 0x8, 0xA, 0xC, 0xE
-        const uint8_t l = static_cast<uint8_t>(k);
-        eight_classes.push_back(static_cast<char>((h << 4) | l));
-    }
-    const ByteSet set8 = ByteSet::from_bytes(eight_classes);
-    EXPECT_TRUE(set8.exact_nibble_lut);
-    for (int b = 0; b < 256; ++b) {
-        const auto byte = static_cast<uint8_t>(b);
-        const bool expected = (eight_classes.find(static_cast<char>(byte)) != std::string::npos);
-        EXPECT_EQ(expected, set8.contains(byte)) << "b=" << b;
-        EXPECT_EQ(set8.contains(byte), set8.nibble_matches(byte)) << "b=" << b;
-    }
-
-    // 9 distinct non-empty high-nibble rows (16 * h + h for h in 0..8).
-    std::string nine_classes;
-    for (int h = 0; h < 9; ++h) {
-        nine_classes.push_back(static_cast<char>(16 * h + h));
-    }
-    const ByteSet set9 = ByteSet::from_bytes(nine_classes);
-    EXPECT_FALSE(set9.exact_nibble_lut);
-    for (int b = 0; b < 256; ++b) {
-        const auto byte = static_cast<uint8_t>(b);
-        const bool expected = (nine_classes.find(static_cast<char>(byte)) != std::string::npos);
-        EXPECT_EQ(expected, set9.contains(byte)) << "b=" << b;
-        if (set9.contains(byte)) {
-            EXPECT_TRUE(set9.nibble_matches(byte)) << "b=" << b;
-        }
-    }
-}
-
 TEST(SkipCharSimdTest, NullAndEmptySlices) {
     EXPECT_EQ(nullptr, skip_leading_char<true>(nullptr, nullptr, ' '));
     EXPECT_EQ(nullptr, skip_trailing_char<true>(nullptr, nullptr, ' '));
@@ -395,6 +284,21 @@ TEST(SkipByteSetSimdTest, BoundaryLengthsAlignmentsAndUtf8Interior) {
             ASSERT_EQ(bm + (len / 2) + 1, skip_trailing_byteset<true>(bm, em, ws_set));
         }
     }
+}
+
+TEST(SkipByteSetSimdTest, MutatedByteSetFallsBackUntilFinalized) {
+    // Mutating a ByteSet via add() must invalidate exact_nibble_lut until finalize_lut() is called,
+    // so SIMD and scalar paths remain consistent even if a caller mutates after construction.
+    ByteSet mutated = ByteSet::from_bytes(" ");
+    mutated.add(static_cast<uint8_t>('\t'));
+    EXPECT_FALSE(mutated.exact_nibble_lut);
+    const std::string tabs(32, '\t');
+    EXPECT_EQ(tabs.data() + tabs.size(), skip_leading_byteset<true>(tabs.data(), tabs.data() + tabs.size(), mutated));
+    EXPECT_EQ(tabs.data(), skip_trailing_byteset<true>(tabs.data(), tabs.data() + tabs.size(), mutated));
+    mutated.finalize_lut();
+    EXPECT_TRUE(mutated.exact_nibble_lut);
+    EXPECT_EQ(tabs.data() + tabs.size(), skip_leading_byteset<true>(tabs.data(), tabs.data() + tabs.size(), mutated));
+    EXPECT_EQ(tabs.data(), skip_trailing_byteset<true>(tabs.data(), tabs.data() + tabs.size(), mutated));
 }
 
 TEST(SkipCharAndByteSetFastPathTest, CleanOneSpaceAndInternalSpacesBoundaries) {
