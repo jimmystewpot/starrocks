@@ -24,7 +24,7 @@
 
 #if defined(__x86_64__)
 #include <immintrin.h>
-#elif defined(__ARM_NEON)
+#elif defined(__ARM_NEON) && defined(__aarch64__)
 #include <arm_neon.h>
 #endif
 
@@ -260,6 +260,32 @@ private:
 #endif
 
 public:
+    enum class Kernel : uint8_t {
+        kScalar,
+        kSse41,
+        kAvx2,
+        kNeon,
+    };
+
+    static Kernel default_kernel() noexcept {
+        static const Kernel kDefaultKernel = []() noexcept {
+#if defined(__x86_64__)
+            if (__builtin_cpu_supports("avx2")) {
+                return Kernel::kAvx2;
+            }
+            if (__builtin_cpu_supports("sse4.1")) {
+                return Kernel::kSse41;
+            }
+            return Kernel::kScalar;
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+            return Kernel::kNeon;
+#else
+            return Kernel::kScalar;
+#endif
+        }();
+        return kDefaultKernel;
+    }
+
     template <typename CharT, typename = std::enable_if_t<sizeof(CharT) == 1>>
     StringSearcher(const CharT* needle_, const size_t needle_size_)
             : needle{reinterpret_cast<const uint8_t*>(needle_)}, needle_size(needle_size_) {
@@ -431,7 +457,7 @@ public:
 
         return _search_sse41_from(p, haystack_end);
     }
-#elif defined(__ARM_NEON)
+#elif defined(__ARM_NEON) && defined(__aarch64__)
     const uint8_t* search_neon(const uint8_t* haystack, const uint8_t* haystack_end) const {
         if (needle_size <= 1 || haystack == nullptr || haystack_end == nullptr || haystack >= haystack_end ||
             static_cast<size_t>(haystack_end - haystack) < (needle_size - 1) + 16) {
@@ -544,11 +570,16 @@ public:
     const CharT* search(const CharT* haystack, const CharT* const haystack_end) const {
         const auto* h = reinterpret_cast<const uint8_t*>(haystack);
         const auto* h_end = reinterpret_cast<const uint8_t*>(haystack_end);
-#if defined(__AVX2__)
-        return reinterpret_cast<const CharT*>(search_avx2(h, h_end));
-#elif defined(__SSE4_1__)
-        return reinterpret_cast<const CharT*>(search_sse41(h, h_end));
-#elif defined(__ARM_NEON)
+#if defined(__x86_64__)
+        switch (default_kernel()) {
+        case Kernel::kAvx2:
+            return reinterpret_cast<const CharT*>(search_avx2(h, h_end));
+        case Kernel::kSse41:
+            return reinterpret_cast<const CharT*>(search_sse41(h, h_end));
+        default:
+            return reinterpret_cast<const CharT*>(search_scalar(h, h_end));
+        }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
         return reinterpret_cast<const CharT*>(search_neon(h, h_end));
 #else
         return reinterpret_cast<const CharT*>(search_scalar(h, h_end));
@@ -557,6 +588,9 @@ public:
 
     template <typename CharT, typename = std::enable_if_t<sizeof(CharT) == 1>>
     const CharT* search(const CharT* haystack, const size_t haystack_size) const {
+        if (haystack == nullptr) {
+            return nullptr;
+        }
         return search(haystack, haystack + haystack_size);
     }
 
@@ -649,7 +683,7 @@ public:
 
         return _rsearch_sse41_upto(haystack, p, haystack_end);
     }
-#elif defined(__ARM_NEON)
+#elif defined(__ARM_NEON) && defined(__aarch64__)
     const uint8_t* rsearch_neon(const uint8_t* haystack, const uint8_t* haystack_end) const {
         if (needle_size <= 1 || haystack == nullptr || haystack_end == nullptr || haystack >= haystack_end ||
             static_cast<size_t>(haystack_end - haystack) < (needle_size - 1) + 16) {
@@ -761,11 +795,16 @@ public:
     const CharT* rsearch(const CharT* haystack, const CharT* const haystack_end) const {
         const auto* h = reinterpret_cast<const uint8_t*>(haystack);
         const auto* h_end = reinterpret_cast<const uint8_t*>(haystack_end);
-#if defined(__AVX2__)
-        return reinterpret_cast<const CharT*>(rsearch_avx2(h, h_end));
-#elif defined(__SSE4_1__)
-        return reinterpret_cast<const CharT*>(rsearch_sse41(h, h_end));
-#elif defined(__ARM_NEON)
+#if defined(__x86_64__)
+        switch (default_kernel()) {
+        case Kernel::kAvx2:
+            return reinterpret_cast<const CharT*>(rsearch_avx2(h, h_end));
+        case Kernel::kSse41:
+            return reinterpret_cast<const CharT*>(rsearch_sse41(h, h_end));
+        default:
+            return reinterpret_cast<const CharT*>(rsearch_scalar(h, h_end));
+        }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
         return reinterpret_cast<const CharT*>(rsearch_neon(h, h_end));
 #else
         return reinterpret_cast<const CharT*>(rsearch_scalar(h, h_end));
@@ -774,6 +813,9 @@ public:
 
     template <typename CharT, typename = std::enable_if_t<sizeof(CharT) == 1>>
     const CharT* rsearch(const CharT* haystack, const size_t haystack_size) const {
+        if (haystack == nullptr) {
+            return nullptr;
+        }
         return rsearch(haystack, haystack + haystack_size);
     }
 };

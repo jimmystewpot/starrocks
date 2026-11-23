@@ -39,7 +39,7 @@ static std::vector<const uint8_t*> run_all_kernels(const StringSearcher& s, cons
 #if defined(__x86_64__)
         if (__builtin_cpu_supports("sse4.1")) r.push_back(s.search_sse41(b, e));
         if (__builtin_cpu_supports("avx2")) r.push_back(s.search_avx2(b, e));
-#elif defined(__ARM_NEON)
+#elif defined(__ARM_NEON) && defined(__aarch64__)
         r.push_back(s.search_neon(b, e));
 #endif
     }
@@ -305,7 +305,7 @@ static std::vector<const uint8_t*> run_all_rkernels(const StringSearcher& s, con
 #if defined(__x86_64__)
         if (__builtin_cpu_supports("sse4.1")) r.push_back(s.rsearch_sse41(b, e));
         if (__builtin_cpu_supports("avx2")) r.push_back(s.rsearch_avx2(b, e));
-#elif defined(__ARM_NEON)
+#elif defined(__ARM_NEON) && defined(__aarch64__)
         r.push_back(s.rsearch_neon(b, e));
 #endif
     }
@@ -519,6 +519,133 @@ TEST_F(StringSearcherTest, LongRepetitiveNeedleForwardAndReverseBoundedTime) {
             std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_tp).count();
     EXPECT_LT(elapsed_ms, 500) << "Long repetitive needle search degraded to quadratic complexity: " << elapsed_ms
                                << " ms";
+}
+
+TEST_F(StringSearcherTest, RuntimeDispatchSelectsBestIsa) {
+#if defined(__x86_64__)
+    if (__builtin_cpu_supports("avx2")) {
+        EXPECT_EQ(StringSearcher::Kernel::kAvx2, StringSearcher::default_kernel());
+    } else if (__builtin_cpu_supports("sse4.1")) {
+        EXPECT_EQ(StringSearcher::Kernel::kSse41, StringSearcher::default_kernel());
+    } else {
+        EXPECT_EQ(StringSearcher::Kernel::kScalar, StringSearcher::default_kernel());
+    }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    EXPECT_EQ(StringSearcher::Kernel::kNeon, StringSearcher::default_kernel());
+#else
+    EXPECT_EQ(StringSearcher::Kernel::kScalar, StringSearcher::default_kernel());
+#endif
+}
+
+TEST_F(StringSearcherTest, RSearchKernelParityBoundaryAndEdgeCases) {
+    auto run_all_rkernels_unconditional = [](const StringSearcher& s, const uint8_t* b, const uint8_t* e) {
+        std::vector<const uint8_t*> r{s.rsearch(b, e), s.rsearch_scalar(b, e)};
+#if defined(__x86_64__)
+        if (__builtin_cpu_supports("sse4.1")) {
+            r.push_back(s.rsearch_sse41(b, e));
+        }
+        if (__builtin_cpu_supports("avx2")) {
+            r.push_back(s.rsearch_avx2(b, e));
+        }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+        r.push_back(s.rsearch_neon(b, e));
+#endif
+        return r;
+    };
+
+    // 1. Empty and null haystacks across empty, 1-byte, short, and >64-byte needles.
+    TightBuffer empty_hay("");
+    for (size_t needle_len : {size_t(0), size_t(1), size_t(2), size_t(5), size_t(16), size_t(32), size_t(65)}) {
+        std::string needle(needle_len, 'a');
+        StringSearcher searcher(needle.data(), needle.size());
+        for (const auto* r : run_all_rkernels_unconditional(searcher, nullptr, nullptr)) {
+            EXPECT_EQ(nullptr, r) << "needle_len=" << needle_len;
+        }
+        EXPECT_EQ(nullptr, searcher.rsearch(static_cast<const char*>(nullptr), size_t(0)))
+                << "needle_len=" << needle_len;
+        for (const auto* r : run_all_rkernels_unconditional(searcher, empty_hay.begin(), empty_hay.end())) {
+            EXPECT_EQ(empty_hay.end(), r) << "needle_len=" << needle_len;
+        }
+    }
+
+    // 2. Boundary haystack lengths 1..65 plus 80, 96, 128 across representative needle lengths.
+    std::vector<size_t> hay_lens;
+    for (size_t h = 1; h <= 65; ++h) {
+        hay_lens.push_back(h);
+    }
+    hay_lens.push_back(80);
+    hay_lens.push_back(96);
+    hay_lens.push_back(128);
+
+    for (size_t needle_len : {size_t(1), size_t(2), size_t(3), size_t(7), size_t(15), size_t(16), size_t(17),
+                              size_t(31), size_t(32), size_t(33), size_t(63), size_t(64), size_t(65)}) {
+        std::string needle(needle_len, 'm');
+        needle.front() = 'F';
+        needle.back() = 'L';
+        if (needle_len > 2) {
+            needle[needle_len / 2] = 'C';
+        }
+        TightBuffer ndl(needle);
+        StringSearcher searcher(ndl.begin(), ndl.size());
+
+        for (size_t hay_len : hay_lens) {
+            std::string miss_str(hay_len, 'x');
+            TightBuffer miss_buf(miss_str);
+            for (const auto* r : run_all_rkernels_unconditional(searcher, miss_buf.begin(), miss_buf.end())) {
+                EXPECT_EQ(miss_buf.end(), r) << "miss needle_len=" << needle_len << " hay_len=" << hay_len;
+            }
+
+            if (hay_len >= needle_len) {
+                const size_t max_pos = hay_len - needle_len;
+                for (size_t pos : {size_t(0), max_pos / 2, max_pos}) {
+                    std::string hit_str(hay_len, 'x');
+                    hit_str.replace(pos, needle_len, needle);
+                    TightBuffer hit_buf(hit_str);
+                    for (const auto* r : run_all_rkernels_unconditional(searcher, hit_buf.begin(), hit_buf.end())) {
+                        EXPECT_EQ(hit_buf.begin() + pos, r)
+                                << "hit needle_len=" << needle_len << " hay_len=" << hay_len << " pos=" << pos;
+                    }
+                }
+                if (hay_len >= 2 * needle_len) {
+                    std::string multi_str(hay_len, 'x');
+                    multi_str.replace(0, needle_len, needle);
+                    multi_str.replace(max_pos, needle_len, needle);
+                    TightBuffer multi_buf(multi_str);
+                    for (const auto* r : run_all_rkernels_unconditional(searcher, multi_buf.begin(), multi_buf.end())) {
+                        EXPECT_EQ(multi_buf.begin() + max_pos, r)
+                                << "multi needle_len=" << needle_len << " hay_len=" << hay_len;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Repetitive needles with decoys across SIMD window boundaries.
+    const std::vector<std::string> repetitive_needles = {
+            "aa",
+            "aaa",
+            "ababab",
+            "aaaaab",
+            "baaaaa",
+            std::string(31, 'a') + "b",
+            "a" + std::string(30, 'b') + "a",
+            std::string(32, 'a') + "b" + std::string(32, 'a'),
+    };
+    for (const std::string& needle : repetitive_needles) {
+        TightBuffer ndl(needle);
+        StringSearcher searcher(ndl.begin(), ndl.size());
+        for (size_t prefix_len : {size_t(0), size_t(1), size_t(15), size_t(16), size_t(17), size_t(31), size_t(32),
+                                  size_t(33), size_t(64), size_t(65)}) {
+            std::string hay =
+                    std::string(prefix_len, 'a') + needle + std::string(17, 'a') + needle + std::string(35, 'a');
+            TightBuffer tb(hay);
+            const size_t expected_pos = std::string_view(hay).rfind(needle);
+            ASSERT_NE(std::string_view::npos, expected_pos);
+            for (const auto* r : run_all_rkernels_unconditional(searcher, tb.begin(), tb.end())) {
+                EXPECT_EQ(tb.begin() + expected_pos, r) << "needle=" << needle << " prefix_len=" << prefix_len;
+            }
+        }
+    }
 }
 
 } // namespace starrocks
