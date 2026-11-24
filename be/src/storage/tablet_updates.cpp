@@ -289,10 +289,12 @@ Status TabletUpdates::_load_from_pb(const TabletUpdatesPB& tablet_updates_pb) {
     }
 
     RETURN_IF_ERROR(_load_meta_and_log(tablet_updates_pb));
+    _applied_version_seq.fetch_add(1, std::memory_order_release);
 
     {
         std::lock_guard lg(_rowset_stats_lock);
         _rowset_stats.clear();
+        _invalidate_compaction_score_cache_unlocked();
     }
     std::set<uint32_t> unapplied_rowsets;
     auto st = _load_rowsets_and_check_consistency(unapplied_rowsets);
@@ -1275,6 +1277,7 @@ Status TabletUpdates::_apply_column_partial_update_commit(const EditVersionInfo&
         // 5. apply memory
         _next_log_id++;
         _apply_version_idx++;
+        _applied_version_seq.fetch_add(1, std::memory_order_release);
         _apply_version_changed.notify_all();
     }
 
@@ -1838,6 +1841,7 @@ Status TabletUpdates::_apply_normal_rowset_commit(const EditVersionInfo& version
         // 5. apply memory
         _next_log_id++;
         _apply_version_idx++;
+        _applied_version_seq.fetch_add(1, std::memory_order_release);
         _apply_version_changed.notify_all();
     }
 
@@ -1889,6 +1893,7 @@ Status TabletUpdates::_apply_normal_rowset_commit(const EditVersionInfo& version
     } else {
         manager->index_cache().release(index_entry);
     }
+    TEST_SYNC_POINT("TabletUpdates::_apply_normal_rowset_commit:before_update_total_stats");
     _update_total_stats(version_info.rowsets, nullptr, nullptr);
     int64_t t_write = MonotonicMillis();
 
@@ -2633,6 +2638,7 @@ Status TabletUpdates::_apply_compaction_commit(const EditVersionInfo& version_in
         // 5. apply memory
         _next_log_id++;
         _apply_version_idx++;
+        _applied_version_seq.fetch_add(1, std::memory_order_release);
         _apply_version_changed.notify_all();
     }
 
@@ -2885,16 +2891,158 @@ void TabletUpdates::remove_expired_versions(int64_t expire_time) {
     _remove_unused_rowsets();
 }
 
+int64_t TabletUpdates::_scale_compaction_score(int64_t raw_score) {
+    if (raw_score < 0) {
+        return -1;
+    }
+    // scale score to a reasonable range relative to the number of files * 10
+    return raw_score / std::max<int64_t>(1, config::update_compaction_size_threshold / 10);
+}
+
+void TabletUpdates::_publish_compaction_score_cache_unlocked(uint64_t applied_seq, int64_t raw_score,
+                                                             bool size_tiered_enabled, const LevelConfig& level_cfg) {
+    const uint64_t seq = _compaction_score_cache_seqlock.load(std::memory_order_relaxed);
+    // Mark write in progress (odd).
+    _compaction_score_cache_seqlock.store(seq + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+
+    _cached_applied_seq.store(applied_seq, std::memory_order_relaxed);
+    _cached_raw_compaction_score.store(raw_score, std::memory_order_relaxed);
+    _cached_size_tiered_enabled.store(size_tiered_enabled, std::memory_order_relaxed);
+    _cached_min_level_size.store(level_cfg.min_level_size, std::memory_order_relaxed);
+    _cached_level_multiple.store(level_cfg.level_multiple, std::memory_order_relaxed);
+    _cached_level_num.store(level_cfg.level_num, std::memory_order_relaxed);
+    _cached_score_valid.store(true, std::memory_order_relaxed);
+
+    // Publish completed write (even).
+    _compaction_score_cache_seqlock.store(seq + 2, std::memory_order_release);
+}
+
+void TabletUpdates::_invalidate_compaction_score_cache_unlocked() {
+    const uint64_t seq = _compaction_score_cache_seqlock.load(std::memory_order_relaxed);
+    _compaction_score_cache_seqlock.store(seq + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    _cached_score_valid.store(false, std::memory_order_relaxed);
+    _compaction_score_cache_seqlock.store(seq + 2, std::memory_order_release);
+}
+
+int64_t TabletUpdates::_calc_raw_compaction_score_unlocked(const std::vector<uint32_t>& rowsets,
+                                                           bool size_tiered_enabled, bool* has_error) {
+    int64_t total_score = 0;
+    size_t total_inputs = 0;
+    size_t total_deletes = 0;
+    bool has_size_tiered_candidate = false;
+    uint64_t seen_levels_mask = 0;
+    std::vector<int32_t> overflow_levels;
+    *has_error = false;
+
+    for (auto rowsetid : rowsets) {
+        auto itr = _rowset_stats.find(rowsetid);
+        if (itr == _rowset_stats.end()) {
+            // should not happen
+            string msg = strings::Substitute("rowset not found in rowset stats tablet=$0 rowset=$1",
+                                             _tablet.tablet_id(), rowsetid);
+            DCHECK(false) << msg;
+            LOG(WARNING) << msg;
+            *has_error = true;
+            return -1;
+        }
+        const RowsetStats* stat = itr->second.get();
+        if (stat->compaction_score > 0) {
+            const size_t inputs = std::max<size_t>(1, stat->num_segments);
+            total_score += stat->compaction_score;
+            total_inputs += inputs;
+            total_deletes += stat->num_dels;
+            if (size_tiered_enabled && !has_size_tiered_candidate) {
+                if (inputs > 1 || stat->num_dels > 0) {
+                    has_size_tiered_candidate = true;
+                } else {
+                    const int32_t level = stat->compaction_level;
+                    const int64_t shifted = static_cast<int64_t>(level) + 1;
+                    if (shifted >= 0 && shifted < 64) {
+                        const uint64_t bit = uint64_t{1} << shifted;
+                        if ((seen_levels_mask & bit) != 0) {
+                            has_size_tiered_candidate = true;
+                        } else {
+                            seen_levels_mask |= bit;
+                        }
+                    } else if (std::find(overflow_levels.begin(), overflow_levels.end(), level) !=
+                               overflow_levels.end()) {
+                        has_size_tiered_candidate = true;
+                    } else {
+                        overflow_levels.push_back(level);
+                    }
+                }
+            }
+        }
+    }
+    if (total_inputs == 1 && total_deletes == 0) {
+        // only 1 input and no delete, no need to do compaction
+        return -1;
+    }
+    if (size_tiered_enabled && !has_size_tiered_candidate) {
+        return -1;
+    }
+    return total_score;
+}
+
+bool TabletUpdates::peek_compaction_score(int64_t now_ms, int64_t* score) const {
+    if (_compaction_running.load(std::memory_order_relaxed) || _error.load(std::memory_order_relaxed)) {
+        *score = -1;
+        return true;
+    }
+    if (_last_compaction_time_ms.load(std::memory_order_relaxed) +
+                config::update_compaction_per_tablet_min_interval_seconds * 1000 >
+        now_ms) {
+        *score = -1;
+        return true;
+    }
+
+    const uint64_t seq1 = _compaction_score_cache_seqlock.load(std::memory_order_acquire);
+    if ((seq1 & 1) != 0) {
+        return false;
+    }
+
+    const bool valid = _cached_score_valid.load(std::memory_order_relaxed);
+    const uint64_t cached_applied_seq = _cached_applied_seq.load(std::memory_order_relaxed);
+    const int64_t raw_score = _cached_raw_compaction_score.load(std::memory_order_relaxed);
+    const bool cached_size_tiered = _cached_size_tiered_enabled.load(std::memory_order_relaxed);
+    const LevelConfig cached_level_cfg{
+            _cached_min_level_size.load(std::memory_order_relaxed),
+            _cached_level_multiple.load(std::memory_order_relaxed),
+            _cached_level_num.load(std::memory_order_relaxed),
+    };
+
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const uint64_t seq2 = _compaction_score_cache_seqlock.load(std::memory_order_relaxed);
+    if (seq1 != seq2 || !valid) {
+        return false;
+    }
+
+    if (cached_applied_seq != _applied_version_seq.load(std::memory_order_acquire)) {
+        return false;
+    }
+
+    if (cached_size_tiered != config::enable_pk_size_tiered_compaction_strategy ||
+        cached_level_cfg != _current_level_config()) {
+        return false;
+    }
+
+    *score = _scale_compaction_score(raw_score);
+    return true;
+}
+
 int64_t TabletUpdates::get_compaction_score() {
-    if (_compaction_running || _error) {
-        // don't do compaction
+    const int64_t now_ms = UnixMillis();
+    int64_t peeked = -1;
+    const bool peek_valid = peek_compaction_score(now_ms, &peeked);
+    if (peek_valid && peeked < 0) {
+        // Lock-free negative fast path (compaction running, error, cooldown, or cached -1).
         return -1;
     }
-    if (_last_compaction_time_ms + config::update_compaction_per_tablet_min_interval_seconds * 1000 > UnixMillis()) {
-        // don't do compaction
-        return -1;
-    }
-    vector<uint32_t> rowsets;
+
+    int64_t raw_score = -1;
+    bool has_error = false;
     {
         std::lock_guard rl(_lock);
         if (_edit_version_infos.empty()) {
@@ -2919,40 +3067,21 @@ int64_t TabletUpdates::get_compaction_score() {
                 return -1;
             }
         }
-        rowsets = _edit_version_infos[_apply_version_idx]->rowsets;
-    }
-    int64_t total_score = 0;
-    size_t total_inputs = 0;
-    size_t total_deletes = 0;
-    bool has_error = false;
-    std::map<int32_t, std::pair<size_t, size_t>> candidates_by_level;
-    {
-        std::lock_guard lg(_rowset_stats_lock);
-        for (auto rowsetid : rowsets) {
-            auto itr = _rowset_stats.find(rowsetid);
-            if (itr == _rowset_stats.end()) {
-                // should not happen
-                string msg = strings::Substitute("rowset not found in rowset stats tablet=$0 rowset=$1",
-                                                 _tablet.tablet_id(), rowsetid);
-                DCHECK(false) << msg;
-                LOG(WARNING) << msg;
-                has_error = true;
-                break;
-            } else if (itr->second->compaction_score > 0) {
-                total_score += itr->second->compaction_score;
-                total_inputs += std::max(1UL, itr->second->num_segments);
-                total_deletes += itr->second->num_dels;
-                if (config::enable_pk_size_tiered_compaction_strategy) {
-                    int32_t level = _calc_compaction_level(itr->second.get());
-                    auto candidate_itr = candidates_by_level.find(level);
-                    if (candidate_itr == candidates_by_level.end()) {
-                        candidates_by_level[level] =
-                                std::make_pair(std::max(1UL, itr->second->num_segments), itr->second->num_dels);
-                    } else {
-                        candidate_itr->second.first += std::max(1UL, itr->second->num_segments);
-                        candidate_itr->second.second += itr->second->num_dels;
-                    }
-                }
+
+        if (peek_compaction_score(now_ms, &peeked)) {
+            return peeked;
+        }
+
+        const uint64_t applied_seq = _applied_version_seq.load(std::memory_order_acquire);
+        const bool size_tiered_enabled = config::enable_pk_size_tiered_compaction_strategy;
+        const LevelConfig level_cfg = _current_level_config();
+        {
+            std::lock_guard lg(_rowset_stats_lock);
+            _refresh_rowset_stats_levels_unlocked(level_cfg);
+            raw_score = _calc_raw_compaction_score_unlocked(_edit_version_infos[_apply_version_idx]->rowsets,
+                                                            size_tiered_enabled, &has_error);
+            if (!has_error) {
+                _publish_compaction_score_cache_unlocked(applied_seq, raw_score, size_tiered_enabled, level_cfg);
             }
         }
     }
@@ -2961,24 +3090,7 @@ int64_t TabletUpdates::get_compaction_score() {
         // do not do compaction
         return -1;
     }
-    if (total_inputs == 1 && total_deletes == 0) {
-        // only 1 input and no delete, no need to do compaction
-        return -1;
-    }
-    if (config::enable_pk_size_tiered_compaction_strategy) {
-        bool flag = false;
-        for (auto [_, candidate] : candidates_by_level) {
-            if (candidate.first > 1 || (candidate.first == 1 && candidate.second > 0)) {
-                flag = true;
-                break;
-            }
-        }
-        if (!flag) {
-            return -1;
-        }
-    }
-    // scale score to a reasonable range relative to the number of files * 10
-    return total_score / std::max<int64_t>(1, config::update_compaction_size_threshold / 10);
+    return _scale_compaction_score(raw_score);
 }
 
 struct CompactionEntry {
@@ -3105,7 +3217,7 @@ Status TabletUpdates::compaction(MemTracker* mem_tracker) {
         }
     }
     // give 10s time gitter, so same table's compaction don't start at same time
-    _last_compaction_time_ms = UnixMillis() + ThreadLocalRandomUniform(10000);
+    _last_compaction_time_ms.store(UnixMillis() + ThreadLocalRandomUniform(10000), std::memory_order_relaxed);
     if (info->inputs.empty()) {
         VLOG(2) << "no candidate rowset to do update compaction, tablet:" << _tablet.tablet_id();
         _compaction_running = false;
@@ -3309,7 +3421,7 @@ Status TabletUpdates::compaction_for_size_tiered(MemTracker* mem_tracker) {
                 _tablet.tablet_id(), version_count, _pending_commits.size());
     } else {
         // give 10s time gitter, so same table's compaction don't start at same time
-        _last_compaction_time_ms = UnixMillis() + ThreadLocalRandomUniform(10000);
+        _last_compaction_time_ms.store(UnixMillis() + ThreadLocalRandomUniform(10000), std::memory_order_relaxed);
     }
 
     int64_t del_rows = total_rows - stat.num_rows;
@@ -4108,9 +4220,9 @@ Status TabletUpdates::link_from(Tablet* base_tablet, int64_t request_version, Ch
     RETURN_IF_ERROR(base_tablet->updates()->get_applied_rowsets(request_version, &rowsets, &version));
 
     // disable compaction temporarily when tablet just loaded
-    int64_t prev_last_compaction_time_ms = _last_compaction_time_ms;
-    DeferOp op([&] { _last_compaction_time_ms = prev_last_compaction_time_ms; });
-    _last_compaction_time_ms = UnixMillis();
+    int64_t prev_last_compaction_time_ms = _last_compaction_time_ms.load(std::memory_order_relaxed);
+    DeferOp op([&] { _last_compaction_time_ms.store(prev_last_compaction_time_ms, std::memory_order_relaxed); });
+    _last_compaction_time_ms.store(UnixMillis(), std::memory_order_relaxed);
 
     // 1. construct new rowsets
     auto kv_store = _tablet.data_dir()->get_meta();
@@ -4316,9 +4428,9 @@ Status TabletUpdates::convert_from(const std::shared_ptr<Tablet>& base_tablet, i
     EditVersion version;
     RETURN_IF_ERROR(base_tablet->updates()->get_applied_rowsets(request_version, &src_rowsets, &version));
     // disable compaction temporarily when tablet just loaded
-    int64_t prev_last_compaction_time_ms = _last_compaction_time_ms;
-    DeferOp op([&] { _last_compaction_time_ms = prev_last_compaction_time_ms; });
-    _last_compaction_time_ms = UnixMillis();
+    int64_t prev_last_compaction_time_ms = _last_compaction_time_ms.load(std::memory_order_relaxed);
+    DeferOp op([&] { _last_compaction_time_ms.store(prev_last_compaction_time_ms, std::memory_order_relaxed); });
+    _last_compaction_time_ms.store(UnixMillis(), std::memory_order_relaxed);
 
     auto kv_store = _tablet.data_dir()->get_meta();
     auto tablet_id = _tablet.tablet_id();
@@ -4573,9 +4685,9 @@ Status TabletUpdates::reorder_from(const std::shared_ptr<Tablet>& base_tablet, i
     std::unique_ptr<MemPool> mem_pool(new MemPool());
 
     // disable compaction temporarily when tablet just loaded
-    int64_t prev_last_compaction_time_ms = _last_compaction_time_ms;
-    DeferOp op([&] { _last_compaction_time_ms = prev_last_compaction_time_ms; });
-    _last_compaction_time_ms = UnixMillis();
+    int64_t prev_last_compaction_time_ms = _last_compaction_time_ms.load(std::memory_order_relaxed);
+    DeferOp op([&] { _last_compaction_time_ms.store(prev_last_compaction_time_ms, std::memory_order_relaxed); });
+    _last_compaction_time_ms.store(UnixMillis(), std::memory_order_relaxed);
 
     auto kv_store = _tablet.data_dir()->get_meta();
     auto tablet_id = _tablet.tablet_id();
@@ -5001,9 +5113,9 @@ Status TabletUpdates::load_snapshot(const SnapshotMeta& snapshot_meta, bool rest
                                     _tablet.tablet_id(), _error_msg));
     }
     // disable compaction temporarily when doing load_snapshot
-    int64_t prev_last_compaction_time_ms = _last_compaction_time_ms;
-    DeferOp op([&] { _last_compaction_time_ms = prev_last_compaction_time_ms; });
-    _last_compaction_time_ms = UnixMillis();
+    int64_t prev_last_compaction_time_ms = _last_compaction_time_ms.load(std::memory_order_relaxed);
+    DeferOp op([&] { _last_compaction_time_ms.store(prev_last_compaction_time_ms, std::memory_order_relaxed); });
+    _last_compaction_time_ms.store(UnixMillis(), std::memory_order_relaxed);
 
     // A utility function used to ensure that segment files have been placed under the
     // tablet directory.
@@ -5138,6 +5250,8 @@ Status TabletUpdates::load_snapshot(const SnapshotMeta& snapshot_meta, bool rest
         STLClearObject(&_rowset_stats);
 
         _apply_version_idx = 0;
+        _applied_version_seq.fetch_add(1, std::memory_order_release);
+        _invalidate_compaction_score_cache_unlocked();
         _rowsets = std::move(new_rowsets);
 
         auto& new_version = _edit_version_infos.emplace_back(std::make_unique<EditVersionInfo>());
@@ -5316,28 +5430,83 @@ Status TabletUpdates::clear_meta() {
     STLClearObject(&_rowset_stats);
     // If this get cleared, every other thread that uses variable should recheck it's valid state after acquiring _lock
     STLClearObject(&_edit_version_infos);
+    _applied_version_seq.fetch_add(1, std::memory_order_release);
+    _invalidate_compaction_score_cache_unlocked();
     return Status::OK();
 }
 
 void TabletUpdates::_update_total_stats(const std::vector<uint32_t>& rowsets, size_t* row_count_before,
                                         size_t* row_count_after) {
+    const uint64_t applied_seq = _applied_version_seq.load(std::memory_order_acquire);
+    const bool size_tiered_enabled = config::enable_pk_size_tiered_compaction_strategy;
+    const LevelConfig level_cfg = _current_level_config();
+
     std::lock_guard l(_rowset_stats_lock);
+    _refresh_rowset_stats_levels_unlocked(level_cfg);
     if (row_count_before != nullptr) {
         *row_count_before = _cur_total_rows - _cur_total_dels;
     }
     size_t nrow = 0;
     size_t ndel = 0;
+    int64_t total_score = 0;
+    size_t total_inputs = 0;
+    size_t total_deletes = 0;
+    bool has_error = false;
+    bool has_size_tiered_candidate = false;
+    uint64_t seen_levels_mask = 0;
+    std::vector<int32_t> overflow_levels;
     for (auto rid : rowsets) {
         auto itr = _rowset_stats.find(rid);
         if (itr != _rowset_stats.end()) {
-            nrow += itr->second->num_rows;
-            ndel += itr->second->num_dels;
+            const RowsetStats* stat = itr->second.get();
+            nrow += stat->num_rows;
+            ndel += stat->num_dels;
+            if (stat->compaction_score > 0) {
+                const size_t inputs = std::max<size_t>(1, stat->num_segments);
+                total_score += stat->compaction_score;
+                total_inputs += inputs;
+                total_deletes += stat->num_dels;
+                if (size_tiered_enabled && !has_size_tiered_candidate) {
+                    if (inputs > 1 || stat->num_dels > 0) {
+                        has_size_tiered_candidate = true;
+                    } else {
+                        const int32_t level = stat->compaction_level;
+                        const int64_t shifted = static_cast<int64_t>(level) + 1;
+                        if (shifted >= 0 && shifted < 64) {
+                            const uint64_t bit = uint64_t{1} << shifted;
+                            if ((seen_levels_mask & bit) != 0) {
+                                has_size_tiered_candidate = true;
+                            } else {
+                                seen_levels_mask |= bit;
+                            }
+                        } else if (std::find(overflow_levels.begin(), overflow_levels.end(), level) !=
+                                   overflow_levels.end()) {
+                            has_size_tiered_candidate = true;
+                        } else {
+                            overflow_levels.push_back(level);
+                        }
+                    }
+                }
+            }
+        } else {
+            LOG(WARNING) << "rowset not found in rowset stats tablet=" << _tablet.tablet_id() << " rowset=" << rid;
+            has_error = true;
         }
     }
     _cur_total_rows = nrow;
     _cur_total_dels = ndel;
     if (row_count_after != nullptr) {
         *row_count_after = _cur_total_rows - _cur_total_dels;
+    }
+
+    if (has_error) {
+        _invalidate_compaction_score_cache_unlocked();
+    } else {
+        int64_t raw_score = total_score;
+        if ((total_inputs == 1 && total_deletes == 0) || (size_tiered_enabled && !has_size_tiered_candidate)) {
+            raw_score = -1;
+        }
+        _publish_compaction_score_cache_unlocked(applied_seq, raw_score, size_tiered_enabled, level_cfg);
     }
 }
 
@@ -5889,7 +6058,15 @@ Status TabletUpdates::recover() {
         _calc_compaction_score(stats.get());
         _rowset_stats[rsid] = std::move(stats);
     }
+    l2.unlock();
     LOG(INFO) << "Primary tablet rebuild rowset stats finish. tablet_id: " << _tablet.tablet_id();
+
+    {
+        std::lock_guard l1(_lock);
+        _applied_version_seq.fetch_add(1, std::memory_order_release);
+        std::lock_guard stats_lg(_rowset_stats_lock);
+        _invalidate_compaction_score_cache_unlocked();
+    }
 
     // reset error state
     _error_msg = "";
@@ -6060,7 +6237,7 @@ Status TabletUpdates::compaction_random(MemTracker* mem_tracker) {
     }
 
     // give 10s time gitter, so same table's compaction don't start at same time
-    _last_compaction_time_ms = UnixMillis() + ThreadLocalRandomUniform(10000);
+    _last_compaction_time_ms.store(UnixMillis() + ThreadLocalRandomUniform(10000), std::memory_order_relaxed);
     if (info->inputs.empty()) {
         VLOG(2) << "no candidate rowset to do update compaction, tablet:" << _tablet.tablet_id();
         _compaction_running = false;

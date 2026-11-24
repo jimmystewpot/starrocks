@@ -188,6 +188,12 @@ public:
     // TODO(cbl): estimate more suitable values
     int64_t get_compaction_score();
 
+    // Lock-free cache peek for compaction score. Returns true and sets |*score| when the
+    // cached score is valid for the current applied version and live strategy/level configs
+    // (or when fast-path veto states such as compaction running / error / cooldown apply).
+    // Returns false on cache miss, concurrent seqlock write, or strategy/level config change.
+    bool peek_compaction_score(int64_t now_ms, int64_t* score) const;
+
     // perform compaction, should only be called by compaction thread
     Status compaction(MemTracker* mem_tracker);
     Status compaction_for_size_tiered(MemTracker* mem_tracker);
@@ -523,7 +529,7 @@ private:
     void stop_compaction(bool running) {
         _compaction_running = running;
         if (running) {
-            _last_compaction_time_ms = UnixMillis();
+            _last_compaction_time_ms.store(UnixMillis(), std::memory_order_relaxed);
         }
     }
     void wait_apply_done() { _wait_apply_done(); }
@@ -582,7 +588,7 @@ private:
     BlockingQueue<RowsetSharedPtr> _unused_rowsets;
 
     std::atomic<bool> _compaction_running{false};
-    int64_t _last_compaction_time_ms = 0;
+    std::atomic<int64_t> _last_compaction_time_ms{0};
     std::atomic<int64_t> _last_compaction_success_millis{0};
     std::atomic<int64_t> _last_compaction_failure_millis{0};
 
@@ -622,10 +628,34 @@ private:
         bool operator!=(const LevelConfig&) const = default;
     };
     static LevelConfig _current_level_config();
+    static int64_t _scale_compaction_score(int64_t raw_score);
     // Requires |_rowset_stats_lock| held.
     void _refresh_rowset_stats_levels_unlocked(const LevelConfig& level_cfg);
+    // Requires |_rowset_stats_lock| held.
+    int64_t _calc_raw_compaction_score_unlocked(const std::vector<uint32_t>& rowsets, bool size_tiered_enabled,
+                                                bool* has_error);
+    // Requires |_rowset_stats_lock| held (serializes seqlock writers).
+    void _publish_compaction_score_cache_unlocked(uint64_t applied_seq, int64_t raw_score, bool size_tiered_enabled,
+                                                  const LevelConfig& level_cfg);
+    // Requires |_rowset_stats_lock| held (serializes seqlock writers).
+    void _invalidate_compaction_score_cache_unlocked();
+
     // Protected by |_rowset_stats_lock|.
     LevelConfig _rowset_stats_level_cfg;
+
+    // Monotonically incremented under |_lock| whenever the applied version / rowset set changes.
+    std::atomic<uint64_t> _applied_version_seq{0};
+
+    // Even/odd seqlock protecting the cached raw compaction score payload below.
+    // Writers are serialized by |_rowset_stats_lock|.
+    std::atomic<uint64_t> _compaction_score_cache_seqlock{0};
+    std::atomic<bool> _cached_score_valid{false};
+    std::atomic<uint64_t> _cached_applied_seq{0};
+    std::atomic<int64_t> _cached_raw_compaction_score{-1};
+    std::atomic<bool> _cached_size_tiered_enabled{false};
+    std::atomic<int64_t> _cached_min_level_size{0};
+    std::atomic<int64_t> _cached_level_multiple{0};
+    std::atomic<int64_t> _cached_level_num{0};
 };
 
 } // namespace starrocks

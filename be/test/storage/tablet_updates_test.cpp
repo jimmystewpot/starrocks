@@ -5174,6 +5174,409 @@ TEST_F(TabletUpdatesTest, test_rowset_stats_compaction_level_tracking) {
     }
 }
 
+namespace {
+
+int64_t calc_reference_compaction_score(TabletUpdates* updates) {
+    if (updates->_compaction_running || updates->_error) {
+        return -1;
+    }
+    if (updates->_last_compaction_time_ms.load(std::memory_order_relaxed) +
+                config::update_compaction_per_tablet_min_interval_seconds * 1000 >
+        UnixMillis()) {
+        return -1;
+    }
+    std::vector<uint32_t> rowsets;
+    {
+        std::lock_guard rl(updates->_lock);
+        if (updates->_edit_version_infos.empty()) {
+            return -1;
+        }
+        if (updates->_apply_version_idx + 2 < updates->_edit_version_infos.size() ||
+            updates->_pending_commits.size() >= 2) {
+            size_t version_count =
+                    updates->_edit_version_infos.back()->rowsets.size() + updates->_pending_commits.size();
+            if (version_count <= config::tablet_max_versions) {
+                return -1;
+            }
+        }
+        for (size_t i = updates->_apply_version_idx + 1; i < updates->_edit_version_infos.size(); i++) {
+            if (updates->_edit_version_infos[i]->compaction) {
+                return -1;
+            }
+        }
+        rowsets = updates->_edit_version_infos[updates->_apply_version_idx]->rowsets;
+    }
+    int64_t total_score = 0;
+    size_t total_inputs = 0;
+    size_t total_deletes = 0;
+    std::map<int32_t, std::pair<size_t, size_t>> candidates_by_level;
+    {
+        std::lock_guard lg(updates->_rowset_stats_lock);
+        for (auto rowsetid : rowsets) {
+            auto itr = updates->_rowset_stats.find(rowsetid);
+            if (itr == updates->_rowset_stats.end()) {
+                return -1;
+            } else if (itr->second->compaction_score > 0) {
+                total_score += itr->second->compaction_score;
+                total_inputs += std::max(1UL, itr->second->num_segments);
+                total_deletes += itr->second->num_dels;
+                if (config::enable_pk_size_tiered_compaction_strategy) {
+                    int32_t level = updates->_calc_compaction_level(itr->second.get());
+                    auto candidate_itr = candidates_by_level.find(level);
+                    if (candidate_itr == candidates_by_level.end()) {
+                        candidates_by_level[level] =
+                                std::make_pair(std::max(1UL, itr->second->num_segments), itr->second->num_dels);
+                    } else {
+                        candidate_itr->second.first += std::max(1UL, itr->second->num_segments);
+                        candidate_itr->second.second += itr->second->num_dels;
+                    }
+                }
+            }
+        }
+    }
+    if (total_inputs == 1 && total_deletes == 0) {
+        return -1;
+    }
+    if (config::enable_pk_size_tiered_compaction_strategy) {
+        bool flag = false;
+        for (auto [_, candidate] : candidates_by_level) {
+            if (candidate.first > 1 || (candidate.first == 1 && candidate.second > 0)) {
+                flag = true;
+                break;
+            }
+        }
+        if (!flag) {
+            return -1;
+        }
+    }
+    return total_score / std::max<int64_t>(1, config::update_compaction_size_threshold / 10);
+}
+
+} // namespace
+
+TEST_F(TabletUpdatesTest, test_compaction_score_cache_differential) {
+    const int64_t old_size_threshold = config::update_compaction_size_threshold;
+    const bool old_size_tiered = config::enable_pk_size_tiered_compaction_strategy;
+    const int64_t old_min_level_size = config::size_tiered_min_level_size;
+    const int64_t old_level_multiple = config::size_tiered_level_multiple;
+    const int64_t old_level_num = config::size_tiered_level_num;
+    const int64_t old_min_interval = config::update_compaction_per_tablet_min_interval_seconds;
+    DeferOp restore([&] {
+        config::update_compaction_size_threshold = old_size_threshold;
+        config::enable_pk_size_tiered_compaction_strategy = old_size_tiered;
+        config::size_tiered_min_level_size = old_min_level_size;
+        config::size_tiered_level_multiple = old_level_multiple;
+        config::size_tiered_level_num = old_level_num;
+        config::update_compaction_per_tablet_min_interval_seconds = old_min_interval;
+    });
+
+    config::update_compaction_per_tablet_min_interval_seconds = 0;
+
+    _tablet = create_tablet(100201, 100201);
+    _tablet->set_enable_persistent_index(false);
+    auto* u = _tablet->updates();
+
+    bool saw_neg_one = false;
+    bool saw_zero = false;
+    bool saw_positive = false;
+    auto check_score = [&]() {
+        int64_t ref = calc_reference_compaction_score(u);
+        int64_t actual = u->get_compaction_score();
+        EXPECT_EQ(ref, actual);
+        // Verify cached hit also matches.
+        EXPECT_EQ(ref, u->get_compaction_score());
+        if (actual == -1) {
+            saw_neg_one = true;
+        } else if (actual == 0) {
+            saw_zero = true;
+        } else if (actual > 0) {
+            saw_positive = true;
+        }
+    };
+
+    // Initial empty tablet: 0 when size-tiered disabled, -1 when size-tiered enabled.
+    config::enable_pk_size_tiered_compaction_strategy = false;
+    check_score();
+    config::enable_pk_size_tiered_compaction_strategy = true;
+    check_score();
+
+    std::mt19937 rng(20261124);
+    int64_t version = 2;
+    std::vector<int32_t> column_indexes = {0, 1};
+    std::shared_ptr<TabletSchema> partial_schema = TabletSchema::create(_tablet->tablet_schema(), column_indexes);
+
+    const std::vector<int64_t> thresholds = {1024, 1024 * 1024, 256 * 1024 * 1024};
+    const std::vector<int64_t> min_level_sizes = {64, 4096, 131072};
+    const std::vector<int64_t> level_multiples = {2, 5};
+    const std::vector<int64_t> level_nums = {0, 7, 70};
+
+    for (int step = 0; step < 12; ++step) {
+        int op = step % 5;
+        if (op == 0) {
+            // Insert batch of keys.
+            std::vector<int64_t> keys;
+            int count = 50 + static_cast<int>(rng() % 150);
+            int base = step * 100;
+            keys.reserve(count);
+            for (int i = 0; i < count; ++i) {
+                keys.push_back(base + i);
+            }
+            ASSERT_OK(_tablet->rowset_commit(version++, create_rowset(_tablet, keys)));
+            u->wait_apply_done();
+        } else if (op == 1) {
+            // Empty rowset (num_rows == 0).
+            ASSERT_OK(_tablet->rowset_commit(version++, create_rowset(_tablet, {})));
+            u->wait_apply_done();
+        } else if (op == 2) {
+            // Delete subset of previously inserted keys.
+            Int64Column deletes;
+            for (int i = 0; i < 30; ++i) {
+                deletes.append(static_cast<int64_t>(rng() % ((step + 1) * 100)));
+            }
+            ASSERT_OK(_tablet->rowset_commit(version++, create_rowset(_tablet, {}, &deletes)));
+            u->wait_apply_done();
+        } else if (op == 3) {
+            // Row-mode partial update.
+            std::vector<int64_t> pkeys;
+            for (int i = 0; i < 40; ++i) {
+                pkeys.push_back(static_cast<int64_t>(rng() % ((step + 1) * 100)));
+            }
+            RowsetSharedPtr partial_rowset = create_partial_rowset(_tablet, pkeys, column_indexes, partial_schema);
+            StorageEngine::instance()->update_manager()->on_rowset_finished(_tablet.get(), partial_rowset.get());
+            ASSERT_OK(_tablet->rowset_commit(version++, partial_rowset));
+            u->wait_apply_done();
+        } else {
+            // Compaction.
+            (void)u->compaction(_compaction_mem_tracker.get());
+            u->wait_apply_done();
+            u->_last_compaction_time_ms.store(0, std::memory_order_relaxed);
+        }
+
+        // Sweep all 5 runtime configs.
+        for (bool st_enabled : {false, true}) {
+            config::enable_pk_size_tiered_compaction_strategy = st_enabled;
+            config::update_compaction_size_threshold = thresholds[step % thresholds.size()];
+            config::size_tiered_min_level_size = min_level_sizes[step % min_level_sizes.size()];
+            config::size_tiered_level_multiple = level_multiples[step % level_multiples.size()];
+            for (int64_t lnum : level_nums) {
+                config::size_tiered_level_num = lnum;
+                check_score();
+            }
+        }
+    }
+
+    EXPECT_TRUE(saw_neg_one);
+    EXPECT_TRUE(saw_zero);
+    EXPECT_TRUE(saw_positive);
+}
+
+TEST_F(TabletUpdatesTest, test_peek_compaction_score_states) {
+    const int64_t old_size_threshold = config::update_compaction_size_threshold;
+    const bool old_size_tiered = config::enable_pk_size_tiered_compaction_strategy;
+    const int64_t old_min_level_size = config::size_tiered_min_level_size;
+    const int64_t old_level_multiple = config::size_tiered_level_multiple;
+    const int64_t old_level_num = config::size_tiered_level_num;
+    const int64_t old_min_interval = config::update_compaction_per_tablet_min_interval_seconds;
+    DeferOp restore([&] {
+        config::update_compaction_size_threshold = old_size_threshold;
+        config::enable_pk_size_tiered_compaction_strategy = old_size_tiered;
+        config::size_tiered_min_level_size = old_min_level_size;
+        config::size_tiered_level_multiple = old_level_multiple;
+        config::size_tiered_level_num = old_level_num;
+        config::update_compaction_per_tablet_min_interval_seconds = old_min_interval;
+    });
+
+    config::update_compaction_per_tablet_min_interval_seconds = 60;
+    config::enable_pk_size_tiered_compaction_strategy = true;
+
+    _tablet = create_tablet(100202, 100202);
+    _tablet->set_enable_persistent_index(false);
+    auto* u = _tablet->updates();
+
+    std::vector<int64_t> keys1 = {1, 2, 3, 4, 5};
+    std::vector<int64_t> keys2 = {6, 7, 8, 9, 10};
+    ASSERT_OK(_tablet->rowset_commit(2, create_rowset(_tablet, keys1)));
+    ASSERT_OK(_tablet->rowset_commit(3, create_rowset(_tablet, keys2)));
+    u->wait_apply_done();
+
+    int64_t score = 0;
+    ASSERT_TRUE(u->peek_compaction_score(UnixMillis(), &score));
+    EXPECT_GT(score, 0);
+    EXPECT_EQ(score, u->get_compaction_score());
+
+    // _compaction_running -> true with -1.
+    u->_compaction_running.store(true, std::memory_order_relaxed);
+    score = 0;
+    EXPECT_TRUE(u->peek_compaction_score(UnixMillis(), &score));
+    EXPECT_EQ(-1, score);
+    u->_compaction_running.store(false, std::memory_order_relaxed);
+
+    // _error -> true with -1.
+    u->_error.store(true, std::memory_order_relaxed);
+    score = 0;
+    EXPECT_TRUE(u->peek_compaction_score(UnixMillis(), &score));
+    EXPECT_EQ(-1, score);
+    u->_error.store(false, std::memory_order_relaxed);
+
+    // Within cooldown -> true with -1.
+    const int64_t now_ms = UnixMillis();
+    u->_last_compaction_time_ms.store(now_ms, std::memory_order_relaxed);
+    score = 0;
+    EXPECT_TRUE(u->peek_compaction_score(now_ms, &score));
+    EXPECT_EQ(-1, score);
+    u->_last_compaction_time_ms.store(0, std::memory_order_relaxed);
+
+    // Strategy toggle -> miss until get_compaction_score() refreshes cache.
+    config::enable_pk_size_tiered_compaction_strategy = false;
+    EXPECT_FALSE(u->peek_compaction_score(UnixMillis(), &score));
+    int64_t refreshed = u->get_compaction_score();
+    EXPECT_GT(refreshed, 0);
+    EXPECT_TRUE(u->peek_compaction_score(UnixMillis(), &score));
+    EXPECT_EQ(refreshed, score);
+
+    // size_tiered_* change -> miss until get_compaction_score() refreshes cache.
+    config::enable_pk_size_tiered_compaction_strategy = true;
+    EXPECT_FALSE(u->peek_compaction_score(UnixMillis(), &score));
+    refreshed = u->get_compaction_score();
+    EXPECT_TRUE(u->peek_compaction_score(UnixMillis(), &score));
+    EXPECT_EQ(refreshed, score);
+
+    config::size_tiered_min_level_size = old_min_level_size + 128;
+    EXPECT_FALSE(u->peek_compaction_score(UnixMillis(), &score));
+    refreshed = u->get_compaction_score();
+    EXPECT_TRUE(u->peek_compaction_score(UnixMillis(), &score));
+    EXPECT_EQ(refreshed, score);
+
+    config::size_tiered_level_multiple = old_level_multiple + 1;
+    EXPECT_FALSE(u->peek_compaction_score(UnixMillis(), &score));
+    refreshed = u->get_compaction_score();
+    EXPECT_TRUE(u->peek_compaction_score(UnixMillis(), &score));
+    EXPECT_EQ(refreshed, score);
+
+    config::size_tiered_level_num = old_level_num + 2;
+    EXPECT_FALSE(u->peek_compaction_score(UnixMillis(), &score));
+    refreshed = u->get_compaction_score();
+    EXPECT_TRUE(u->peek_compaction_score(UnixMillis(), &score));
+    EXPECT_EQ(refreshed, score);
+
+    // Live update_compaction_size_threshold change reflects immediately without mutating RowsetStats::compaction_score.
+    std::map<uint32_t, int64_t> saved_rowset_scores;
+    {
+        std::lock_guard lg(u->_rowset_stats_lock);
+        for (const auto& [rsid, stat] : u->_rowset_stats) {
+            saved_rowset_scores[rsid] = stat->compaction_score;
+        }
+    }
+    const int64_t score_before_threshold = score;
+    config::update_compaction_size_threshold = std::max<int64_t>(20, old_size_threshold / 2);
+    int64_t score_after_threshold = 0;
+    EXPECT_TRUE(u->peek_compaction_score(UnixMillis(), &score_after_threshold));
+    EXPECT_GT(score_after_threshold, score_before_threshold);
+    EXPECT_EQ(score_after_threshold, u->get_compaction_score());
+    {
+        std::lock_guard lg(u->_rowset_stats_lock);
+        for (const auto& [rsid, expected_rs_score] : saved_rowset_scores) {
+            auto itr = u->_rowset_stats.find(rsid);
+            ASSERT_NE(itr, u->_rowset_stats.end());
+            EXPECT_EQ(expected_rs_score, itr->second->compaction_score);
+        }
+    }
+}
+
+TEST_F(TabletUpdatesTest, test_compaction_score_apply_transition_sync_point) {
+    const int64_t old_min_interval = config::update_compaction_per_tablet_min_interval_seconds;
+    DeferOp restore([&] {
+        SyncPoint::GetInstance()->ClearCallBack("TabletUpdates::_apply_normal_rowset_commit:before_update_total_stats");
+        SyncPoint::GetInstance()->DisableProcessing();
+        config::update_compaction_per_tablet_min_interval_seconds = old_min_interval;
+    });
+    config::update_compaction_per_tablet_min_interval_seconds = 0;
+
+    _tablet = create_tablet(100203, 100203);
+    _tablet->set_enable_persistent_index(false);
+    auto* u = _tablet->updates();
+
+    // Commit first rowset -> 1 input, 0 deletes -> score == -1.
+    std::vector<int64_t> keys1 = {1, 2, 3, 4, 5};
+    ASSERT_OK(_tablet->rowset_commit(2, create_rowset(_tablet, keys1)));
+    u->wait_apply_done();
+
+    int64_t score = 0;
+    ASSERT_TRUE(u->peek_compaction_score(UnixMillis(), &score));
+    EXPECT_EQ(-1, score);
+    EXPECT_EQ(-1, u->get_compaction_score());
+
+    // Pause apply of second rowset between _apply_version_idx++ and _update_total_stats().
+    std::mutex sp_mu;
+    std::condition_variable sp_cv;
+    bool entered = false;
+    bool release = false;
+
+    SyncPoint::GetInstance()->EnableProcessing();
+    SyncPoint::GetInstance()->SetCallBack("TabletUpdates::_apply_normal_rowset_commit:before_update_total_stats",
+                                          [&](void*) {
+                                              std::unique_lock lk(sp_mu);
+                                              entered = true;
+                                              sp_cv.notify_all();
+                                              sp_cv.wait(lk, [&] { return release; });
+                                          });
+
+    std::vector<int64_t> keys2 = {6, 7, 8, 9, 10};
+    ASSERT_OK(_tablet->rowset_commit(3, create_rowset(_tablet, keys2)));
+
+    {
+        std::unique_lock lk(sp_mu);
+        sp_cv.wait(lk, [&] { return entered; });
+    }
+
+    // While paused before _update_total_stats(), peek must report a miss and get_compaction_score() must return > 0.
+    EXPECT_FALSE(u->peek_compaction_score(UnixMillis(), &score));
+    EXPECT_GT(u->get_compaction_score(), 0);
+
+    {
+        std::lock_guard lk(sp_mu);
+        release = true;
+    }
+    sp_cv.notify_all();
+    u->wait_apply_done();
+
+    EXPECT_TRUE(u->peek_compaction_score(UnixMillis(), &score));
+    EXPECT_GT(score, 0);
+}
+
+TEST_F(TabletUpdatesTest, test_compaction_score_cache_invalidation_on_recover) {
+    const int64_t old_min_interval = config::update_compaction_per_tablet_min_interval_seconds;
+    DeferOp restore([&] { config::update_compaction_per_tablet_min_interval_seconds = old_min_interval; });
+    config::update_compaction_per_tablet_min_interval_seconds = 0;
+
+    _tablet = create_tablet(100204, 100204);
+    _tablet->set_enable_persistent_index(false);
+    auto* u = _tablet->updates();
+
+    std::vector<int64_t> keys1 = {1, 2, 3, 4, 5};
+    std::vector<int64_t> keys2 = {6, 7, 8, 9, 10};
+    ASSERT_OK(_tablet->rowset_commit(2, create_rowset(_tablet, keys1)));
+    ASSERT_OK(_tablet->rowset_commit(3, create_rowset(_tablet, keys2)));
+    u->wait_apply_done();
+
+    int64_t score_before = 0;
+    ASSERT_TRUE(u->peek_compaction_score(UnixMillis(), &score_before));
+    EXPECT_GT(score_before, 0);
+
+    u->set_error("ut_compaction_score_recover");
+    ASSERT_OK(u->recover());
+
+    // Cache must be invalidated right after recover().
+    int64_t score_after = 0;
+    EXPECT_FALSE(u->peek_compaction_score(UnixMillis(), &score_after));
+
+    // get_compaction_score() recomputes accurately and repopulates the cache.
+    int64_t recomputed = u->get_compaction_score();
+    EXPECT_EQ(score_before, recomputed);
+    EXPECT_TRUE(u->peek_compaction_score(UnixMillis(), &score_after));
+    EXPECT_EQ(recomputed, score_after);
+}
+
 // Full/non-full input selection, light publish and index rebuild are independent
 // inputs. In particular, the two config switches must not reset an index that
 // the light conflict resolver subsequently updates with replace().
