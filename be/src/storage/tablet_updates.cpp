@@ -1874,6 +1874,7 @@ Status TabletUpdates::_apply_normal_rowset_commit(const EditVersionInfo& version
         } else {
             iter->second->byte_size = full_rowset_size;
             iter->second->row_size = full_row_size;
+            iter->second->compaction_level = _calc_compaction_level(iter->second.get());
         }
     }
     new_deletes.clear();
@@ -3655,9 +3656,28 @@ int32_t TabletUpdates::_calc_compaction_level(RowsetStats* stats) {
     }
 }
 
+TabletUpdates::LevelConfig TabletUpdates::_current_level_config() {
+    return LevelConfig{
+            config::size_tiered_min_level_size,
+            config::size_tiered_level_multiple,
+            config::size_tiered_level_num,
+    };
+}
+
+void TabletUpdates::_refresh_rowset_stats_levels_unlocked(const LevelConfig& level_cfg) {
+    if (_rowset_stats_level_cfg == level_cfg) {
+        return;
+    }
+    for (auto& [rsid, stat] : _rowset_stats) {
+        stat->compaction_level = _calc_compaction_level(stat.get());
+    }
+    _rowset_stats_level_cfg = level_cfg;
+}
+
 void TabletUpdates::_calc_compaction_score(RowsetStats* stats) {
     if (stats->num_rows == 0) {
         stats->compaction_score = config::update_compaction_size_threshold;
+        stats->compaction_level = _calc_compaction_level(stats);
         return;
     }
     // TODO(cbl): estimate read/write cost, currently just use fixed value
@@ -3668,6 +3688,7 @@ void TabletUpdates::_calc_compaction_score(RowsetStats* stats) {
     stats->compaction_score =
             config::update_compaction_size_threshold * (stats->num_segments > 1 ? stats->num_segments - 1 : 1) +
             (cost_record_read + cost_record_write) * delete_bytes - cost_record_write * stats->byte_size;
+    stats->compaction_level = _calc_compaction_level(stats);
 }
 
 size_t TabletUpdates::_get_rowset_num_deletes(uint32_t rowsetid) {

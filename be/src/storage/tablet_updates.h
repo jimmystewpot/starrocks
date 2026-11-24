@@ -613,6 +613,19 @@ private:
 
     // cache of latest ExtraFileSize
     ExtraFileSize _extra_file_size_cache;
+
+    struct LevelConfig {
+        int64_t min_level_size = 0;
+        int64_t level_multiple = 0;
+        int64_t level_num = 0;
+        bool operator==(const LevelConfig&) const = default;
+        bool operator!=(const LevelConfig&) const = default;
+    };
+    static LevelConfig _current_level_config();
+    // Requires |_rowset_stats_lock| held.
+    void _refresh_rowset_stats_levels_unlocked(const LevelConfig& level_cfg);
+    // Protected by |_rowset_stats_lock|.
+    LevelConfig _rowset_stats_level_cfg;
 };
 
 } // namespace starrocks

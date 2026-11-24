@@ -5129,6 +5129,51 @@ TEST_F(TabletUpdatesTest, test_do_manual_compaction_via_task_queue) {
     EXPECT_TRUE(_tablet->verify().ok());
 }
 
+TEST_F(TabletUpdatesTest, test_rowset_stats_compaction_level_tracking) {
+    const int64_t old_min_level_size = config::size_tiered_min_level_size;
+    DeferOp restore([&] { config::size_tiered_min_level_size = old_min_level_size; });
+
+    srand(GetCurrentTimeMicros());
+    _tablet = create_tablet(rand(), rand());
+    _tablet->set_enable_persistent_index(false);
+
+    const int N = 1000;
+    std::vector<int64_t> keys;
+    keys.reserve(N);
+    for (int i = 0; i < N; i++) {
+        keys.emplace_back(i);
+    }
+    ASSERT_OK(_tablet->rowset_commit(2, create_rowset(_tablet, keys)));
+    _tablet->updates()->wait_apply_done();
+
+    auto* updates = _tablet->updates();
+    int32_t initial_level = -1;
+    {
+        std::lock_guard lg(updates->_rowset_stats_lock);
+        ASSERT_FALSE(updates->_rowset_stats.empty());
+        for (const auto& [rsid, stat] : updates->_rowset_stats) {
+            int32_t expected_level = updates->_calc_compaction_level(stat.get());
+            EXPECT_NE(-1, stat->compaction_level);
+            EXPECT_EQ(expected_level, stat->compaction_level);
+            initial_level = stat->compaction_level;
+        }
+    }
+
+    config::size_tiered_min_level_size = 64;
+    auto new_cfg = TabletUpdates::_current_level_config();
+    {
+        std::lock_guard lg(updates->_rowset_stats_lock);
+        updates->_refresh_rowset_stats_levels_unlocked(new_cfg);
+        EXPECT_EQ(new_cfg, updates->_rowset_stats_level_cfg);
+        for (const auto& [rsid, stat] : updates->_rowset_stats) {
+            int32_t expected_level = updates->_calc_compaction_level(stat.get());
+            EXPECT_NE(-1, stat->compaction_level);
+            EXPECT_EQ(expected_level, stat->compaction_level);
+            EXPECT_GT(stat->compaction_level, initial_level);
+        }
+    }
+}
+
 // Full/non-full input selection, light publish and index rebuild are independent
 // inputs. In particular, the two config switches must not reset an index that
 // the light conflict resolver subsequently updates with replace().
