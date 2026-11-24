@@ -2926,14 +2926,66 @@ void TabletUpdates::_invalidate_compaction_score_cache_unlocked() {
     _compaction_score_cache_seqlock.store(seq + 2, std::memory_order_release);
 }
 
+namespace {
+
+class RawCompactionScoreAccumulator {
+public:
+    void add(int64_t compaction_score, size_t num_segments, size_t num_dels, int32_t compaction_level,
+             bool size_tiered_enabled) {
+        if (compaction_score <= 0) {
+            return;
+        }
+        const size_t inputs = std::max<size_t>(1, num_segments);
+        _total_score += compaction_score;
+        _total_inputs += inputs;
+        _total_deletes += num_dels;
+        if (size_tiered_enabled && !_has_size_tiered_candidate) {
+            if (inputs > 1 || num_dels > 0) {
+                _has_size_tiered_candidate = true;
+            } else {
+                const int64_t shifted = static_cast<int64_t>(compaction_level) + 1;
+                if (shifted >= 0 && shifted < 64) {
+                    const uint64_t bit = uint64_t{1} << shifted;
+                    if ((_seen_levels_mask & bit) != 0) {
+                        _has_size_tiered_candidate = true;
+                    } else {
+                        _seen_levels_mask |= bit;
+                    }
+                } else if (std::find(_overflow_levels.begin(), _overflow_levels.end(), compaction_level) !=
+                           _overflow_levels.end()) {
+                    _has_size_tiered_candidate = true;
+                } else {
+                    _overflow_levels.push_back(compaction_level);
+                }
+            }
+        }
+    }
+
+    int64_t finalize(bool size_tiered_enabled) const {
+        if (_total_inputs == 1 && _total_deletes == 0) {
+            // only 1 input and no delete, no need to do compaction
+            return -1;
+        }
+        if (size_tiered_enabled && !_has_size_tiered_candidate) {
+            return -1;
+        }
+        return _total_score;
+    }
+
+private:
+    int64_t _total_score = 0;
+    size_t _total_inputs = 0;
+    size_t _total_deletes = 0;
+    bool _has_size_tiered_candidate = false;
+    uint64_t _seen_levels_mask = 0;
+    std::vector<int32_t> _overflow_levels;
+};
+
+} // namespace
+
 int64_t TabletUpdates::_calc_raw_compaction_score_unlocked(const std::vector<uint32_t>& rowsets,
                                                            bool size_tiered_enabled, bool* has_error) {
-    int64_t total_score = 0;
-    size_t total_inputs = 0;
-    size_t total_deletes = 0;
-    bool has_size_tiered_candidate = false;
-    uint64_t seen_levels_mask = 0;
-    std::vector<int32_t> overflow_levels;
+    RawCompactionScoreAccumulator acc;
     *has_error = false;
 
     for (auto rowsetid : rowsets) {
@@ -2948,42 +3000,10 @@ int64_t TabletUpdates::_calc_raw_compaction_score_unlocked(const std::vector<uin
             return -1;
         }
         const RowsetStats* stat = itr->second.get();
-        if (stat->compaction_score > 0) {
-            const size_t inputs = std::max<size_t>(1, stat->num_segments);
-            total_score += stat->compaction_score;
-            total_inputs += inputs;
-            total_deletes += stat->num_dels;
-            if (size_tiered_enabled && !has_size_tiered_candidate) {
-                if (inputs > 1 || stat->num_dels > 0) {
-                    has_size_tiered_candidate = true;
-                } else {
-                    const int32_t level = stat->compaction_level;
-                    const int64_t shifted = static_cast<int64_t>(level) + 1;
-                    if (shifted >= 0 && shifted < 64) {
-                        const uint64_t bit = uint64_t{1} << shifted;
-                        if ((seen_levels_mask & bit) != 0) {
-                            has_size_tiered_candidate = true;
-                        } else {
-                            seen_levels_mask |= bit;
-                        }
-                    } else if (std::find(overflow_levels.begin(), overflow_levels.end(), level) !=
-                               overflow_levels.end()) {
-                        has_size_tiered_candidate = true;
-                    } else {
-                        overflow_levels.push_back(level);
-                    }
-                }
-            }
-        }
+        acc.add(stat->compaction_score, stat->num_segments, stat->num_dels, stat->compaction_level,
+                size_tiered_enabled);
     }
-    if (total_inputs == 1 && total_deletes == 0) {
-        // only 1 input and no delete, no need to do compaction
-        return -1;
-    }
-    if (size_tiered_enabled && !has_size_tiered_candidate) {
-        return -1;
-    }
-    return total_score;
+    return acc.finalize(size_tiered_enabled);
 }
 
 bool TabletUpdates::peek_compaction_score(int64_t now_ms, int64_t* score) const {
@@ -3073,15 +3093,17 @@ int64_t TabletUpdates::get_compaction_score() {
         }
 
         const uint64_t applied_seq = _applied_version_seq.load(std::memory_order_acquire);
-        const bool size_tiered_enabled = config::enable_pk_size_tiered_compaction_strategy;
-        const LevelConfig level_cfg = _current_level_config();
         {
             std::lock_guard lg(_rowset_stats_lock);
+            const bool size_tiered_enabled = config::enable_pk_size_tiered_compaction_strategy;
+            const LevelConfig level_cfg = _current_level_config();
             _refresh_rowset_stats_levels_unlocked(level_cfg);
             raw_score = _calc_raw_compaction_score_unlocked(_edit_version_infos[_apply_version_idx]->rowsets,
                                                             size_tiered_enabled, &has_error);
             if (!has_error) {
                 _publish_compaction_score_cache_unlocked(applied_seq, raw_score, size_tiered_enabled, level_cfg);
+            } else {
+                _invalidate_compaction_score_cache_unlocked();
             }
         }
     }
@@ -3744,16 +3766,16 @@ void TabletUpdates::get_compaction_status(std::string* json_result) {
     *json_result = std::string(strbuf.GetString());
 }
 
-int32_t TabletUpdates::_calc_compaction_level(RowsetStats* stats) {
+int32_t TabletUpdates::_calc_compaction_level(const RowsetStats* stats, const LevelConfig& level_cfg) {
     if (stats->num_rows == 0) {
         return -1;
     }
     size_t new_rows = stats->num_rows - stats->num_dels;
     size_t new_bytes = stats->byte_size * new_rows / stats->num_rows;
 
-    int64_t level_multiple = config::size_tiered_level_multiple;
-    int64_t min_level_size = config::size_tiered_min_level_size;
-    int64_t level_num = config::size_tiered_level_num;
+    int64_t level_multiple = level_cfg.level_multiple;
+    int64_t min_level_size = level_cfg.min_level_size;
+    int64_t level_num = level_cfg.level_num;
     int64_t max_level_size = min_level_size * pow(level_multiple, level_num);
 
     if (new_bytes == 0) {
@@ -3766,6 +3788,10 @@ int32_t TabletUpdates::_calc_compaction_level(RowsetStats* stats) {
         auto x = (double)new_bytes / min_level_size;
         return log(x) / log((double)level_multiple);
     }
+}
+
+int32_t TabletUpdates::_calc_compaction_level(RowsetStats* stats) {
+    return _calc_compaction_level(stats, _current_level_config());
 }
 
 TabletUpdates::LevelConfig TabletUpdates::_current_level_config() {
@@ -3781,7 +3807,7 @@ void TabletUpdates::_refresh_rowset_stats_levels_unlocked(const LevelConfig& lev
         return;
     }
     for (auto& [rsid, stat] : _rowset_stats) {
-        stat->compaction_level = _calc_compaction_level(stat.get());
+        stat->compaction_level = _calc_compaction_level(stat.get(), level_cfg);
     }
     _rowset_stats_level_cfg = level_cfg;
 }
@@ -5438,56 +5464,26 @@ Status TabletUpdates::clear_meta() {
 void TabletUpdates::_update_total_stats(const std::vector<uint32_t>& rowsets, size_t* row_count_before,
                                         size_t* row_count_after) {
     const uint64_t applied_seq = _applied_version_seq.load(std::memory_order_acquire);
-    const bool size_tiered_enabled = config::enable_pk_size_tiered_compaction_strategy;
-    const LevelConfig level_cfg = _current_level_config();
 
     std::lock_guard l(_rowset_stats_lock);
+    const bool size_tiered_enabled = config::enable_pk_size_tiered_compaction_strategy;
+    const LevelConfig level_cfg = _current_level_config();
     _refresh_rowset_stats_levels_unlocked(level_cfg);
     if (row_count_before != nullptr) {
         *row_count_before = _cur_total_rows - _cur_total_dels;
     }
     size_t nrow = 0;
     size_t ndel = 0;
-    int64_t total_score = 0;
-    size_t total_inputs = 0;
-    size_t total_deletes = 0;
     bool has_error = false;
-    bool has_size_tiered_candidate = false;
-    uint64_t seen_levels_mask = 0;
-    std::vector<int32_t> overflow_levels;
+    RawCompactionScoreAccumulator acc;
     for (auto rid : rowsets) {
         auto itr = _rowset_stats.find(rid);
         if (itr != _rowset_stats.end()) {
             const RowsetStats* stat = itr->second.get();
             nrow += stat->num_rows;
             ndel += stat->num_dels;
-            if (stat->compaction_score > 0) {
-                const size_t inputs = std::max<size_t>(1, stat->num_segments);
-                total_score += stat->compaction_score;
-                total_inputs += inputs;
-                total_deletes += stat->num_dels;
-                if (size_tiered_enabled && !has_size_tiered_candidate) {
-                    if (inputs > 1 || stat->num_dels > 0) {
-                        has_size_tiered_candidate = true;
-                    } else {
-                        const int32_t level = stat->compaction_level;
-                        const int64_t shifted = static_cast<int64_t>(level) + 1;
-                        if (shifted >= 0 && shifted < 64) {
-                            const uint64_t bit = uint64_t{1} << shifted;
-                            if ((seen_levels_mask & bit) != 0) {
-                                has_size_tiered_candidate = true;
-                            } else {
-                                seen_levels_mask |= bit;
-                            }
-                        } else if (std::find(overflow_levels.begin(), overflow_levels.end(), level) !=
-                                   overflow_levels.end()) {
-                            has_size_tiered_candidate = true;
-                        } else {
-                            overflow_levels.push_back(level);
-                        }
-                    }
-                }
-            }
+            acc.add(stat->compaction_score, stat->num_segments, stat->num_dels, stat->compaction_level,
+                    size_tiered_enabled);
         } else {
             LOG(WARNING) << "rowset not found in rowset stats tablet=" << _tablet.tablet_id() << " rowset=" << rid;
             has_error = true;
@@ -5502,11 +5498,8 @@ void TabletUpdates::_update_total_stats(const std::vector<uint32_t>& rowsets, si
     if (has_error) {
         _invalidate_compaction_score_cache_unlocked();
     } else {
-        int64_t raw_score = total_score;
-        if ((total_inputs == 1 && total_deletes == 0) || (size_tiered_enabled && !has_size_tiered_candidate)) {
-            raw_score = -1;
-        }
-        _publish_compaction_score_cache_unlocked(applied_seq, raw_score, size_tiered_enabled, level_cfg);
+        _publish_compaction_score_cache_unlocked(applied_seq, acc.finalize(size_tiered_enabled), size_tiered_enabled,
+                                                 level_cfg);
     }
 }
 

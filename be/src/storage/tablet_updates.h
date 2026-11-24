@@ -627,6 +627,7 @@ private:
         bool operator==(const LevelConfig&) const = default;
         bool operator!=(const LevelConfig&) const = default;
     };
+    static int32_t _calc_compaction_level(const RowsetStats* stats, const LevelConfig& level_cfg);
     static LevelConfig _current_level_config();
     static int64_t _scale_compaction_score(int64_t raw_score);
     // Requires |_rowset_stats_lock| held.

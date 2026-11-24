@@ -858,6 +858,9 @@ std::vector<TabletAndScore> TabletManager::pick_tablets_to_do_pk_index_major_com
 }
 
 TabletSharedPtr TabletManager::find_best_tablet_to_do_update_compaction(DataDir* data_dir) {
+    if (data_dir == nullptr) {
+        return nullptr;
+    }
     struct UpdateCompactionCandidate {
         TabletSharedPtr tablet;
         bool valid = false;
@@ -867,6 +870,7 @@ TabletSharedPtr TabletManager::find_best_tablet_to_do_update_compaction(DataDir*
     int64_t highest_score = 0;
     TabletSharedPtr best_tablet;
     const int64_t now_ms = UnixMillis();
+    const int64_t target_path_hash = data_dir->path_hash();
     std::vector<UpdateCompactionCandidate> candidates;
 
     for (const auto& tablets_shard : _tablets_shards) {
@@ -887,7 +891,7 @@ TabletSharedPtr TabletManager::find_best_tablet_to_do_update_compaction(DataDir*
                 if (tablet_ptr->tablet_state() == TABLET_NOTREADY) {
                     continue;
                 }
-                if (tablet_ptr->data_dir() == nullptr || tablet_ptr->data_dir()->path_hash() != data_dir->path_hash() ||
+                if (tablet_ptr->data_dir() == nullptr || tablet_ptr->data_dir()->path_hash() != target_path_hash ||
                     !tablet_ptr->is_used()) {
                     continue;
                 }
