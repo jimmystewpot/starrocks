@@ -1880,6 +1880,7 @@ Status TabletUpdates::_apply_normal_rowset_commit(const EditVersionInfo& version
             iter->second->row_size = full_row_size;
             iter->second->compaction_level = _calc_compaction_level(iter->second.get());
         }
+        _invalidate_compaction_score_cache_unlocked();
     }
     new_deletes.clear();
     WARN_IF_ERROR(index.on_commited(), fmt::format("primary index on_commit failed, tablet: {}", _tablet.tablet_id()));
@@ -2923,6 +2924,7 @@ void TabletUpdates::_invalidate_compaction_score_cache_unlocked() {
     _compaction_score_cache_seqlock.store(seq + 1, std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_release);
     _cached_score_valid.store(false, std::memory_order_relaxed);
+    _rowset_stats_level_cfg = {};
     _compaction_score_cache_seqlock.store(seq + 2, std::memory_order_release);
 }
 
@@ -3012,7 +3014,7 @@ bool TabletUpdates::peek_compaction_score(int64_t now_ms, int64_t* score) const 
         return true;
     }
     if (_last_compaction_time_ms.load(std::memory_order_relaxed) +
-                config::update_compaction_per_tablet_min_interval_seconds * 1000 >
+                config::update_compaction_per_tablet_min_interval_seconds * 1000LL >
         now_ms) {
         *score = -1;
         return true;

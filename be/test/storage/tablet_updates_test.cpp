@@ -5308,7 +5308,7 @@ TEST_F(TabletUpdatesTest, test_compaction_score_cache_differential) {
     const std::vector<int64_t> thresholds = {1024, 1024 * 1024, 256 * 1024 * 1024};
     const std::vector<int64_t> min_level_sizes = {64, 4096, 131072};
     const std::vector<int64_t> level_multiples = {2, 5};
-    const std::vector<int64_t> level_nums = {0, 7, 70};
+    const std::vector<int64_t> level_nums = {0, 2, 7};
 
     for (int step = 0; step < 12; ++step) {
         int op = step % 5;
@@ -5363,6 +5363,12 @@ TEST_F(TabletUpdatesTest, test_compaction_score_cache_differential) {
                 check_score();
             }
         }
+        // Exercise overflow_levels path (level >= 63) without int64_t pow() overflow.
+        config::enable_pk_size_tiered_compaction_strategy = true;
+        config::size_tiered_min_level_size = 0;
+        config::size_tiered_level_multiple = 2;
+        config::size_tiered_level_num = 70;
+        check_score();
     }
 
     EXPECT_TRUE(saw_neg_one);
@@ -5639,6 +5645,7 @@ TEST_F(TabletUpdatesTest, test_find_best_tablet_two_phase_scan_and_dirty_fallbac
                     t->updates()->wait_apply_done();
                 }
                 (void)tablet_mgr->drop_tablet(t->tablet_id(), kKeepMetaAndFiles);
+                (void)TabletMetaManager::remove(t->data_dir(), t->tablet_id());
                 (void)fs::remove_all(t->schema_hash_path());
             }
         }
@@ -5720,18 +5727,20 @@ TEST_F(TabletUpdatesTest, test_find_best_tablet_concurrent_apply_create_drop) {
 
     DataDir* data_dir = persistent_tablets[0]->data_dir();
     std::mutex cleanup_mu;
-    std::vector<std::string> transient_paths;
+    std::vector<std::pair<int64_t, std::string>> transient_tablets;
 
     DeferOp cleanup([&] {
         for (const auto& t : persistent_tablets) {
             if (t != nullptr) {
                 t->updates()->wait_apply_done();
                 (void)tablet_mgr->drop_tablet(t->tablet_id(), kKeepMetaAndFiles);
+                (void)TabletMetaManager::remove(t->data_dir(), t->tablet_id());
                 (void)fs::remove_all(t->schema_hash_path());
             }
         }
         std::lock_guard lg(cleanup_mu);
-        for (const auto& path : transient_paths) {
+        for (const auto& [tid, path] : transient_tablets) {
+            (void)TabletMetaManager::remove(data_dir, tid);
             (void)fs::remove_all(path);
         }
     });
@@ -5762,15 +5771,15 @@ TEST_F(TabletUpdatesTest, test_find_best_tablet_concurrent_apply_create_drop) {
     // Uses kKeepMetaAndFiles to exercise stop_and_wait_apply_done(), tablet_map.erase, partition/dir deregistration
     // without mutating non-atomic BaseTablet::_state or leaking into _shutdown_tablets; paths are removed once after join.
     std::thread create_drop_writer([&] {
-        int64_t next_tid = 100400;
+        static std::atomic<int64_t> next_tid{1000000};
         while (!stop.load(std::memory_order_relaxed)) {
-            int64_t tid = next_tid++;
+            int64_t tid = next_tid.fetch_add(1, std::memory_order_relaxed);
             auto t = create_tablet(tid, static_cast<int32_t>(tid));
             if (t != nullptr) {
                 std::string path = t->schema_hash_path();
                 {
                     std::lock_guard lg(cleanup_mu);
-                    transient_paths.emplace_back(std::move(path));
+                    transient_tablets.emplace_back(tid, std::move(path));
                 }
                 std::vector<int64_t> keys = {1, 2, 3};
                 (void)t->rowset_commit(2, create_rowset(t, keys));
