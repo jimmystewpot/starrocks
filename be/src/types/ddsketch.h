@@ -96,6 +96,7 @@ public:
     static constexpr uint32_t kInterpolationCubic = 3;
 
     static uint32_t default_max_bins_for_accuracy(double relative_accuracy);
+    static uint32_t default_max_bins_for_mapping(double gamma, uint32_t interpolation);
 
     // Default constructor leaves _mapping_initialized = false (adopts first merged initialized sketch,
     // or initializes with kDefaultRelativeAccuracy = 0.01 on first add() or serialize()).
@@ -127,6 +128,7 @@ public:
     double index_offset() const { return _index_offset; }
     uint32_t interpolation() const { return _interpolation; }
     double relative_accuracy() const { return _relative_accuracy; }
+    uint32_t max_bins() const { return _positive_store.max_bins(); }
 
     int32_t key(double value) const;
     double bin_value(int32_t index) const;

@@ -1039,4 +1039,188 @@ TEST_F(DDSketchTest, TestOfficialDatadogJavaGoldenFixtures) {
     }
 }
 
+TEST_F(DDSketchTest, TestCanonicalCapacityAndCollapsingPartitionInvariance) {
+    // 1. Exact capacities across reinit, deserialize, merge, and merge_serialized for alpha in
+    // {0.01 -> 2048, 0.005 -> 4096, 0.002 -> 10240, 0.001 -> 20480} (both NONE and CUBIC mappings).
+    {
+        struct CapacityCase {
+            double alpha;
+            uint32_t expected_max_bins;
+        };
+        const CapacityCase cases[] = {
+                {0.01, 2048U},
+                {0.005, 4096U},
+                {0.002, 10240U},
+                {0.001, 20480U},
+        };
+        const double cubic_inv_cf = (10.0 / 7.0) * std::log(2.0);
+
+        for (const auto& tc : cases) {
+            SCOPED_TRACE(::testing::Message() << "alpha=" << tc.alpha);
+
+            // NONE (logarithmic) mapping via reinit, deserialize, merge, merge_serialized
+            const double none_gamma = (1.0 + tc.alpha) / (1.0 - tc.alpha);
+            EXPECT_EQ(tc.expected_max_bins, DDSketch::default_max_bins_for_accuracy(tc.alpha));
+            EXPECT_EQ(tc.expected_max_bins,
+                      DDSketch::default_max_bins_for_mapping(none_gamma, DDSketch::kInterpolationNone));
+
+            DDSketch sk_reinit;
+            sk_reinit.reinit(tc.alpha);
+            sk_reinit.add(10.0);
+            EXPECT_EQ(tc.expected_max_bins, sk_reinit.max_bins());
+
+            const std::string wire_none = serialize_sketch(sk_reinit);
+
+            DDSketch sk_deser;
+            ASSERT_TRUE(sk_deser.deserialize(Slice(wire_none)).ok());
+            EXPECT_EQ(tc.expected_max_bins, sk_deser.max_bins());
+
+            DDSketch sk_merge;
+            ASSERT_TRUE(sk_merge.merge(sk_reinit).ok());
+            EXPECT_EQ(tc.expected_max_bins, sk_merge.max_bins());
+
+            DDSketch sk_merge_ser;
+            ASSERT_TRUE(sk_merge_ser.merge_serialized(Slice(wire_none)).ok());
+            EXPECT_EQ(tc.expected_max_bins, sk_merge_ser.max_bins());
+
+            // CUBIC mapping via deserialize, merge, merge_serialized
+            const double corrected_gamma = (1.0 + tc.alpha) / (1.0 - tc.alpha);
+            const double cubic_gamma = std::pow(corrected_gamma, cubic_inv_cf);
+            EXPECT_EQ(tc.expected_max_bins,
+                      DDSketch::default_max_bins_for_mapping(cubic_gamma, DDSketch::kInterpolationCubic));
+            std::string wire_cubic;
+            append_length_delimited(&wire_cubic, 1,
+                                    make_index_mapping_msg(cubic_gamma, 0.0, DDSketch::kInterpolationCubic));
+
+            DDSketch cubic_deser;
+            ASSERT_TRUE(cubic_deser.deserialize(Slice(wire_cubic)).ok());
+            EXPECT_EQ(DDSketch::kInterpolationCubic, cubic_deser.interpolation());
+            EXPECT_EQ(tc.expected_max_bins, cubic_deser.max_bins());
+
+            DDSketch cubic_merge;
+            ASSERT_TRUE(cubic_merge.merge(cubic_deser).ok());
+            EXPECT_EQ(tc.expected_max_bins, cubic_merge.max_bins());
+
+            DDSketch cubic_merge_ser;
+            ASSERT_TRUE(cubic_merge_ser.merge_serialized(Slice(wire_cubic)).ok());
+            EXPECT_EQ(tc.expected_max_bins, cubic_merge_ser.max_bins());
+        }
+    }
+
+    // 2. Exact review reproduction (100 copies of 1.0 + 20 log-spaced values from 1.0 to 1e20)
+    // at both 0.01 and 0.001 across direct, 2-way/4-way merge(), 2-way/4-way merge_serialized(), and deserialize().
+    {
+        std::vector<double> values;
+        values.reserve(120);
+        for (int i = 0; i < 100; ++i) {
+            values.push_back(1.0);
+        }
+        for (int i = 1; i <= 20; ++i) {
+            values.push_back(std::pow(1e20, static_cast<double>(i) / 20.0));
+        }
+
+        struct ReproCase {
+            double alpha;
+            uint32_t expected_max_bins;
+        };
+        for (const ReproCase& tc : std::vector<ReproCase>{{0.01, 2048U}, {0.001, 20480U}}) {
+            SCOPED_TRACE(::testing::Message() << "repro alpha=" << tc.alpha);
+
+            DDSketch direct(tc.alpha);
+            for (double v : values) {
+                direct.add(v);
+            }
+            const std::string direct_wire = serialize_sketch(direct);
+            EXPECT_EQ(tc.expected_max_bins, direct.max_bins());
+
+            // Deserialized direct
+            DDSketch deserialized;
+            ASSERT_TRUE(deserialized.deserialize(Slice(direct_wire)).ok());
+            EXPECT_EQ(tc.expected_max_bins, deserialized.max_bins());
+            EXPECT_EQ(direct_wire, serialize_sketch(deserialized));
+            EXPECT_DOUBLE_EQ(direct.quantile(0.5), deserialized.quantile(0.5));
+
+            // 2-way and 4-way splits merged via merge() and merge_serialized() into uninitialized DDSketch()
+            for (size_t num_parts : {size_t{2}, size_t{4}}) {
+                SCOPED_TRACE(::testing::Message() << "num_parts=" << num_parts);
+                DDSketch merged_obj;
+                DDSketch merged_ser;
+                const size_t part_size = values.size() / num_parts;
+                for (size_t p = 0; p < num_parts; ++p) {
+                    const size_t begin = p * part_size;
+                    const size_t end = (p + 1 == num_parts) ? values.size() : (p + 1) * part_size;
+                    DDSketch part(tc.alpha);
+                    for (size_t i = begin; i < end; ++i) {
+                        part.add(values[i]);
+                    }
+                    ASSERT_TRUE(merged_obj.merge(part).ok());
+                    const std::string part_wire = serialize_sketch(part);
+                    ASSERT_TRUE(merged_ser.merge_serialized(Slice(part_wire)).ok());
+                }
+
+                EXPECT_EQ(tc.expected_max_bins, merged_obj.max_bins());
+                EXPECT_EQ(direct_wire, serialize_sketch(merged_obj));
+                EXPECT_DOUBLE_EQ(direct.quantile(0.5), merged_obj.quantile(0.5));
+
+                EXPECT_EQ(tc.expected_max_bins, merged_ser.max_bins());
+                EXPECT_EQ(direct_wire, serialize_sketch(merged_ser));
+                EXPECT_DOUBLE_EQ(direct.quantile(0.5), merged_ser.quantile(0.5));
+            }
+        }
+    }
+
+    // 3. Non-canonical protobuf field order (field 2 positive_values before field 1 IndexMapping)
+    // at alpha = 0.001 with 3,000 bins preserves all 3,000 bins (max_bins() == 20480).
+    {
+        const double gamma_0001 = (1.0 + 0.001) / (1.0 - 0.001);
+        std::string store_3000;
+        append_tag(&store_3000, 2, 2);
+        append_varint(&store_3000, 3000ULL * sizeof(double));
+        for (int i = 0; i < 3000; ++i) {
+            append_double_le(&store_3000, 1.0);
+        }
+
+        // Non-canonical order: field 2 BEFORE field 1
+        std::string non_canonical_wire;
+        append_length_delimited(&non_canonical_wire, 2, store_3000);
+        append_length_delimited(&non_canonical_wire, 1, make_index_mapping_msg(gamma_0001));
+
+        // Canonical order for comparison: field 1 BEFORE field 2
+        std::string canonical_wire;
+        append_length_delimited(&canonical_wire, 1, make_index_mapping_msg(gamma_0001));
+        append_length_delimited(&canonical_wire, 2, store_3000);
+
+        DDSketch decoded_non_canon;
+        ASSERT_TRUE(decoded_non_canon.deserialize(Slice(non_canonical_wire)).ok());
+        EXPECT_EQ(20480U, decoded_non_canon.max_bins());
+        EXPECT_EQ(3000ULL, decoded_non_canon.total_count());
+
+        DDSketch decoded_canon;
+        ASSERT_TRUE(decoded_canon.deserialize(Slice(canonical_wire)).ok());
+        EXPECT_EQ(20480U, decoded_canon.max_bins());
+        EXPECT_EQ(serialize_sketch(decoded_canon), serialize_sketch(decoded_non_canon));
+        EXPECT_DOUBLE_EQ(decoded_canon.min_value(), decoded_non_canon.min_value());
+        EXPECT_DOUBLE_EQ(decoded_canon.quantile(0.5), decoded_non_canon.quantile(0.5));
+        EXPECT_DOUBLE_EQ(decoded_canon.max_value(), decoded_non_canon.max_value());
+
+        DDSketch merged_non_canon;
+        ASSERT_TRUE(merged_non_canon.merge_serialized(Slice(non_canonical_wire)).ok());
+        EXPECT_EQ(20480U, merged_non_canon.max_bins());
+        EXPECT_EQ(serialize_sketch(decoded_canon), serialize_sketch(merged_non_canon));
+    }
+
+    // 4. Explicit custom max_bins (DDSketch(0.01, 512)) merged into uninitialized DDSketch() preserves max_bins() == 512.
+    {
+        DDSketch custom(0.01, 512);
+        custom.add(1.0);
+        custom.add(100.0);
+        EXPECT_EQ(512U, custom.max_bins());
+
+        DDSketch uninitialized;
+        ASSERT_TRUE(uninitialized.merge(custom).ok());
+        EXPECT_EQ(512U, uninitialized.max_bins());
+        EXPECT_EQ(serialize_sketch(custom), serialize_sketch(uninitialized));
+    }
+}
+
 } // namespace starrocks

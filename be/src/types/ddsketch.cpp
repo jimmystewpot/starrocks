@@ -1153,10 +1153,10 @@ void CollapsingLowestDenseStore::merge(const CollapsingLowestDenseStore& other) 
 // ============================================================================
 
 uint32_t DDSketch::default_max_bins_for_accuracy(double relative_accuracy) {
-    if (!std::isfinite(relative_accuracy) || relative_accuracy <= 0.0 || relative_accuracy >= 0.01) {
+    if (!std::isfinite(relative_accuracy) || relative_accuracy <= 0.0 || relative_accuracy >= 0.01 - 1e-12) {
         return kDefaultMaxBins;
     }
-    const double scaled = std::ceil(20.48 / relative_accuracy);
+    const double scaled = std::ceil((20.48 / relative_accuracy) - 1e-7);
     if (scaled >= static_cast<double>(kMaxScaledBins)) {
         return kMaxScaledBins;
     }
@@ -1164,6 +1164,10 @@ uint32_t DDSketch::default_max_bins_for_accuracy(double relative_accuracy) {
         return kDefaultMaxBins;
     }
     return static_cast<uint32_t>(scaled);
+}
+
+uint32_t DDSketch::default_max_bins_for_mapping(double gamma, uint32_t interpolation) {
+    return default_max_bins_for_accuracy(compute_relative_accuracy_from_gamma(gamma, interpolation));
 }
 
 DDSketch::DDSketch() {
@@ -1250,9 +1254,9 @@ void DDSketch::reinit(double relative_accuracy, uint32_t max_bins) {
     if (!std::isfinite(acc) || acc < kMinRelativeAccuracy || acc > kMaxRelativeAccuracy) {
         acc = kDefaultRelativeAccuracy;
     }
-    const uint32_t eff_max_bins = (max_bins == 0) ? default_max_bins_for_accuracy(acc) : max_bins;
     const double gamma = (1.0 + acc) / (1.0 - acc);
     _init_mapping_from_gamma(gamma, 0.0, kInterpolationNone);
+    const uint32_t eff_max_bins = (max_bins == 0) ? default_max_bins_for_mapping(_gamma, _interpolation) : max_bins;
     _mapping_initialized = true;
     _zero_count = 0;
     _positive_store = CollapsingLowestDenseStore(eff_max_bins);
@@ -1395,8 +1399,7 @@ Status DDSketch::merge(const DDSketch& other) {
         }
         _init_mapping_from_gamma(other._gamma, other._index_offset, other._interpolation);
         _mapping_initialized = true;
-        const uint32_t target_max_bins =
-                std::max(other._positive_store.max_bins(), default_max_bins_for_accuracy(_relative_accuracy));
+        const uint32_t target_max_bins = other._positive_store.max_bins();
         _positive_store = CollapsingLowestDenseStore(target_max_bins);
         _negative_store = CollapsingLowestDenseStore(target_max_bins);
         _zero_count = other._zero_count;
@@ -1478,8 +1481,7 @@ Status DDSketch::merge_serialized(const Slice& src) {
             const uint32_t allowed_max_bins =
                     _mapping_initialized
                             ? _positive_store.max_bins()
-                            : (has_mapping ? default_max_bins_for_accuracy(compute_relative_accuracy_from_gamma(
-                                                     parsed_gamma, parsed_interpolation))
+                            : (has_mapping ? default_max_bins_for_mapping(parsed_gamma, parsed_interpolation)
                                            : kDefaultMaxBins);
             if (!read_varint(p, end, &len).ok() || len > static_cast<uint64_t>(end - p) ||
                 !try_parse_fast_contiguous_store(p, p + len, allowed_max_bins, &pos_view)) {
@@ -1492,8 +1494,7 @@ Status DDSketch::merge_serialized(const Slice& src) {
             const uint32_t allowed_max_bins =
                     _mapping_initialized
                             ? _negative_store.max_bins()
-                            : (has_mapping ? default_max_bins_for_accuracy(compute_relative_accuracy_from_gamma(
-                                                     parsed_gamma, parsed_interpolation))
+                            : (has_mapping ? default_max_bins_for_mapping(parsed_gamma, parsed_interpolation)
                                            : kDefaultMaxBins);
             if (!read_varint(p, end, &len).ok() || len > static_cast<uint64_t>(end - p) ||
                 !try_parse_fast_contiguous_store(p, p + len, allowed_max_bins, &neg_view)) {
@@ -1523,7 +1524,7 @@ Status DDSketch::merge_serialized(const Slice& src) {
     if (!_mapping_initialized) {
         _init_mapping_from_gamma(parsed_gamma, parsed_offset, parsed_interpolation);
         _mapping_initialized = true;
-        const uint32_t target_max_bins = default_max_bins_for_accuracy(_relative_accuracy);
+        const uint32_t target_max_bins = default_max_bins_for_mapping(_gamma, _interpolation);
         _positive_store = CollapsingLowestDenseStore(target_max_bins);
         _negative_store = CollapsingLowestDenseStore(target_max_bins);
     } else {
@@ -2102,9 +2103,7 @@ Status DDSketch::deserialize(const Slice& src) {
                 return Status::InvalidArgument("ddsketch: length-delimited field exceeds buffer");
             }
             const uint32_t allowed_max_bins =
-                    has_mapping ? default_max_bins_for_accuracy(
-                                          compute_relative_accuracy_from_gamma(parsed_gamma, parsed_interpolation))
-                                : kDefaultMaxBins;
+                    has_mapping ? default_max_bins_for_mapping(parsed_gamma, parsed_interpolation) : kDefaultMaxBins;
             if (pos_submsg_count == 0 && try_parse_fast_contiguous_store(p, p + len, allowed_max_bins, &fast_pos)) {
                 pos_submsg_count = 1;
             } else {
@@ -2142,9 +2141,7 @@ Status DDSketch::deserialize(const Slice& src) {
                 return Status::InvalidArgument("ddsketch: length-delimited field exceeds buffer");
             }
             const uint32_t allowed_max_bins =
-                    has_mapping ? default_max_bins_for_accuracy(
-                                          compute_relative_accuracy_from_gamma(parsed_gamma, parsed_interpolation))
-                                : kDefaultMaxBins;
+                    has_mapping ? default_max_bins_for_mapping(parsed_gamma, parsed_interpolation) : kDefaultMaxBins;
             if (neg_submsg_count == 0 && try_parse_fast_contiguous_store(p, p + len, allowed_max_bins, &fast_neg)) {
                 neg_submsg_count = 1;
             } else {
@@ -2193,8 +2190,7 @@ Status DDSketch::deserialize(const Slice& src) {
         return Status::InvalidArgument("ddsketch: missing IndexMapping");
     }
 
-    const double parsed_acc = compute_relative_accuracy_from_gamma(parsed_gamma, parsed_interpolation);
-    const uint32_t target_max_bins = default_max_bins_for_accuracy(parsed_acc);
+    const uint32_t target_max_bins = default_max_bins_for_mapping(parsed_gamma, parsed_interpolation);
 
     CollapsingLowestDenseStore new_pos(target_max_bins);
     CollapsingLowestDenseStore new_neg(target_max_bins);
