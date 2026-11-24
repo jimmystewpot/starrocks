@@ -858,32 +858,78 @@ std::vector<TabletAndScore> TabletManager::pick_tablets_to_do_pk_index_major_com
 }
 
 TabletSharedPtr TabletManager::find_best_tablet_to_do_update_compaction(DataDir* data_dir) {
+    struct UpdateCompactionCandidate {
+        TabletSharedPtr tablet;
+        bool valid = false;
+        int64_t peeked_score = -1;
+    };
+
     int64_t highest_score = 0;
     TabletSharedPtr best_tablet;
+    const int64_t now_ms = UnixMillis();
+    std::vector<UpdateCompactionCandidate> candidates;
+
     for (const auto& tablets_shard : _tablets_shards) {
-        std::vector<TabletSharedPtr> all_tablets_by_shard = _get_all_tablets_from_shard(tablets_shard, PRIMARY_KEYS);
-        for (const auto& tablet_ptr : all_tablets_by_shard) {
-            // A not-ready tablet maybe a newly created tablet under schema-change, skip it
-            if (tablet_ptr->tablet_state() == TABLET_NOTREADY) {
-                continue;
-            }
+        candidates.clear();
+        // Phase 1: Under shared shard lock, do strictly nonblocking filtering and lock-free score peeking
+        // (never acquire TabletUpdates::_lock or _rowset_stats_lock here).
+        {
+            std::shared_lock rlock(tablets_shard.lock);
+            for (const auto& [tablet_id, tablet_ptr] : tablets_shard.tablet_map) {
+                if (!tablet_ptr->init_succeeded()) {
+                    continue;
+                }
+                auto* updates = tablet_ptr->updates();
+                if (updates == nullptr) {
+                    continue;
+                }
+                // A not-ready tablet maybe a newly created tablet under schema-change, skip it
+                if (tablet_ptr->tablet_state() == TABLET_NOTREADY) {
+                    continue;
+                }
+                if (tablet_ptr->data_dir() == nullptr || tablet_ptr->data_dir()->path_hash() != data_dir->path_hash() ||
+                    !tablet_ptr->is_used()) {
+                    continue;
+                }
 
-            if (tablet_ptr->data_dir()->path_hash() != data_dir->path_hash() || !tablet_ptr->is_used() ||
-                !tablet_ptr->init_succeeded()) {
-                continue;
+                int64_t peeked_score = -1;
+                const bool valid = updates->peek_compaction_score(now_ms, &peeked_score);
+                if (valid && peeked_score <= highest_score) {
+                    continue;
+                }
+                candidates.push_back(UpdateCompactionCandidate{tablet_ptr, valid, peeked_score});
             }
+        }
 
-            int64_t table_score = tablet_ptr->updates()->get_compaction_score();
+        // Phase 2: Outside shard lock, evaluate dirty candidates first and valid candidates in descending
+        // peeked_score order, breaking early once remaining valid candidates cannot beat highest_score.
+        if (candidates.empty()) {
+            continue;
+        }
+        if (candidates.size() > 1) {
+            std::sort(candidates.begin(), candidates.end(),
+                      [](const UpdateCompactionCandidate& a, const UpdateCompactionCandidate& b) {
+                          if (a.valid != b.valid) {
+                              return !a.valid;
+                          }
+                          return a.peeked_score > b.peeked_score;
+                      });
+        }
+        for (const auto& cand : candidates) {
+            if (cand.valid && cand.peeked_score <= highest_score) {
+                break;
+            }
+            int64_t table_score = cand.tablet->updates()->get_compaction_score();
             // tablet_score maybe negative, which means it's not worthy to do compaction
             if (table_score <= 0) {
                 continue;
             }
-
             if (table_score > highest_score) {
                 highest_score = table_score;
-                best_tablet = tablet_ptr;
+                best_tablet = cand.tablet;
             }
         }
+        candidates.clear();
     }
 
     if (best_tablet != nullptr) {
