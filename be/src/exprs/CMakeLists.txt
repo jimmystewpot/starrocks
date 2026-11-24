@@ -113,6 +113,7 @@ set(EXPR_FILES
   match_expr.cpp
   ngram.cpp
   placeholder_ref.cpp
+  ddsketch_functions.cpp
   percentile_functions.cpp
   regexp_split.cpp
   split.cpp

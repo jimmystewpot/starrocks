@@ -1257,6 +1257,20 @@ vectorized_functions = [
     [130002, 'percentile_approx_raw', True, False, 'DOUBLE', ['PERCENTILE', 'DOUBLE'],
      'PercentileFunctions::percentile_approx_raw'],
 
+    # ddsketch function
+    [130010, 'ddsketch_empty', True, False, 'VARBINARY', [], 'DDSketchFunctions::ddsketch_empty'],
+    [130011, 'ddsketch_empty', True, False, 'VARBINARY', ['DOUBLE'], 'DDSketchFunctions::ddsketch_empty_with_alpha'],
+    [130012, 'ddsketch_quantile', True, False, 'DOUBLE', ['VARBINARY', 'DOUBLE'], 'DDSketchFunctions::ddsketch_quantile'],
+    [130013, 'ddsketch_quantile', True, False, 'ARRAY_DOUBLE', ['VARBINARY', 'ARRAY_DOUBLE'], 'DDSketchFunctions::ddsketch_quantile_array'],
+    [130014, 'ddsketch_cdf', True, False, 'DOUBLE', ['VARBINARY', 'DOUBLE'], 'DDSketchFunctions::ddsketch_cdf'],
+    [130015, 'ddsketch_cdf', True, False, 'ARRAY_DOUBLE', ['VARBINARY', 'ARRAY_DOUBLE'], 'DDSketchFunctions::ddsketch_cdf_array'],
+    [130016, 'ddsketch_union', True, False, 'VARBINARY', ['VARBINARY', 'VARBINARY'], 'DDSketchFunctions::ddsketch_union'],
+    [130017, 'ddsketch_count', True, False, 'BIGINT', ['VARBINARY'], 'DDSketchFunctions::ddsketch_count'],
+    [130018, 'ddsketch_sum', True, False, 'DOUBLE', ['VARBINARY'], 'DDSketchFunctions::ddsketch_sum'],
+    [130019, 'ddsketch_avg', True, False, 'DOUBLE', ['VARBINARY'], 'DDSketchFunctions::ddsketch_avg'],
+    [130020, 'ddsketch_min', True, False, 'DOUBLE', ['VARBINARY'], 'DDSketchFunctions::ddsketch_min'],
+    [130021, 'ddsketch_max', True, False, 'DOUBLE', ['VARBINARY'], 'DDSketchFunctions::ddsketch_max'],
+
     [140000, 'grouping_id', True, False, 'BIGINT', ['BIGINT'], 'GroupingSetsFunctions::grouping_id'],
     [140001, 'grouping', True, False, 'BIGINT', ['BIGINT'], 'GroupingSetsFunctions::grouping'],
 

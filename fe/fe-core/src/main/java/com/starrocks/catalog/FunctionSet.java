@@ -374,6 +374,11 @@ public class FunctionSet {
     public static final String PERCENTILE_CONT = "percentile_cont";
     public static final String PERCENTILE_DISC = "percentile_disc";
     public static final String LC_PERCENTILE_DISC = "percentile_disc_lc";
+    public static final String DDSKETCH_ACCUMULATE = "ddsketch_accumulate";
+    public static final String DDSKETCH_ACCUMULATE_WEIGHTED = "ddsketch_accumulate_weighted";
+    public static final String DDSKETCH_COMBINE = "ddsketch_combine";
+    public static final String DDSKETCH_PERCENTILE = "ddsketch_percentile";
+    public static final String DDSKETCH_PERCENTILE_WEIGHTED = "ddsketch_percentile_weighted";
     public static final String RETENTION = "retention";
     public static final String STDDEV = "stddev";
     public static final String STDDEV_POP = "stddev_pop";
@@ -499,6 +504,15 @@ public class FunctionSet {
     public static final String PERCENTILE_EMPTY = "percentile_empty";
     public static final String PERCENTILE_HASH = "percentile_hash";
     public static final String PERCENTILE_UNION = "percentile_union";
+    public static final String DDSKETCH_EMPTY = "ddsketch_empty";
+    public static final String DDSKETCH_QUANTILE = "ddsketch_quantile";
+    public static final String DDSKETCH_CDF = "ddsketch_cdf";
+    public static final String DDSKETCH_UNION = "ddsketch_union";
+    public static final String DDSKETCH_COUNT = "ddsketch_count";
+    public static final String DDSKETCH_SUM = "ddsketch_sum";
+    public static final String DDSKETCH_AVG = "ddsketch_avg";
+    public static final String DDSKETCH_MIN = "ddsketch_min";
+    public static final String DDSKETCH_MAX = "ddsketch_max";
 
     // Condition functions:
     public static final String COALESCE = "coalesce";
@@ -1006,6 +1020,11 @@ public class FunctionSet {
                     .add(DS_THETA_ACCUMULATE)
                     .add(DS_THETA_COMBINE)
                     .add(DS_THETA_INTERSECT_COND_AGG)
+                    .add(DDSKETCH_ACCUMULATE)
+                    .add(DDSKETCH_ACCUMULATE_WEIGHTED)
+                    .add(DDSKETCH_COMBINE)
+                    .add(DDSKETCH_PERCENTILE)
+                    .add(DDSKETCH_PERCENTILE_WEIGHTED)
                     // Functions with constant contexts in be are not supported.
                     .add(WINDOW_FUNNEL)
                     .add(APPROX_TOP_K)
@@ -2062,6 +2081,58 @@ public class FunctionSet {
 
         addBuiltin(AggregateFunction.createBuiltin(PERCENTILE_UNION,
                 Lists.newArrayList(PercentileType.PERCENTILE), PercentileType.PERCENTILE, PercentileType.PERCENTILE,
+                false, false, false));
+
+        // DDSketch aggregate functions
+        addBuiltin(AggregateFunction.createBuiltin(DDSKETCH_ACCUMULATE,
+                Lists.newArrayList(FloatType.DOUBLE), VarbinaryType.VARBINARY, VarbinaryType.VARBINARY,
+                false, false, false));
+        addBuiltin(AggregateFunction.createBuiltin(DDSKETCH_ACCUMULATE,
+                Lists.newArrayList(FloatType.DOUBLE, FloatType.DOUBLE), VarbinaryType.VARBINARY,
+                VarbinaryType.VARBINARY,
+                false, false, false));
+        addBuiltin(AggregateFunction.createBuiltin(DDSKETCH_ACCUMULATE_WEIGHTED,
+                Lists.newArrayList(FloatType.DOUBLE, IntegerType.BIGINT), VarbinaryType.VARBINARY,
+                VarbinaryType.VARBINARY,
+                false, false, false));
+        addBuiltin(AggregateFunction.createBuiltin(DDSKETCH_ACCUMULATE_WEIGHTED,
+                Lists.newArrayList(FloatType.DOUBLE, IntegerType.BIGINT, FloatType.DOUBLE), VarbinaryType.VARBINARY,
+                VarbinaryType.VARBINARY,
+                false, false, false));
+        addBuiltin(AggregateFunction.createBuiltin(DDSKETCH_COMBINE,
+                Lists.newArrayList(VarbinaryType.VARBINARY), VarbinaryType.VARBINARY, VarbinaryType.VARBINARY,
+                false, false, false));
+        addBuiltin(AggregateFunction.createBuiltin(DDSKETCH_PERCENTILE,
+                Lists.newArrayList(FloatType.DOUBLE, FloatType.DOUBLE), FloatType.DOUBLE, VarbinaryType.VARBINARY,
+                false, false, false));
+        addBuiltin(AggregateFunction.createBuiltin(DDSKETCH_PERCENTILE,
+                Lists.newArrayList(FloatType.DOUBLE, FloatType.DOUBLE, FloatType.DOUBLE), FloatType.DOUBLE,
+                VarbinaryType.VARBINARY,
+                false, false, false));
+        addBuiltin(AggregateFunction.createBuiltin(DDSKETCH_PERCENTILE,
+                Lists.newArrayList(FloatType.DOUBLE, new ArrayType(FloatType.DOUBLE)),
+                new ArrayType(FloatType.DOUBLE), VarbinaryType.VARBINARY,
+                false, false, false));
+        addBuiltin(AggregateFunction.createBuiltin(DDSKETCH_PERCENTILE,
+                Lists.newArrayList(FloatType.DOUBLE, new ArrayType(FloatType.DOUBLE), FloatType.DOUBLE),
+                new ArrayType(FloatType.DOUBLE), VarbinaryType.VARBINARY,
+                false, false, false));
+        addBuiltin(AggregateFunction.createBuiltin(DDSKETCH_PERCENTILE_WEIGHTED,
+                Lists.newArrayList(FloatType.DOUBLE, IntegerType.BIGINT, FloatType.DOUBLE), FloatType.DOUBLE,
+                VarbinaryType.VARBINARY,
+                false, false, false));
+        addBuiltin(AggregateFunction.createBuiltin(DDSKETCH_PERCENTILE_WEIGHTED,
+                Lists.newArrayList(FloatType.DOUBLE, IntegerType.BIGINT, FloatType.DOUBLE, FloatType.DOUBLE),
+                FloatType.DOUBLE, VarbinaryType.VARBINARY,
+                false, false, false));
+        addBuiltin(AggregateFunction.createBuiltin(DDSKETCH_PERCENTILE_WEIGHTED,
+                Lists.newArrayList(FloatType.DOUBLE, IntegerType.BIGINT, new ArrayType(FloatType.DOUBLE)),
+                new ArrayType(FloatType.DOUBLE), VarbinaryType.VARBINARY,
+                false, false, false));
+        addBuiltin(AggregateFunction.createBuiltin(DDSKETCH_PERCENTILE_WEIGHTED,
+                Lists.newArrayList(FloatType.DOUBLE, IntegerType.BIGINT, new ArrayType(FloatType.DOUBLE),
+                        FloatType.DOUBLE),
+                new ArrayType(FloatType.DOUBLE), VarbinaryType.VARBINARY,
                 false, false, false));
 
         // PercentileCont

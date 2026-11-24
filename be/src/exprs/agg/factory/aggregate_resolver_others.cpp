@@ -76,6 +76,44 @@ void AggregateFuncResolver::register_others() {
     add_aggregate_mapping<TYPE_PERCENTILE, TYPE_PERCENTILE, PercentileValue>(
             "percentile_union", kWithoutWindow, AggregateFactory::MakePercentileUnionAggregateFunction());
 
+    add_aggregate_mapping_variadic<TYPE_DOUBLE, TYPE_VARBINARY, DDSketchState>(
+            "ddsketch_accumulate", false, AggregateFactory::MakeDDSketchAccumulateAggregateFunction(),
+            DDSketchEmptyNullPred());
+    add_aggregate_mapping_variadic<TYPE_DOUBLE, TYPE_VARBINARY, DDSketchState>(
+            "ddsketch_accumulate_weighted", false, AggregateFactory::MakeDDSketchAccumulateWeightedAggregateFunction(),
+            DDSketchEmptyNullPred());
+    add_aggregate_mapping<TYPE_VARBINARY, TYPE_VARBINARY, DDSketchState>(
+            "ddsketch_combine", kWithoutWindow, AggregateFactory::MakeDDSketchCombineAggregateFunction(),
+            DDSketchCombineNullPred());
+
+    add_aggregate_mapping_variadic<TYPE_BIGINT, TYPE_DOUBLE, DDSketchPercentileState>(
+            "ddsketch_percentile", false, AggregateFactory::MakeDDSketchPercentileAggregateFunction(),
+            DDSketchPercentileEmptyNullPred());
+    add_aggregate_mapping_variadic<TYPE_DOUBLE, TYPE_DOUBLE, DDSketchPercentileState>(
+            "ddsketch_percentile", false, AggregateFactory::MakeDDSketchPercentileAggregateFunction(),
+            DDSketchPercentileEmptyNullPred());
+    add_aggregate_mapping_variadic<TYPE_BIGINT, TYPE_ARRAY, DDSketchPercentileState>(
+            "ddsketch_percentile", false, AggregateFactory::MakeDDSketchPercentileArrayAggregateFunction(),
+            DDSketchPercentileEmptyNullPred());
+    add_aggregate_mapping_variadic<TYPE_DOUBLE, TYPE_ARRAY, DDSketchPercentileState>(
+            "ddsketch_percentile", false, AggregateFactory::MakeDDSketchPercentileArrayAggregateFunction(),
+            DDSketchPercentileEmptyNullPred());
+
+    add_aggregate_mapping_variadic<TYPE_BIGINT, TYPE_DOUBLE, DDSketchPercentileState>(
+            "ddsketch_percentile_weighted", false, AggregateFactory::MakeDDSketchPercentileWeightedAggregateFunction(),
+            DDSketchPercentileEmptyNullPred());
+    add_aggregate_mapping_variadic<TYPE_DOUBLE, TYPE_DOUBLE, DDSketchPercentileState>(
+            "ddsketch_percentile_weighted", false, AggregateFactory::MakeDDSketchPercentileWeightedAggregateFunction(),
+            DDSketchPercentileEmptyNullPred());
+    add_aggregate_mapping_variadic<TYPE_BIGINT, TYPE_ARRAY, DDSketchPercentileState>(
+            "ddsketch_percentile_weighted", false,
+            AggregateFactory::MakeDDSketchPercentileWeightedArrayAggregateFunction(),
+            DDSketchPercentileEmptyNullPred());
+    add_aggregate_mapping_variadic<TYPE_DOUBLE, TYPE_ARRAY, DDSketchPercentileState>(
+            "ddsketch_percentile_weighted", false,
+            AggregateFactory::MakeDDSketchPercentileWeightedArrayAggregateFunction(),
+            DDSketchPercentileEmptyNullPred());
+
     add_aggregate_mapping_variadic<TYPE_DOUBLE, TYPE_DOUBLE, PercentileState<TYPE_DOUBLE>>(
             "percentile_cont", false, AggregateFactory::MakePercentileContAggregateFunction<TYPE_DOUBLE>());
     add_aggregate_mapping_variadic<TYPE_DATETIME, TYPE_DATETIME, PercentileState<TYPE_DATETIME>>(

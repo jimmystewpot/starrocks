@@ -380,6 +380,15 @@ public class FunctionAnalyzer {
             throw new SemanticException("COUNT_IF does not support DISTINCT", functionCallExpr.getPos());
         }
 
+        if ((fnName.equals(FunctionSet.DDSKETCH_ACCUMULATE)
+                || fnName.equals(FunctionSet.DDSKETCH_ACCUMULATE_WEIGHTED)
+                || fnName.equals(FunctionSet.DDSKETCH_COMBINE)
+                || fnName.equals(FunctionSet.DDSKETCH_PERCENTILE)
+                || fnName.equals(FunctionSet.DDSKETCH_PERCENTILE_WEIGHTED))
+                && fnParams.isDistinct()) {
+            throw new SemanticException("ddsketch functions do not support DISTINCT", functionCallExpr.getPos());
+        }
+
         if (fnName.equals(FunctionSet.GROUP_CONCAT)) {
             if (functionCallExpr.getChildren().size() - fnParams.getOrderByElemNum() < 2) {
                 throw new SemanticException(
@@ -639,6 +648,85 @@ public class FunctionAnalyzer {
             if (children.size() == 4) {
                 validateNumericParameter(functionCallExpr.getChild(3), "fourth", "compression", 
                         "percentile_approx_weighted", functionCallExpr.getPos());
+            }
+        }
+
+        if (fnName.equals(FunctionSet.DDSKETCH_ACCUMULATE)) {
+            List<Expr> children = functionCallExpr.getChildren();
+            if (children.size() != 1 && children.size() != 2) {
+                throw new SemanticException(
+                        "ddsketch_accumulate(expr [, DOUBLE relative_accuracy]) requires one or two parameters",
+                        functionCallExpr.getPos());
+            }
+            validateNumericParameter(functionCallExpr.getChild(0), "first", "value",
+                    FunctionSet.DDSKETCH_ACCUMULATE, functionCallExpr.getPos());
+            if (children.size() == 2) {
+                validateDDSketchRelativeAccuracy(functionCallExpr.getChild(1), functionCallExpr.getPos());
+            }
+        }
+
+        if (fnName.equals(FunctionSet.DDSKETCH_ACCUMULATE_WEIGHTED)) {
+            List<Expr> children = functionCallExpr.getChildren();
+            if (children.size() != 2 && children.size() != 3) {
+                throw new SemanticException(
+                        "ddsketch_accumulate_weighted(expr, weight [, DOUBLE relative_accuracy]) " +
+                                "requires two or three parameters",
+                        functionCallExpr.getPos());
+            }
+            validateNumericParameter(functionCallExpr.getChild(0), "first", "value",
+                    FunctionSet.DDSKETCH_ACCUMULATE_WEIGHTED, functionCallExpr.getPos());
+            validateNumericParameter(functionCallExpr.getChild(1), "second", "weight",
+                    FunctionSet.DDSKETCH_ACCUMULATE_WEIGHTED, functionCallExpr.getPos());
+            if (children.size() == 3) {
+                validateDDSketchRelativeAccuracy(functionCallExpr.getChild(2), functionCallExpr.getPos());
+            }
+        }
+
+        if (fnName.equals(FunctionSet.DDSKETCH_COMBINE)) {
+            List<Expr> children = functionCallExpr.getChildren();
+            if (children.size() != 1) {
+                throw new SemanticException("ddsketch_combine(sketch) requires one parameter",
+                        functionCallExpr.getPos());
+            }
+            if (!functionCallExpr.getChild(0).getType().isBinaryType()) {
+                throw new SemanticException("ddsketch_combine requires a VARBINARY parameter, but got: " +
+                        functionCallExpr.getChild(0).getType().toSql(), functionCallExpr.getPos());
+            }
+        }
+
+        if (fnName.equals(FunctionSet.DDSKETCH_PERCENTILE)) {
+            List<Expr> children = functionCallExpr.getChildren();
+            if (children.size() != 2 && children.size() != 3) {
+                throw new SemanticException(
+                        "ddsketch_percentile(expr, DOUBLE|ARRAY<DOUBLE> [, DOUBLE relative_accuracy]) " +
+                                "requires two or three parameters",
+                        functionCallExpr.getPos());
+            }
+            validateNumericParameter(functionCallExpr.getChild(0), "first", "value",
+                    FunctionSet.DDSKETCH_PERCENTILE, functionCallExpr.getPos());
+            validateDDSketchQuantileParameter(functionCallExpr.getChild(1), "second",
+                    FunctionSet.DDSKETCH_PERCENTILE, functionCallExpr.getPos());
+            if (children.size() == 3) {
+                validateDDSketchRelativeAccuracy(functionCallExpr.getChild(2), functionCallExpr.getPos());
+            }
+        }
+
+        if (fnName.equals(FunctionSet.DDSKETCH_PERCENTILE_WEIGHTED)) {
+            List<Expr> children = functionCallExpr.getChildren();
+            if (children.size() != 3 && children.size() != 4) {
+                throw new SemanticException(
+                        "ddsketch_percentile_weighted(expr, weight, DOUBLE|ARRAY<DOUBLE> " +
+                                "[, DOUBLE relative_accuracy]) requires three or four parameters",
+                        functionCallExpr.getPos());
+            }
+            validateNumericParameter(functionCallExpr.getChild(0), "first", "value",
+                    FunctionSet.DDSKETCH_PERCENTILE_WEIGHTED, functionCallExpr.getPos());
+            validateNumericParameter(functionCallExpr.getChild(1), "second", "weight",
+                    FunctionSet.DDSKETCH_PERCENTILE_WEIGHTED, functionCallExpr.getPos());
+            validateDDSketchQuantileParameter(functionCallExpr.getChild(2), "third",
+                    FunctionSet.DDSKETCH_PERCENTILE_WEIGHTED, functionCallExpr.getPos());
+            if (children.size() == 4) {
+                validateDDSketchRelativeAccuracy(functionCallExpr.getChild(3), functionCallExpr.getPos());
             }
         }
 
@@ -918,6 +1006,69 @@ public class FunctionAnalyzer {
                 throw new SemanticException(
                         String.format("%s requires the %s parameter (percentile) to be ARRAY<NUMERIC>, but got: ARRAY<%s>",
                                 functionName, paramPosition, itemType.toSql()),
+                        pos);
+            }
+        }
+    }
+
+    private static Optional<Double> extractDoubleValue(Expr expr) {
+        if (expr instanceof UserVariableExpr) {
+            expr = ((UserVariableExpr) expr).getValue();
+        }
+        if (expr instanceof CastExpr && expr.getType().isNumericType()) {
+            return extractDoubleValue(expr.getChild(0));
+        }
+        if (expr instanceof LiteralExpr && !(expr instanceof NullLiteral) && expr.getType().isNumericType()) {
+            double value = ((LiteralExpr) expr).getDoubleValue();
+            if (Double.isFinite(value)) {
+                return Optional.of(value);
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static Expr unwrapArrayExpr(Expr expr) {
+        if (expr instanceof UserVariableExpr) {
+            return unwrapArrayExpr(((UserVariableExpr) expr).getValue());
+        }
+        if (expr instanceof CastExpr && expr.getType().isArrayType()) {
+            return unwrapArrayExpr(expr.getChild(0));
+        }
+        return expr;
+    }
+
+    private static void validateDDSketchRelativeAccuracy(Expr accuracyExpr, NodePosition pos) {
+        Optional<Double> alpha = extractDoubleValue(accuracyExpr);
+        if (!alpha.isPresent() || alpha.get() < 0.001 || alpha.get() > 0.5) {
+            throw new SemanticException("ddsketch relative_accuracy must be a constant in [0.001, 0.5]", pos);
+        }
+    }
+
+    private static void validateDDSketchQuantileParameter(Expr percentileExpr, String paramPosition,
+                                                          String functionName, NodePosition pos) {
+        validatePercentileParameter(percentileExpr, paramPosition, functionName, pos);
+        if (percentileExpr.getType().isArrayType()) {
+            Expr unwrapped = unwrapArrayExpr(percentileExpr);
+            if (!(unwrapped instanceof ArrayExpr) || unwrapped.getChildren().isEmpty() || !percentileExpr.isConstant()) {
+                throw new SemanticException(
+                        String.format("%s requires the %s parameter (percentile) to be a non-empty constant array",
+                                functionName, paramPosition),
+                        pos);
+            }
+            for (int i = 0; i < unwrapped.getChildren().size(); i++) {
+                Optional<Double> p = extractDoubleValue(unwrapped.getChild(i));
+                if (!p.isPresent() || p.get() < 0.0 || p.get() > 1.0) {
+                    throw new SemanticException(
+                            String.format("%s percentile array element[%d] must be between 0 and 1",
+                                    functionName, i),
+                            pos);
+                }
+            }
+        } else {
+            Optional<Double> p = extractDoubleValue(percentileExpr);
+            if (!p.isPresent() || p.get() < 0.0 || p.get() > 1.0) {
+                throw new SemanticException(
+                        String.format("%s percentile parameter must be between 0 and 1", functionName),
                         pos);
             }
         }
