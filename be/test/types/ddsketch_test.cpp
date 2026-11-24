@@ -827,6 +827,8 @@ TEST_F(DDSketchTest, TestOfficialDatadogJavaGoldenFixtures) {
     struct GoldenCase {
         const char* name;
         const char* hex;
+        uint32_t expected_interpolation;
+        uint32_t expected_max_bins;
         uint64_t count;
         double sum;
         double avg;
@@ -839,23 +841,24 @@ TEST_F(DDSketchTest, TestOfficialDatadogJavaGoldenFixtures) {
 
     const GoldenCase cases[] = {
             // Case 1: LogarithmicMapping(0.01), single observation 100.0 (UnboundedSizeDenseStore)
-            {"log_single_100_alpha_0_01_dense", "0a0909fd4a815abf52f03f120d1208000000000000f03f18cc031a00", 1ULL,
-             100.49456770856492, 100.49456770856492, 100.49456770856492, 100.49456770856492, 100.49456770856492,
-             100.49456770856492, 100.49456770856492},
+            {"log_single_100_alpha_0_01_dense", "0a0909fd4a815abf52f03f120d1208000000000000f03f18cc031a00",
+             DDSketch::kInterpolationNone, 2048U, 1ULL, 100.49456770856492, 100.49456770856492, 100.49456770856492,
+             100.49456770856492, 100.49456770856492, 100.49456770856492, 100.49456770856492},
             // Case 2: LogarithmicMapping(0.01), {0.005, 0.5, 1.0, 10.0, 100.0, 1000.0} (SparseStore)
             {"log_powers_and_fractions_alpha_0_01_sparse",
              "0a0909fd4a815abf52f03f12520a0c08910411000000000000f03f0a0b084511000000000000f03f0a0b080011000000000000f03"
              "f"
              "0a0c08e60111000000000000f03f0a0c08cc0311000000000000f03f0a0c08b20511000000000000f03f1a00",
-             6ULL, 1114.5138529928140, 185.75230883213567, 0.0050406192044765320, 1.0100000000000000,
-             100.49456770856492, 100.49456770856492, 1002.4280085221300},
+             DDSketch::kInterpolationNone, 2048U, 6ULL, 1114.5138529928140, 185.75230883213567, 0.0050406192044765320,
+             1.0100000000000000, 100.49456770856492, 100.49456770856492, 1002.4280085221300},
             // Case 3: LogarithmicMapping(0.01), {-500.0, -10.0, -1.0, 0.0, 0.0, 1.0, 10.0, 500.0} (SparseStore)
             {"log_signed_and_zero_alpha_0_01_sparse",
              "0a0909fd4a815abf52f03f12290a0b080011000000000000f03f0a0c08e60111000000000000f03f0a0c08ec0411000000000000f"
              "0"
              "3f1a290a0b080011000000000000f03f0a0c08e60111000000000000f03f0a0c08ec0411000000000000f03f21000000000000004"
              "0",
-             8ULL, 0.0, 0.0, -497.77940145581560, 0.0, 10.074696689511330, 10.074696689511330, 497.77940145581560},
+             DDSketch::kInterpolationNone, 2048U, 8ULL, 0.0, 0.0, -497.77940145581560, 0.0, 10.074696689511330,
+             10.074696689511330, 497.77940145581560},
             // Case 4: LogarithmicMapping(0.01), [10.0 .. 25.0] (UnboundedSizeDenseStore contiguous counts)
             {"log_contiguous_10_to_25_alpha_0_01_dense",
              "0a0909fd4a815abf52f03f12f60212f002000000000000f03f0000000000000000000000000000000000000000000000000000000"
@@ -873,8 +876,8 @@ TEST_F(DDSketchTest, TestOfficialDatadogJavaGoldenFixtures) {
              "00f03f0000000000000000000000000000f03f0000000000000000000000000000f03f0000000000000000000000000000f03f000"
              "0"
              "000000000000000000000000f03f18e6011a00",
-             16ULL, 279.47307544471540, 17.467067215294712, 10.074696689511330, 16.946212143511012, 22.875222481776756,
-             23.808809768044550, 24.780498769903320},
+             DDSketch::kInterpolationNone, 2048U, 16ULL, 279.47307544471540, 17.467067215294712, 10.074696689511330,
+             16.946212143511012, 22.875222481776756, 23.808809768044550, 24.780498769903320},
             // Case 5: LogarithmicMapping(0.001), 100x 1.0 + 20 log-spaced up to 1000.0 (SparseStore)
             {"log_bimodal_1_to_1000_alpha_0_001_sparse",
              "0a0909830052403308f03f12a5020a0b08001100000000000059400a0c08d80211000000000000f03f0a0c08b2051100000000000"
@@ -888,8 +891,8 @@ TEST_F(DDSketchTest, TestOfficialDatadogJavaGoldenFixtures) {
              "e22511000000000000f03f0a0c08bc2811000000000000f03f0a0c08962b11000000000000f03f0a0c08ee2d11000000000000f03"
              "f"
              "0a0c08c83011000000000000f03f0a0c08a23311000000000000f03f0a0c08fa3511000000000000f03f1a00",
-             120ULL, 3520.4500898422425, 29.337084082018688, 1.0010000000000000, 1.0010000000000000, 15.847320319275351,
-             501.19817027865133, 999.24680714442010},
+             DDSketch::kInterpolationNone, 20480U, 120ULL, 3520.4500898422425, 29.337084082018688, 1.0010000000000000,
+             1.0010000000000000, 15.847320319275351, 501.19817027865133, 999.24680714442010},
             // Case 6: Default Java CubicallyInterpolatedMapping(0.01) + SparseStore
             {"cubic_default_java_mixed_alpha_0_01_sparse",
              "0a0b09c2f1e7e9ed51f03f180312530a0c088b0111000000000000f03f0a0b080011000000000000f03f0a0c08f80211000000000"
@@ -897,8 +900,8 @@ TEST_F(DDSketchTest, TestOfficialDatadogJavaGoldenFixtures) {
              "00f03f0a0c08d00311000000000000f03f0a0c08b80511000000000000f03f0a0c08c40811000000000000f03f1a1b0a0b0800110"
              "0"
              "0000000000f03f0a0c08ac0411000000000000f03f21000000000000f03f",
-             9ULL, 51046.604341873810, 5671.8449268748680, -248.76017323768866, 1.0100000000000000, 995.08612904744850,
-             995.08612904744850, 50158.312820030056},
+             DDSketch::kInterpolationCubic, 2048U, 9ULL, 51046.604341873810, 5671.8449268748680, -248.76017323768866,
+             1.0100000000000000, 995.08612904744850, 995.08612904744850, 50158.312820030056},
             // Case 7: Default Java DDSketches.unboundedDense(0.01) over [10.0 .. 25.0] (contiguous dense + CUBIC)
             {"cubic_default_java_contiguous_10_to_25_alpha_0_01_dense",
              "0a0b09c2f1e7e9ed51f03f180312fe0212f802000000000000f03f000000000000000000000000000000000000000000000000000"
@@ -916,8 +919,8 @@ TEST_F(DDSketchTest, TestOfficialDatadogJavaGoldenFixtures) {
              "000000f03f00000000000000000000000000000000000000000000f03f0000000000000000000000000000f03f000000000000000"
              "0"
              "000000000000f03f0000000000000000000000000000f03f18e8011a00",
-             16ULL, 280.16044981553650, 17.510028113471030, 10.044983161068599, 17.156494165845820, 23.068115741661620,
-             24.002636914918774, 24.977983750285134},
+             DDSketch::kInterpolationCubic, 2048U, 16ULL, 280.16044981553650, 17.510028113471030, 10.044983161068599,
+             17.156494165845820, 23.068115741661620, 24.002636914918774, 24.977983750285134},
     };
 
     for (const auto& tc : cases) {
@@ -928,6 +931,8 @@ TEST_F(DDSketchTest, TestOfficialDatadogJavaGoldenFixtures) {
         DDSketch decoded;
         Status st = decoded.deserialize(Slice(wire));
         ASSERT_TRUE(st.ok()) << tc.name << ": " << st.to_string();
+        EXPECT_EQ(tc.expected_interpolation, decoded.interpolation());
+        EXPECT_EQ(tc.expected_max_bins, decoded.max_bins());
         EXPECT_EQ(tc.count, decoded.total_count());
         EXPECT_NEAR(tc.sum, decoded.sum(), 1e-9);
         EXPECT_NEAR(tc.avg, decoded.avg(), 1e-9);
@@ -941,17 +946,26 @@ TEST_F(DDSketchTest, TestOfficialDatadogJavaGoldenFixtures) {
         DDSketch merged;
         Status st_m = merged.merge_serialized(Slice(wire));
         ASSERT_TRUE(st_m.ok()) << tc.name << ": " << st_m.to_string();
+        EXPECT_EQ(tc.expected_interpolation, merged.interpolation());
+        EXPECT_EQ(tc.expected_max_bins, merged.max_bins());
         EXPECT_EQ(tc.count, merged.total_count());
+        EXPECT_NEAR(tc.sum, merged.sum(), 1e-9);
+        EXPECT_NEAR(tc.avg, merged.avg(), 1e-9);
+        EXPECT_NEAR(tc.p0, merged.quantile(0.0), 1e-11);
         EXPECT_NEAR(tc.p50, merged.quantile(0.5), 1e-11);
+        EXPECT_NEAR(tc.p90, merged.quantile(0.9), 1e-11);
         EXPECT_NEAR(tc.p99, merged.quantile(0.99), 1e-11);
+        EXPECT_NEAR(tc.p100, merged.quantile(1.0), 1e-11);
 
         // 3. Re-serialize from C++ (including CUBIC interpolation tag 0x18 0x03) and re-decode
         std::string reserialized = serialize_sketch(decoded);
         DDSketch roundtrip;
         ASSERT_TRUE(roundtrip.deserialize(Slice(reserialized)).ok());
-        EXPECT_EQ(decoded.interpolation(), roundtrip.interpolation());
+        EXPECT_EQ(tc.expected_interpolation, roundtrip.interpolation());
+        EXPECT_EQ(tc.expected_max_bins, roundtrip.max_bins());
         EXPECT_EQ(tc.count, roundtrip.total_count());
         EXPECT_NEAR(tc.sum, roundtrip.sum(), 1e-9);
+        EXPECT_NEAR(tc.avg, roundtrip.avg(), 1e-9);
         EXPECT_NEAR(tc.p0, roundtrip.quantile(0.0), 1e-11);
         EXPECT_NEAR(tc.p50, roundtrip.quantile(0.5), 1e-11);
         EXPECT_NEAR(tc.p90, roundtrip.quantile(0.9), 1e-11);
@@ -1036,6 +1050,143 @@ TEST_F(DDSketchTest, TestOfficialDatadogJavaGoldenFixtures) {
         EXPECT_DOUBLE_EQ(fresh_decoded.min_value(), reused.min_value());
         EXPECT_DOUBLE_EQ(fresh_decoded.quantile(0.5), reused.quantile(0.5));
         EXPECT_EQ(serialize_sketch(fresh_decoded), serialize_sketch(reused));
+    }
+}
+
+// Golden fixtures generated directly by official github.com/DataDog/sketches-go v1.4.8
+// (proto.Marshal(sketch.ToProto())).
+TEST_F(DDSketchTest, TestOfficialDatadogGoGoldenFixtures) {
+    struct GoldenCase {
+        const char* name;
+        const char* hex;
+        uint32_t expected_interpolation;
+        uint32_t expected_max_bins;
+        uint64_t count;
+        double sum;
+        double avg;
+        double p0;
+        double p50;
+        double p90;
+        double p99;
+        double p100;
+    };
+
+    const GoldenCase cases[] = {
+            // Case 1: LogarithmicMapping(0.01), single observation 100.0 (LogUnboundedDenseDDSketch)
+            {"go_log_single_100_alpha_0_01", "0a0909fd4a815abf52f03f120d1208000000000000f03f18cc031a00",
+             DDSketch::kInterpolationNone, 2048U, 1ULL, 100.49456770856489, 100.49456770856489, 100.49456770856489,
+             100.49456770856489, 100.49456770856489, 100.49456770856489, 100.49456770856489},
+            // Case 2: LogarithmicMapping(0.01), {-500.0, -10.0, -1.0, 0.0, 1.0, 10.0, 500.0} (SparseStore)
+            {"go_log_signed_zero_alpha_0_01",
+             "0a0909fd4a815abf52f03f12290a0b080011000000000000f03f0a0c08e60111000000000000f03f0a0c08ec0411000000000000f"
+             "03f1a290a0b080011000000000000f03f0a0c08ec0411000000000000f03f0a0c08e60111000000000000f03f21000000000000f0"
+             "3f",
+             DDSketch::kInterpolationNone, 2048U, 7ULL, 0.0, 0.0, -497.7794014558155, 0.0, 10.074696689511327,
+             10.074696689511327, 497.7794014558155},
+            // Case 3: CubicallyInterpolatedMapping(0.01) + DefaultProvider with {-250, -1, 0, 0.5, 1, 10, 100, 1000}
+            {"go_cubic_default_alpha_0_01",
+             "0a0b09c3f1e7e9ed51f03f180312440a0c08d00311000000000000f03f0a0c08b80511000000000000f03f0a0b084511000000000"
+             "000f03f0a0b080011000000000000f03f0a0c08e80111000000000000f03f1a1b0a0b080011000000000000f03f0a0c08ac041100"
+             "0000000000f03f21000000000000f03f",
+             DDSketch::kInterpolationCubic, 2048U, 8ULL, 856.79251222116113, 107.09906402764514, -248.76017323770407,
+             0.50498866925061126, 99.916584581019848, 99.916584581019848, 995.0861290475259},
+            // Case 4: CubicallyInterpolatedMapping(0.001) + DefaultProvider, 100 x 1.0 + 20 log-spaced up to 1000.0
+            {"go_cubic_alpha_0_001_bimodal",
+             "0a0b099a2b05ae1e08f03f180312a5020a0c08cc2b11000000000000f03f0a0c08843111000000000000f03f0a0c08d8201100000"
+             "0000000f03f0a0c08b80511000000000000f03f0a0c08960811000000000000f03f0a0c08d00d11000000000000f03f0a0c08e615"
+             "11000000000000f03f0a0c08e23311000000000000f03f0a0c08dc0211000000000000f03f0a0c08ac1011000000000000f03f0a0"
+             "c08fc1d11000000000000f03f0a0c08b62311000000000000f03f0a0c08be3611000000000000f03f0a0b08001100000000000059"
+             "400a0c08f20a11000000000000f03f0a0c08c21811000000000000f03f0a0c089e1b11000000000000f03f0a0c089226110000000"
+             "00000f03f0a0c08aa2e11000000000000f03f0a0c088a1311000000000000f03f0a0c08f02811000000000000f03f1a00",
+             DDSketch::kInterpolationCubic, 20480U, 120ULL, 3519.61981181294, 29.330165098441167, 1.0010000000000006,
+             1.0010000000000006, 15.862367458261247, 500.75379614938618, 999.56116319963849},
+            // Case 5: NewDefaultDDSketch(0.001) (LogarithmicMapping/NONE + DefaultProvider), 100 x 1.0 + 20 log-spaced
+            {"go_log_alpha_0_001_bimodal",
+             "0a0909830052403308f03f12a5020a0c08a41811000000000000f03f0a0c08fc1a11000000000000f03f0a0c088a2311000000000"
+             "000f03f0a0b08001100000000000059400a0c08981011000000000000f03f0a0c08b02011000000000000f03f0a0c08fa35110000"
+             "00000000f03f0a0c08b20511000000000000f03f0a0c08ca1511000000000000f03f0a0c08d61d11000000000000f03f0a0c08962"
+             "b11000000000000f03f0a0c08c83011000000000000f03f0a0c08e22511000000000000f03f0a0c08bc2811000000000000f03f0a"
+             "0"
+             "c08ee2d11000000000000f03f0a0c08a23311000000000000f03f0a0c08d80211000000000000f03f0a0c088c0811000000000000"
+             "f03f0a0c08e40a11000000000000f03f0a0c08be0d11000000000000f03f0a0c08f01211000000000000f03f1a00",
+             DDSketch::kInterpolationNone, 20480U, 120ULL, 3520.4500898422434, 29.337084082018695, 1.0010000000000001,
+             1.0010000000000001, 15.847320319275354, 501.19817027865145, 999.24680714442036},
+    };
+
+    auto q_tol = [](double expected) { return std::max(1e-11, std::abs(expected) * 1e-12); };
+
+    for (const auto& tc : cases) {
+        SCOPED_TRACE(tc.name);
+        const std::string wire = hex_to_bytes(tc.hex);
+
+        // 1. Direct deserialize() from official DataDog/sketches-go v1.4.8 protobuf bytes
+        DDSketch decoded;
+        Status st = decoded.deserialize(Slice(wire));
+        ASSERT_TRUE(st.ok()) << tc.name << ": " << st.to_string();
+        EXPECT_EQ(tc.expected_interpolation, decoded.interpolation());
+        EXPECT_EQ(tc.expected_max_bins, decoded.max_bins());
+        EXPECT_EQ(tc.count, decoded.total_count());
+        EXPECT_NEAR(tc.sum, decoded.sum(), 1e-9);
+        EXPECT_NEAR(tc.avg, decoded.avg(), 1e-9);
+        EXPECT_NEAR(tc.p0, decoded.quantile(0.0), q_tol(tc.p0));
+        EXPECT_NEAR(tc.p50, decoded.quantile(0.5), q_tol(tc.p50));
+        EXPECT_NEAR(tc.p90, decoded.quantile(0.9), q_tol(tc.p90));
+        EXPECT_NEAR(tc.p99, decoded.quantile(0.99), q_tol(tc.p99));
+        EXPECT_NEAR(tc.p100, decoded.quantile(1.0), q_tol(tc.p100));
+
+        // 2. Direct merge_serialized() from official DataDog/sketches-go v1.4.8 protobuf bytes
+        DDSketch merged;
+        Status st_m = merged.merge_serialized(Slice(wire));
+        ASSERT_TRUE(st_m.ok()) << tc.name << ": " << st_m.to_string();
+        EXPECT_EQ(tc.expected_interpolation, merged.interpolation());
+        EXPECT_EQ(tc.expected_max_bins, merged.max_bins());
+        EXPECT_EQ(tc.count, merged.total_count());
+        EXPECT_NEAR(tc.sum, merged.sum(), 1e-9);
+        EXPECT_NEAR(tc.avg, merged.avg(), 1e-9);
+        EXPECT_NEAR(tc.p0, merged.quantile(0.0), q_tol(tc.p0));
+        EXPECT_NEAR(tc.p50, merged.quantile(0.5), q_tol(tc.p50));
+        EXPECT_NEAR(tc.p90, merged.quantile(0.9), q_tol(tc.p90));
+        EXPECT_NEAR(tc.p99, merged.quantile(0.99), q_tol(tc.p99));
+        EXPECT_NEAR(tc.p100, merged.quantile(1.0), q_tol(tc.p100));
+
+        // 3. Re-serialize from C++ and re-decode (bidirectional round-trip)
+        std::string reserialized = serialize_sketch(decoded);
+        DDSketch roundtrip;
+        ASSERT_TRUE(roundtrip.deserialize(Slice(reserialized)).ok());
+        EXPECT_EQ(tc.expected_interpolation, roundtrip.interpolation());
+        EXPECT_EQ(tc.expected_max_bins, roundtrip.max_bins());
+        EXPECT_EQ(tc.count, roundtrip.total_count());
+        EXPECT_NEAR(tc.sum, roundtrip.sum(), 1e-9);
+        EXPECT_NEAR(tc.avg, roundtrip.avg(), 1e-9);
+        EXPECT_NEAR(tc.p0, roundtrip.quantile(0.0), q_tol(tc.p0));
+        EXPECT_NEAR(tc.p50, roundtrip.quantile(0.5), q_tol(tc.p50));
+        EXPECT_NEAR(tc.p90, roundtrip.quantile(0.9), q_tol(tc.p90));
+        EXPECT_NEAR(tc.p99, roundtrip.quantile(0.99), q_tol(tc.p99));
+        EXPECT_NEAR(tc.p100, roundtrip.quantile(1.0), q_tol(tc.p100));
+    }
+
+    // 4. Bidirectional C++ -> Java 0.8.3 & Go v1.4.8 cross-verified collapsing [1..1e20] at alpha = 0.001
+    {
+        DDSketch collapsing_001(0.001);
+        for (int i = 0; i < 100; ++i) {
+            collapsing_001.add(1.0);
+        }
+        for (int i = 1; i <= 20; ++i) {
+            collapsing_001.add(std::pow(1e20, static_cast<double>(i) / 20.0));
+        }
+        EXPECT_EQ(20480U, collapsing_001.max_bins());
+        const std::string wire = serialize_sketch(collapsing_001);
+
+        DDSketch roundtrip;
+        ASSERT_TRUE(roundtrip.deserialize(Slice(wire)).ok());
+        EXPECT_EQ(20480U, roundtrip.max_bins());
+        EXPECT_EQ(120ULL, roundtrip.total_count());
+        EXPECT_NEAR(1.1104179217702573e+20, roundtrip.sum(), 1e+11);
+        EXPECT_NEAR(162.87795819882263, roundtrip.quantile(0.0), 1e-11);
+        EXPECT_NEAR(162.87795819882263, roundtrip.quantile(0.5), 1e-11);
+        EXPECT_NEAR(100032494.91685347, roundtrip.quantile(0.9), 1e-7);
+        EXPECT_NEAR(1.0004817577889793e+18, roundtrip.quantile(0.99), 1e+9);
+        EXPECT_NEAR(9.993132263973639e+19, roundtrip.quantile(1.0), 1e+11);
     }
 }
 
