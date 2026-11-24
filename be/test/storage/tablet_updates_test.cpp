@@ -5610,9 +5610,9 @@ TEST_F(TabletUpdatesTest, test_find_best_tablet_two_phase_scan_and_dirty_fallbac
     };
 
     // Place dup_tablet and idle_tablet in distinct shards, and place med/clean_high/dirty_high in the same shard
-    // (using shard_stride = config::tablet_map_shard_size) so Phase 2 receives candidates.size() >= 2 and exercises
-    // both std::sort (dirty first, then descending peeked_score) and the early break.
-    const int64_t shard_stride = config::tablet_map_shard_size;
+    // (using shard_stride = tablet_mgr->_tablets_shards.size()) so Phase 2 receives candidates.size() >= 2 and
+    // exercises both std::sort (dirty first, then descending peeked_score) and the early break.
+    const int64_t shard_stride = static_cast<int64_t>(tablet_mgr->_tablets_shards.size());
     auto dup_tablet = create_dup_tablet(100301, 100301);
     auto idle_tablet = create_tablet(100302, 100302);
     auto med_tablet = create_tablet(100303, 100303);
@@ -5638,7 +5638,7 @@ TEST_F(TabletUpdatesTest, test_find_best_tablet_two_phase_scan_and_dirty_fallbac
                 if (t->updates() != nullptr) {
                     t->updates()->wait_apply_done();
                 }
-                (void)tablet_mgr->drop_tablet(t->tablet_id());
+                (void)tablet_mgr->drop_tablet(t->tablet_id(), kKeepMetaAndFiles);
                 (void)fs::remove_all(t->schema_hash_path());
             }
         }

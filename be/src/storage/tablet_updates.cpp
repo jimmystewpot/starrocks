@@ -2987,7 +2987,7 @@ int64_t TabletUpdates::_calc_raw_compaction_score_unlocked(const std::vector<uin
 }
 
 bool TabletUpdates::peek_compaction_score(int64_t now_ms, int64_t* score) const {
-    if (_compaction_running.load(std::memory_order_relaxed) || _error.load(std::memory_order_relaxed)) {
+    if (_compaction_running.load(std::memory_order_acquire) || _error.load(std::memory_order_acquire)) {
         *score = -1;
         return true;
     }
@@ -2999,7 +2999,7 @@ bool TabletUpdates::peek_compaction_score(int64_t now_ms, int64_t* score) const 
     }
 
     const uint64_t seq1 = _compaction_score_cache_seqlock.load(std::memory_order_acquire);
-    if ((seq1 & 1) != 0) {
+    if (seq1 == 0 || (seq1 & 1) != 0) {
         return false;
     }
 
