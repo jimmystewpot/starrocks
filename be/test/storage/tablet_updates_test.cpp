@@ -5820,6 +5820,111 @@ TEST_F(TabletUpdatesTest, test_find_best_tablet_concurrent_apply_create_drop) {
     EXPECT_GT(scan_iters.load(std::memory_order_relaxed), 0);
 }
 
+TEST_F(TabletUpdatesTest, test_normal_apply_preserves_level_cfg_and_skips_full_level_refresh) {
+    const int64_t old_size_threshold = config::update_compaction_size_threshold;
+    const bool old_size_tiered = config::enable_pk_size_tiered_compaction_strategy;
+    const int64_t old_min_level_size = config::size_tiered_min_level_size;
+    const int64_t old_level_multiple = config::size_tiered_level_multiple;
+    const int64_t old_level_num = config::size_tiered_level_num;
+    const int64_t old_min_interval = config::update_compaction_per_tablet_min_interval_seconds;
+    DeferOp restore([&] {
+        config::update_compaction_size_threshold = old_size_threshold;
+        config::enable_pk_size_tiered_compaction_strategy = old_size_tiered;
+        config::size_tiered_min_level_size = old_min_level_size;
+        config::size_tiered_level_multiple = old_level_multiple;
+        config::size_tiered_level_num = old_level_num;
+        config::update_compaction_per_tablet_min_interval_seconds = old_min_interval;
+    });
+
+    config::update_compaction_per_tablet_min_interval_seconds = 0;
+    auto* tablet_mgr = StorageEngine::instance()->tablet_manager();
+
+    for (bool size_tiered_enabled : {false, true}) {
+        config::enable_pk_size_tiered_compaction_strategy = size_tiered_enabled;
+        config::size_tiered_min_level_size = 131072;
+        config::size_tiered_level_multiple = 5;
+        config::size_tiered_level_num = 7;
+
+        const int64_t tid = 100350 + (size_tiered_enabled ? 1 : 0);
+        auto tablet = create_tablet(tid, static_cast<int32_t>(tid));
+        ASSERT_NE(nullptr, tablet);
+        tablet->set_enable_persistent_index(false);
+        DeferOp cleanup([&] {
+            tablet->updates()->wait_apply_done();
+            (void)tablet_mgr->drop_tablet(tid, kKeepMetaAndFiles);
+            (void)TabletMetaManager::remove(tablet->data_dir(), tid);
+            (void)fs::remove_all(tablet->schema_hash_path());
+        });
+
+        auto* u = tablet->updates();
+        auto make_keys = [](int64_t start, int count) {
+            std::vector<int64_t> keys;
+            keys.reserve(count);
+            for (int i = 0; i < count; ++i) {
+                keys.push_back(start + i);
+            }
+            return keys;
+        };
+
+        // Commit multiple retained rowsets with disjoint key ranges and warm the cache.
+        ASSERT_OK(tablet->rowset_commit(2, create_rowset(tablet, make_keys(0, 50))));
+        ASSERT_OK(tablet->rowset_commit(3, create_rowset(tablet, make_keys(100, 50))));
+        ASSERT_OK(tablet->rowset_commit(4, create_rowset(tablet, make_keys(200, 50))));
+        u->wait_apply_done();
+
+        const int64_t warm_score = u->get_compaction_score();
+        EXPECT_EQ(calc_reference_compaction_score(u), warm_score);
+        int64_t peeked = -1;
+        ASSERT_TRUE(u->peek_compaction_score(UnixMillis(), &peeked));
+        EXPECT_EQ(warm_score, peeked);
+
+        // Apply a normal update with unchanged config and verify score matches reference.
+        ASSERT_OK(tablet->rowset_commit(5, create_rowset(tablet, make_keys(100, 20))));
+        u->wait_apply_done();
+        EXPECT_EQ(calc_reference_compaction_score(u), u->get_compaction_score());
+
+        // Plant a sentinel compaction_level on an untouched rowset (rowset with keys [0, 50)).
+        uint32_t untouched_rsid = 0;
+        {
+            std::lock_guard rl(u->_lock);
+            ASSERT_FALSE(u->_edit_version_infos.empty());
+            ASSERT_GE(u->_edit_version_infos[u->_apply_version_idx]->rowsets.size(), 3);
+            untouched_rsid = u->_edit_version_infos[u->_apply_version_idx]->rowsets.front();
+        }
+        constexpr int32_t kSentinelLevel = 999;
+        {
+            std::lock_guard lg(u->_rowset_stats_lock);
+            auto itr = u->_rowset_stats.find(untouched_rsid);
+            ASSERT_NE(itr, u->_rowset_stats.end());
+            itr->second->compaction_level = kSentinelLevel;
+        }
+
+        // Apply another normal update touching only disjoint keys [300, 350): untouched rowset
+        // must NOT have its compaction_level recalculated because level config did not change.
+        ASSERT_OK(tablet->rowset_commit(6, create_rowset(tablet, make_keys(300, 50))));
+        u->wait_apply_done();
+        {
+            std::lock_guard lg(u->_rowset_stats_lock);
+            auto itr = u->_rowset_stats.find(untouched_rsid);
+            ASSERT_NE(itr, u->_rowset_stats.end());
+            EXPECT_EQ(kSentinelLevel, itr->second->compaction_level);
+        }
+
+        // Change level configuration: full refresh MUST recalculate the untouched rowset level
+        // and produce a score matching the reference.
+        config::size_tiered_min_level_size = 64;
+        const int64_t refreshed_score = u->get_compaction_score();
+        EXPECT_EQ(calc_reference_compaction_score(u), refreshed_score);
+        {
+            std::lock_guard lg(u->_rowset_stats_lock);
+            auto itr = u->_rowset_stats.find(untouched_rsid);
+            ASSERT_NE(itr, u->_rowset_stats.end());
+            EXPECT_NE(kSentinelLevel, itr->second->compaction_level);
+            EXPECT_EQ(u->_calc_compaction_level(itr->second.get()), itr->second->compaction_level);
+        }
+    }
+}
+
 // Full/non-full input selection, light publish and index rebuild are independent
 // inputs. In particular, the two config switches must not reset an index that
 // the light conflict resolver subsequently updates with replace().

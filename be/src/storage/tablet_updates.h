@@ -640,6 +640,9 @@ private:
                                                   const LevelConfig& level_cfg);
     // Requires |_rowset_stats_lock| held (serializes seqlock writers).
     void _invalidate_compaction_score_cache_unlocked();
+    // Requires |_rowset_stats_lock| held. Forces full RowsetStats::compaction_level recomputation
+    // on the next refresh (used only on rebuild/clear paths, not routine applies).
+    void _invalidate_rowset_stats_level_cfg_unlocked() { _rowset_stats_level_cfg = {}; }
 
     // Protected by |_rowset_stats_lock|.
     LevelConfig _rowset_stats_level_cfg;

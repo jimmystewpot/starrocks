@@ -295,6 +295,7 @@ Status TabletUpdates::_load_from_pb(const TabletUpdatesPB& tablet_updates_pb) {
         std::lock_guard lg(_rowset_stats_lock);
         _rowset_stats.clear();
         _invalidate_compaction_score_cache_unlocked();
+        _invalidate_rowset_stats_level_cfg_unlocked();
     }
     std::set<uint32_t> unapplied_rowsets;
     auto st = _load_rowsets_and_check_consistency(unapplied_rowsets);
@@ -2924,7 +2925,6 @@ void TabletUpdates::_invalidate_compaction_score_cache_unlocked() {
     _compaction_score_cache_seqlock.store(seq + 1, std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_release);
     _cached_score_valid.store(false, std::memory_order_relaxed);
-    _rowset_stats_level_cfg = {};
     _compaction_score_cache_seqlock.store(seq + 2, std::memory_order_release);
 }
 
@@ -5280,6 +5280,7 @@ Status TabletUpdates::load_snapshot(const SnapshotMeta& snapshot_meta, bool rest
         _apply_version_idx = 0;
         _applied_version_seq.fetch_add(1, std::memory_order_release);
         _invalidate_compaction_score_cache_unlocked();
+        _invalidate_rowset_stats_level_cfg_unlocked();
         _rowsets = std::move(new_rowsets);
 
         auto& new_version = _edit_version_infos.emplace_back(std::make_unique<EditVersionInfo>());
@@ -5460,6 +5461,7 @@ Status TabletUpdates::clear_meta() {
     STLClearObject(&_edit_version_infos);
     _applied_version_seq.fetch_add(1, std::memory_order_release);
     _invalidate_compaction_score_cache_unlocked();
+    _invalidate_rowset_stats_level_cfg_unlocked();
     return Status::OK();
 }
 
@@ -6061,6 +6063,7 @@ Status TabletUpdates::recover() {
         _applied_version_seq.fetch_add(1, std::memory_order_release);
         std::lock_guard stats_lg(_rowset_stats_lock);
         _invalidate_compaction_score_cache_unlocked();
+        _invalidate_rowset_stats_level_cfg_unlocked();
     }
 
     // reset error state
