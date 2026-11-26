@@ -37,6 +37,11 @@ public:
     }
 
 public:
+    static bool has_compiled_regex_or_hs(FunctionContext* context) {
+        return LikePredicate::shared_state(context)->database != nullptr ||
+               LikePredicate::shared_state(context)->re2 != nullptr;
+    }
+
     TExprNode expr_node;
 };
 
@@ -999,6 +1004,196 @@ TEST_F(LikeTest, issue76417RegexpAlternation) {
         ASSERT_TRUE(ColumnHelper::get_const_value<TYPE_BOOLEAN>(result));
 
         ASSERT_TRUE(LikePredicate::regex_close(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+    }
+}
+
+TEST_F(LikeTest, emptyConstPatternLikeUsesConstantEquals) {
+    auto context = FunctionContext::create_test_context();
+    std::unique_ptr<FunctionContext> ctx(context);
+    Columns columns;
+
+    auto str = BinaryColumn::create();
+    str->append("");
+    str->append("a");
+    str->append("");
+    str->append("hello");
+    auto pattern = ColumnHelper::create_const_column<TYPE_VARCHAR>("", 4);
+
+    columns.emplace_back(std::move(str));
+    columns.emplace_back(std::move(pattern));
+    context->set_constant_columns(columns);
+
+    ASSERT_TRUE(LikePredicate::like_prepare(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+    EXPECT_FALSE(has_compiled_regex_or_hs(context));
+
+    auto result = LikePredicate::like(context, columns).value();
+    const auto* data = ColumnHelper::cast_to_raw<TYPE_BOOLEAN>(result)->immutable_data().data();
+    EXPECT_EQ(1, data[0]);
+    EXPECT_EQ(0, data[1]);
+    EXPECT_EQ(1, data[2]);
+    EXPECT_EQ(0, data[3]);
+
+    ASSERT_TRUE(LikePredicate::like_close(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+}
+
+TEST_F(LikeTest, matchConstantAllSizeClassesAndSimdRegimes) {
+    const std::vector<size_t> pat_lengths = {0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  12, 15,
+                                             16, 17, 20, 24, 25, 31, 32, 33, 47, 48, 49, 64};
+    const std::vector<size_t> row_counts = {0, 1, 3, 4, 7, 8, 9, 15, 16, 17, 63, 64, 65};
+
+    for (size_t pat_len : pat_lengths) {
+        std::string pat_str(pat_len, '\0');
+        for (size_t i = 0; i < pat_len; ++i) {
+            // Include embedded NUL at index 2 when pat_len >= 4
+            pat_str[i] = (i == 2 && pat_len >= 4) ? '\0' : static_cast<char>('a' + (i % 23));
+        }
+        Slice pat_slice(pat_str);
+
+        for (size_t n_rows : row_counts) {
+            auto col = BinaryColumn::create();
+            std::vector<uint8_t> expected_starts(n_rows, 0);
+            std::vector<uint8_t> expected_ends(n_rows, 0);
+            std::vector<uint8_t> expected_equals(n_rows, 0);
+
+            for (size_t r = 0; r < n_rows; ++r) {
+                std::string val;
+                if (pat_len == 0) {
+                    val = (r % 3 == 0) ? "" : "non_empty";
+                } else if (r < 16 && n_rows >= 32) {
+                    // Regime 1: 16 consecutive length-rejected rows (shorter than pat_len)
+                    val = pat_str.substr(0, pat_len - 1);
+                } else if (r >= 16 && r < 32 && n_rows >= 48) {
+                    // Regime 2: 16 consecutive length-equal rows (alternating byte match/mismatch)
+                    val = pat_str;
+                    if (r % 2 == 1) {
+                        val[pat_len / 2] ^= 0x01;
+                    }
+                } else {
+                    // Regime 3: mixed lengths and positions
+                    switch (r % 6) {
+                    case 0: // exact match
+                        val = pat_str;
+                        break;
+                    case 1: // prefix match only
+                        val = pat_str + "tail_extra";
+                        break;
+                    case 2: // suffix match only
+                        val = std::string("head_extra") + pat_str;
+                        break;
+                    case 3: // shorter than pattern
+                        val = pat_str.substr(0, pat_len / 2);
+                        break;
+                    case 4: { // same length, mismatch at first byte
+                        val = pat_str;
+                        val.front() ^= 0x01;
+                        break;
+                    }
+                    case 5: { // longer, mismatch at last byte of prefix/suffix
+                        val = pat_str;
+                        val.back() ^= 0x01;
+                        val = "x" + val + "y";
+                        break;
+                    }
+                    }
+                }
+                col->append(Slice(val));
+                expected_starts[r] =
+                        (val.size() >= pat_len && std::memcmp(val.data(), pat_str.data(), pat_len) == 0) ? 1 : 0;
+                expected_ends[r] = (val.size() >= pat_len &&
+                                    std::memcmp(val.data() + val.size() - pat_len, pat_str.data(), pat_len) == 0)
+                                           ? 1
+                                           : 0;
+                expected_equals[r] =
+                        (val.size() == pat_len && std::memcmp(val.data(), pat_str.data(), pat_len) == 0) ? 1 : 0;
+            }
+
+            auto res_starts = LikePredicate::match_constant_starts_with(col, pat_slice).value();
+            auto res_ends = LikePredicate::match_constant_ends_with(col, pat_slice).value();
+            auto res_equals = LikePredicate::match_constant_equals(col, pat_slice).value();
+
+            auto b_starts = ColumnHelper::cast_to<TYPE_BOOLEAN>(res_starts)->immutable_data();
+            auto b_ends = ColumnHelper::cast_to<TYPE_BOOLEAN>(res_ends)->immutable_data();
+            auto b_equals = ColumnHelper::cast_to<TYPE_BOOLEAN>(res_equals)->immutable_data();
+
+            for (size_t r = 0; r < n_rows; ++r) {
+                ASSERT_EQ(expected_starts[r], b_starts[r])
+                        << "pat_len=" << pat_len << " n_rows=" << n_rows << " r=" << r;
+                ASSERT_EQ(expected_ends[r], b_ends[r]) << "pat_len=" << pat_len << " n_rows=" << n_rows << " r=" << r;
+                ASSERT_EQ(expected_equals[r], b_equals[r])
+                        << "pat_len=" << pat_len << " n_rows=" << n_rows << " r=" << r;
+            }
+        }
+    }
+}
+
+TEST_F(LikeTest, matchConstantColumnWrappersAndEmptyLikePatterns) {
+    // 1. Large-offset BinaryColumn
+    {
+        auto large_col = BinaryColumn::create();
+        large_col->get_offset().ensure_width_for_value(static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) + 1);
+        large_col->append(Slice("https://starrocks.io"));
+        large_col->append(Slice("http://starrocks.io"));
+        auto res = LikePredicate::match_constant_starts_with(large_col, Slice("https://")).value();
+        auto data = ColumnHelper::cast_to<TYPE_BOOLEAN>(res)->immutable_data();
+        ASSERT_EQ(1, data[0]);
+        ASSERT_EQ(0, data[1]);
+    }
+
+    // 2. ConstColumn (matching and non-matching, size > 1 preserved)
+    {
+        auto const_col = ColumnHelper::create_const_column<TYPE_VARCHAR>("starrocks", 7);
+        auto res_true = LikePredicate::match_constant_ends_with(const_col, Slice("rocks")).value();
+        ASSERT_TRUE(res_true->is_constant());
+        ASSERT_EQ(7, res_true->size());
+        ASSERT_TRUE(ColumnHelper::get_const_value<TYPE_BOOLEAN>(res_true));
+
+        auto res_false = LikePredicate::match_constant_equals(const_col, Slice("star")).value();
+        ASSERT_TRUE(res_false->is_constant());
+        ASSERT_EQ(7, res_false->size());
+        ASSERT_FALSE(ColumnHelper::get_const_value<TYPE_BOOLEAN>(res_false));
+    }
+
+    // 3. only_null() preserves row count
+    {
+        auto null_const = ColumnHelper::create_const_null_column(11);
+        auto res = LikePredicate::match_constant_starts_with(null_const, Slice("abc")).value();
+        ASSERT_TRUE(res->only_null());
+        ASSERT_EQ(11, res->size());
+    }
+
+    // 4. LIKE '' and LIKE '%' / '%%' via like_prepare + like (no regex/hyperscan compiled)
+    {
+        auto context = FunctionContext::create_test_context();
+        std::unique_ptr<FunctionContext> ctx(context);
+
+        auto str = BinaryColumn::create();
+        str->append("");
+        str->append("a");
+        str->append("abc");
+
+        auto empty_pat = ColumnHelper::create_const_column<TYPE_VARCHAR>("", 3);
+        Columns cols_empty = {str, empty_pat};
+        context->set_constant_columns(cols_empty);
+        ASSERT_TRUE(LikePredicate::like_prepare(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+        EXPECT_FALSE(has_compiled_regex_or_hs(context));
+        auto res_empty = LikePredicate::like(context, cols_empty).value();
+        auto v_empty = ColumnHelper::cast_to<TYPE_BOOLEAN>(res_empty)->immutable_data();
+        ASSERT_EQ(1, v_empty[0]);
+        ASSERT_EQ(0, v_empty[1]);
+        ASSERT_EQ(0, v_empty[2]);
+        ASSERT_TRUE(LikePredicate::like_close(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+
+        auto pct_pat = ColumnHelper::create_const_column<TYPE_VARCHAR>("%", 3);
+        Columns cols_pct = {str, pct_pat};
+        context->set_constant_columns(cols_pct);
+        ASSERT_TRUE(LikePredicate::like_prepare(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
+        EXPECT_FALSE(has_compiled_regex_or_hs(context));
+        auto res_pct = LikePredicate::like(context, cols_pct).value();
+        auto v_pct = ColumnHelper::cast_to<TYPE_BOOLEAN>(res_pct)->immutable_data();
+        ASSERT_EQ(1, v_pct[0]);
+        ASSERT_EQ(1, v_pct[1]);
+        ASSERT_EQ(1, v_pct[2]);
+        ASSERT_TRUE(LikePredicate::like_close(context, FunctionContext::FunctionStateScope::FRAGMENT_LOCAL).ok());
     }
 }
 } // namespace starrocks

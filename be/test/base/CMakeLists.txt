@@ -85,6 +85,7 @@ set(BASE_TEST_FILES
     string/c_string_test.cpp
     string/faststring_test.cpp
     string/memcmp_test.cpp
+    string/offset_string_cmp_test.cpp
     string/parse_util_test.cpp
     string/string_search_test.cpp
     string/string_searcher_test.cpp

@@ -62,6 +62,10 @@ public:
      */
     DEFINE_VECTORIZED_FN(regex);
 
+    static StatusOr<ColumnPtr> match_constant_starts_with(const ColumnPtr& value_col, const Slice& pattern);
+    static StatusOr<ColumnPtr> match_constant_ends_with(const ColumnPtr& value_col, const Slice& pattern);
+    static StatusOr<ColumnPtr> match_constant_equals(const ColumnPtr& value_col, const Slice& pattern);
+
 private:
     /**
      * use for:
@@ -216,8 +220,6 @@ private:
         /// the string.
         Slice search_string_sv;
 
-        ColumnPtr _search_string_column;
-
         // The Hyperscan database compiled once from the (constant) pattern in the FRAGMENT_LOCAL
         // prepare and shared across all worker threads (shared_ptr with hs_free_database as the
         // deleter). Per-thread scratch is held separately via FunctionContext thread-state
@@ -233,7 +235,6 @@ private:
         void set_search_string(const std::string& search_string_arg) {
             search_string = search_string_arg;
             search_string_sv = Slice(search_string);
-            _search_string_column = ColumnHelper::create_const_column<TYPE_VARCHAR>(search_string_sv, 1);
         }
     };
 };
