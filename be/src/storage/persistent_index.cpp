@@ -4377,6 +4377,17 @@ struct MergeKVRefHash {
     uint64_t operator()(const MergeKVRef& kv) const { return kv.hash; }
 };
 
+constexpr size_t kMergePrefetchDistance = 16;
+
+template <class Set>
+inline void prefetch_merge_kv(const Set& kvs_set, const std::vector<KVRef>& vec, size_t idx) {
+    if (idx + kMergePrefetchDistance < vec.size()) {
+        const auto& next_kv = vec[idx + kMergePrefetchDistance];
+        kvs_set.prefetch_hash(kvs_set.hash(MergeKVRef(next_kv)));
+        __builtin_prefetch(next_kv.kv_pos);
+    }
+}
+
 } // namespace
 
 template <size_t KeySize>
@@ -4385,7 +4396,9 @@ Status merge_shard_kvs_fixed_len(std::vector<KVRef>& l0_kvs, std::vector<std::ve
     phmap::flat_hash_set<MergeKVRef, MergeKVRefHash, MergeKVRefEq<KeySize>> kvs_set;
     kvs_set.reserve(estimated_size);
     DCHECK(!l1_kvs.empty());
-    for (const auto& kv : l1_kvs[0]) {
+    for (size_t j = 0; j < l1_kvs[0].size(); j++) {
+        prefetch_merge_kv(kvs_set, l1_kvs[0], j);
+        const auto& kv = l1_kvs[0][j];
         const auto v = UNALIGNED_LOAD64(kv.kv_pos + KeySize);
         if (v == NullIndexValue) {
             continue;
@@ -4397,7 +4410,9 @@ Status merge_shard_kvs_fixed_len(std::vector<KVRef>& l0_kvs, std::vector<std::ve
         }
     }
     for (size_t i = 1; i < l1_kvs.size(); i++) {
-        for (const auto& kv : l1_kvs[i]) {
+        for (size_t j = 0; j < l1_kvs[i].size(); j++) {
+            prefetch_merge_kv(kvs_set, l1_kvs[i], j);
+            const auto& kv = l1_kvs[i][j];
             const auto v = UNALIGNED_LOAD64(kv.kv_pos + KeySize);
             if (v == NullIndexValue) {
                 kvs_set.erase(kv);
@@ -4411,7 +4426,9 @@ Status merge_shard_kvs_fixed_len(std::vector<KVRef>& l0_kvs, std::vector<std::ve
             }
         }
     }
-    for (const auto& kv : l0_kvs) {
+    for (size_t j = 0; j < l0_kvs.size(); j++) {
+        prefetch_merge_kv(kvs_set, l0_kvs, j);
+        const auto& kv = l0_kvs[j];
         const auto v = UNALIGNED_LOAD64(kv.kv_pos + KeySize);
         if (v == NullIndexValue) {
             // delete
@@ -4437,7 +4454,9 @@ Status merge_shard_kvs_var_len(std::vector<KVRef>& l0_kvs, std::vector<std::vect
     phmap::flat_hash_set<MergeKVRef, MergeKVRefHash, MergeKVRefEq<0>> kvs_set;
     kvs_set.reserve(estimate_size);
     DCHECK(!l1_kvs.empty());
-    for (const auto& kv : l1_kvs[0]) {
+    for (size_t j = 0; j < l1_kvs[0].size(); j++) {
+        prefetch_merge_kv(kvs_set, l1_kvs[0], j);
+        const auto& kv = l1_kvs[0][j];
         const auto v = UNALIGNED_LOAD64(kv.kv_pos + kv.size - kIndexValueSize);
         if (v == NullIndexValue) {
             continue;
@@ -4449,7 +4468,9 @@ Status merge_shard_kvs_var_len(std::vector<KVRef>& l0_kvs, std::vector<std::vect
         }
     }
     for (size_t i = 1; i < l1_kvs.size(); i++) {
-        for (const auto& kv : l1_kvs[i]) {
+        for (size_t j = 0; j < l1_kvs[i].size(); j++) {
+            prefetch_merge_kv(kvs_set, l1_kvs[i], j);
+            const auto& kv = l1_kvs[i][j];
             const auto v = UNALIGNED_LOAD64(kv.kv_pos + kv.size - kIndexValueSize);
             if (v == NullIndexValue) {
                 kvs_set.erase(kv);
@@ -4463,7 +4484,9 @@ Status merge_shard_kvs_var_len(std::vector<KVRef>& l0_kvs, std::vector<std::vect
             }
         }
     }
-    for (auto& kv : l0_kvs) {
+    for (size_t j = 0; j < l0_kvs.size(); j++) {
+        prefetch_merge_kv(kvs_set, l0_kvs, j);
+        const auto& kv = l0_kvs[j];
         const uint64_t v = UNALIGNED_LOAD64(kv.kv_pos + kv.size - kIndexValueSize);
         if (v == NullIndexValue) {
             // delete
@@ -4531,7 +4554,9 @@ Status merge_shard_kvs_fixed_len_with_delete(std::vector<KVRef>& l0_kvs, std::ve
     kvs_set.reserve(estimated_size);
     DCHECK(!l1_kvs.empty());
     for (auto& l1_kv : l1_kvs) {
-        for (const auto& kv : l1_kv) {
+        for (size_t j = 0; j < l1_kv.size(); j++) {
+            prefetch_merge_kv(kvs_set, l1_kv, j);
+            const auto& kv = l1_kv[j];
             auto [it, inserted] = kvs_set.emplace(kv);
             if (!inserted) {
                 DCHECK(it->hash == kv.hash) << "upsert kv in set, hash should be the same";
@@ -4540,7 +4565,9 @@ Status merge_shard_kvs_fixed_len_with_delete(std::vector<KVRef>& l0_kvs, std::ve
             }
         }
     }
-    for (const auto& kv : l0_kvs) {
+    for (size_t j = 0; j < l0_kvs.size(); j++) {
+        prefetch_merge_kv(kvs_set, l0_kvs, j);
+        const auto& kv = l0_kvs[j];
         auto [it, inserted] = kvs_set.emplace(kv);
         if (!inserted) {
             DCHECK(it->hash == kv.hash) << "upsert kv in set, hash should be the same";
@@ -4561,7 +4588,9 @@ Status merge_shard_kvs_var_len_with_delete(std::vector<KVRef>& l0_kvs, std::vect
     kvs_set.reserve(estimate_size);
     DCHECK(!l1_kvs.empty());
     for (auto& l1_kv : l1_kvs) {
-        for (const auto& kv : l1_kv) {
+        for (size_t j = 0; j < l1_kv.size(); j++) {
+            prefetch_merge_kv(kvs_set, l1_kv, j);
+            const auto& kv = l1_kv[j];
             auto [it, inserted] = kvs_set.emplace(kv);
             if (!inserted) {
                 DCHECK(it->hash == kv.hash) << "upsert kv in set, hash should be the same";
@@ -4570,7 +4599,9 @@ Status merge_shard_kvs_var_len_with_delete(std::vector<KVRef>& l0_kvs, std::vect
             }
         }
     }
-    for (auto& kv : l0_kvs) {
+    for (size_t j = 0; j < l0_kvs.size(); j++) {
+        prefetch_merge_kv(kvs_set, l0_kvs, j);
+        const auto& kv = l0_kvs[j];
         if (auto [it, inserted] = kvs_set.emplace(kv); !inserted) {
             DCHECK(it->hash == kv.hash) << "upsert kv in set, hash should be the same";
             DCHECK(it->size == kv.size) << "upsert kv in set, size should be the same";
