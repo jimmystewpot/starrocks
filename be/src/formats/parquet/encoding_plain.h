@@ -182,7 +182,7 @@ public:
         // expand_load reads its source with unaligned loads.
         const T* src = reinterpret_cast<const T*>(_data.data + _offset);
         T* __restrict data = data_column->get_data().data() + cur_size;
-        SIMD::Expand::expand_load(data, src, is_nulls, expand_count);
+        SIMD::Expand::expand_load(data, src, is_nulls, expand_count, read_count);
         _offset += read_bytes;
         return Status::OK();
     }
@@ -482,7 +482,7 @@ public:
             --expand_count;
         }
         SIMD::Expand::expand_load(data_column->get_data().data() + cur_size, _values_buffer.data(), is_nulls,
-                                  expand_count);
+                                  expand_count, read_count);
         return Status::OK();
     }
 
