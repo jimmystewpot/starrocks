@@ -4472,8 +4472,8 @@ Status merge_shard_kvs_var_len(std::vector<KVRef>& l0_kvs, std::vector<std::vect
     return Status::OK();
 }
 
-static Status merge_shard_kvs(size_t key_size, std::vector<KVRef>& l0_kvs, std::vector<std::vector<KVRef>>& l1_kvs,
-                              size_t estimated_size, std::vector<KVRef>& ret) {
+Status merge_shard_kvs(size_t key_size, std::vector<KVRef>& l0_kvs, std::vector<std::vector<KVRef>>& l1_kvs,
+                       size_t estimated_size, std::vector<KVRef>& ret) {
     if (key_size > 0) {
 #define CASE_SIZE(s) \
     case s:          \
@@ -4577,9 +4577,8 @@ Status merge_shard_kvs_var_len_with_delete(std::vector<KVRef>& l0_kvs, std::vect
     return Status::OK();
 }
 
-static Status merge_shard_kvs_with_delete(size_t key_size, std::vector<KVRef>& l0_kvs,
-                                          std::vector<std::vector<KVRef>>& l1_kvs, size_t estimated_size,
-                                          std::vector<KVRef>& ret) {
+Status merge_shard_kvs_with_delete(size_t key_size, std::vector<KVRef>& l0_kvs, std::vector<std::vector<KVRef>>& l1_kvs,
+                                   size_t estimated_size, std::vector<KVRef>& ret) {
     if (key_size > 0) {
 #define CASE_SIZE(s) \
     case s:          \
