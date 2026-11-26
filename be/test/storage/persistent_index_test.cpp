@@ -4128,4 +4128,77 @@ TEST(PersistentIndexMergeShardKvsTest, ShortEmptyAndHighLoadBoundary) {
     }
 }
 
+TEST(PersistentIndexMergeShardKvsTest, RepeatedUpsertsAtHighLoadPreserveLatestPos) {
+    constexpr size_t kNumKeys = 14000;
+    constexpr size_t kNumUpdated = 10000;
+    constexpr size_t kNumExtraL1Layers = 4;
+
+    auto make_key = [](size_t key_size, size_t idx) -> std::string {
+        if (key_size > 0) {
+            return make_fixed_key16(idx);
+        }
+        return "var_key_" + std::to_string(idx) + "_" + std::string(idx % 17, 'x');
+    };
+
+    for (size_t key_size : {size_t{16}, size_t{0}}) {
+        for (bool with_delete : {false, true}) {
+            MergeShardKVArena arena;
+            std::vector<std::vector<KVRef>> l1_kvs(1 + kNumExtraL1Layers);
+            std::vector<KVRef> l0_kvs;
+            l1_kvs[0].reserve(kNumKeys);
+            for (size_t layer = 1; layer <= kNumExtraL1Layers; ++layer) {
+                l1_kvs[layer].reserve(kNumUpdated);
+            }
+            l0_kvs.reserve(kNumUpdated);
+
+            std::unordered_map<std::string, std::pair<const uint8_t*, uint64_t>> expected;
+            expected.reserve(kNumKeys);
+
+            for (size_t i = 0; i < kNumKeys; ++i) {
+                std::string k = make_key(key_size, i);
+                uint64_t v = i + 1;
+                KVRef ref = arena.add(k, v);
+                l1_kvs[0].push_back(ref);
+                expected.emplace(std::move(k), std::make_pair(ref.kv_pos, v));
+            }
+
+            for (size_t layer = 1; layer <= kNumExtraL1Layers; ++layer) {
+                for (size_t i = 0; i < kNumUpdated; ++i) {
+                    std::string k = make_key(key_size, i);
+                    uint64_t v = layer * 100000ULL + i + 1;
+                    KVRef ref = arena.add(k, v);
+                    l1_kvs[layer].push_back(ref);
+                    expected[k] = std::make_pair(ref.kv_pos, v);
+                }
+            }
+
+            for (size_t i = 0; i < kNumUpdated; ++i) {
+                std::string k = make_key(key_size, i);
+                uint64_t v = (kNumExtraL1Layers + 1) * 100000ULL + i + 1;
+                KVRef ref = arena.add(k, v);
+                l0_kvs.push_back(ref);
+                expected[k] = std::make_pair(ref.kv_pos, v);
+            }
+
+            std::vector<KVRef> ret;
+            if (with_delete) {
+                ASSERT_OK(merge_shard_kvs_with_delete(key_size, l0_kvs, l1_kvs, kNumKeys, ret));
+            } else {
+                ASSERT_OK(merge_shard_kvs(key_size, l0_kvs, l1_kvs, kNumKeys, ret));
+            }
+
+            ASSERT_EQ(ret.size(), kNumKeys);
+            for (const auto& kv : ret) {
+                std::string k = kv_key(kv, key_size);
+                auto it = expected.find(k);
+                ASSERT_NE(it, expected.end());
+                ASSERT_EQ(kv.kv_pos, it->second.first);
+                ASSERT_EQ(kv_val(kv, key_size), it->second.second);
+                expected.erase(it);
+            }
+            ASSERT_TRUE(expected.empty());
+        }
+    }
+}
+
 } // namespace starrocks
