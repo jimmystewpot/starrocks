@@ -4354,7 +4354,6 @@ struct MergeKVRef {
 
     MergeKVRef() = default;
     MergeKVRef(const KVRef& kv) : kv_pos(kv.kv_pos), hash(kv.hash), size(kv.size) {}
-    MergeKVRef(const uint8_t* kv_pos, uint64_t hash, uint16_t size) : kv_pos(kv_pos), hash(hash), size(size) {}
 };
 static_assert(sizeof(MergeKVRef) == sizeof(KVRef));
 
@@ -4393,9 +4392,11 @@ inline void prefetch_merge_kv(const Set& kvs_set, const std::vector<KVRef>& vec,
 template <size_t KeySize>
 Status merge_shard_kvs_fixed_len(std::vector<KVRef>& l0_kvs, std::vector<std::vector<KVRef>>& l1_kvs,
                                  size_t estimated_size, std::vector<KVRef>& ret) {
+    if (UNLIKELY(l1_kvs.empty())) {
+        return Status::InternalError("l1_kvs is empty");
+    }
     phmap::flat_hash_set<MergeKVRef, MergeKVRefHash, MergeKVRefEq<KeySize>> kvs_set;
     kvs_set.reserve(estimated_size);
-    DCHECK(!l1_kvs.empty());
     for (size_t j = 0; j < l1_kvs[0].size(); j++) {
         prefetch_merge_kv(kvs_set, l1_kvs[0], j);
         const auto& kv = l1_kvs[0][j];
@@ -4451,12 +4452,17 @@ Status merge_shard_kvs_fixed_len(std::vector<KVRef>& l0_kvs, std::vector<std::ve
 
 Status merge_shard_kvs_var_len(std::vector<KVRef>& l0_kvs, std::vector<std::vector<KVRef>>& l1_kvs,
                                size_t estimate_size, std::vector<KVRef>& ret) {
+    if (UNLIKELY(l1_kvs.empty())) {
+        return Status::InternalError("l1_kvs is empty");
+    }
     phmap::flat_hash_set<MergeKVRef, MergeKVRefHash, MergeKVRefEq<0>> kvs_set;
     kvs_set.reserve(estimate_size);
-    DCHECK(!l1_kvs.empty());
     for (size_t j = 0; j < l1_kvs[0].size(); j++) {
         prefetch_merge_kv(kvs_set, l1_kvs[0], j);
         const auto& kv = l1_kvs[0][j];
+        if (UNLIKELY(kv.size < kIndexValueSize)) {
+            return Status::InternalError(fmt::format("invalid var-len kv size {}", kv.size));
+        }
         const auto v = UNALIGNED_LOAD64(kv.kv_pos + kv.size - kIndexValueSize);
         if (v == NullIndexValue) {
             continue;
@@ -4471,6 +4477,9 @@ Status merge_shard_kvs_var_len(std::vector<KVRef>& l0_kvs, std::vector<std::vect
         for (size_t j = 0; j < l1_kvs[i].size(); j++) {
             prefetch_merge_kv(kvs_set, l1_kvs[i], j);
             const auto& kv = l1_kvs[i][j];
+            if (UNLIKELY(kv.size < kIndexValueSize)) {
+                return Status::InternalError(fmt::format("invalid var-len kv size {}", kv.size));
+            }
             const auto v = UNALIGNED_LOAD64(kv.kv_pos + kv.size - kIndexValueSize);
             if (v == NullIndexValue) {
                 kvs_set.erase(kv);
@@ -4487,6 +4496,9 @@ Status merge_shard_kvs_var_len(std::vector<KVRef>& l0_kvs, std::vector<std::vect
     for (size_t j = 0; j < l0_kvs.size(); j++) {
         prefetch_merge_kv(kvs_set, l0_kvs, j);
         const auto& kv = l0_kvs[j];
+        if (UNLIKELY(kv.size < kIndexValueSize)) {
+            return Status::InternalError(fmt::format("invalid var-len kv size {}", kv.size));
+        }
         const uint64_t v = UNALIGNED_LOAD64(kv.kv_pos + kv.size - kIndexValueSize);
         if (v == NullIndexValue) {
             // delete
@@ -4544,15 +4556,17 @@ Status merge_shard_kvs(size_t key_size, std::vector<KVRef>& l0_kvs, std::vector<
     } else if (key_size == 0) {
         return merge_shard_kvs_var_len(l0_kvs, l1_kvs, estimated_size, ret);
     }
-    return Status::OK();
+    return Status::InternalError(fmt::format("unsupported key_size {} in merge_shard_kvs", key_size));
 }
 
 template <size_t KeySize>
 Status merge_shard_kvs_fixed_len_with_delete(std::vector<KVRef>& l0_kvs, std::vector<std::vector<KVRef>>& l1_kvs,
                                              size_t estimated_size, std::vector<KVRef>& ret) {
+    if (UNLIKELY(l1_kvs.empty())) {
+        return Status::InternalError("l1_kvs is empty");
+    }
     phmap::flat_hash_set<MergeKVRef, MergeKVRefHash, MergeKVRefEq<KeySize>> kvs_set;
     kvs_set.reserve(estimated_size);
-    DCHECK(!l1_kvs.empty());
     for (auto& l1_kv : l1_kvs) {
         for (size_t j = 0; j < l1_kv.size(); j++) {
             prefetch_merge_kv(kvs_set, l1_kv, j);
@@ -4584,13 +4598,18 @@ Status merge_shard_kvs_fixed_len_with_delete(std::vector<KVRef>& l0_kvs, std::ve
 
 Status merge_shard_kvs_var_len_with_delete(std::vector<KVRef>& l0_kvs, std::vector<std::vector<KVRef>>& l1_kvs,
                                            size_t estimate_size, std::vector<KVRef>& ret) {
+    if (UNLIKELY(l1_kvs.empty())) {
+        return Status::InternalError("l1_kvs is empty");
+    }
     phmap::flat_hash_set<MergeKVRef, MergeKVRefHash, MergeKVRefEq<0>> kvs_set;
     kvs_set.reserve(estimate_size);
-    DCHECK(!l1_kvs.empty());
     for (auto& l1_kv : l1_kvs) {
         for (size_t j = 0; j < l1_kv.size(); j++) {
             prefetch_merge_kv(kvs_set, l1_kv, j);
             const auto& kv = l1_kv[j];
+            if (UNLIKELY(kv.size < kIndexValueSize)) {
+                return Status::InternalError(fmt::format("invalid var-len kv size {}", kv.size));
+            }
             auto [it, inserted] = kvs_set.emplace(kv);
             if (!inserted) {
                 DCHECK(it->hash == kv.hash) << "upsert kv in set, hash should be the same";
@@ -4602,6 +4621,9 @@ Status merge_shard_kvs_var_len_with_delete(std::vector<KVRef>& l0_kvs, std::vect
     for (size_t j = 0; j < l0_kvs.size(); j++) {
         prefetch_merge_kv(kvs_set, l0_kvs, j);
         const auto& kv = l0_kvs[j];
+        if (UNLIKELY(kv.size < kIndexValueSize)) {
+            return Status::InternalError(fmt::format("invalid var-len kv size {}", kv.size));
+        }
         if (auto [it, inserted] = kvs_set.emplace(kv); !inserted) {
             DCHECK(it->hash == kv.hash) << "upsert kv in set, hash should be the same";
             DCHECK(it->size == kv.size) << "upsert kv in set, size should be the same";
@@ -4653,7 +4675,7 @@ Status merge_shard_kvs_with_delete(size_t key_size, std::vector<KVRef>& l0_kvs, 
     } else if (key_size == 0) {
         return merge_shard_kvs_var_len_with_delete(l0_kvs, l1_kvs, estimated_size, ret);
     }
-    return Status::OK();
+    return Status::InternalError(fmt::format("unsupported key_size {} in merge_shard_kvs_with_delete", key_size));
 }
 
 Status PersistentIndex::_merge_compaction_internal(ImmutableIndexWriter* writer, int l1_start_idx, int l1_end_idx,

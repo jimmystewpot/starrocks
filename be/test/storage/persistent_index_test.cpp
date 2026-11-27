@@ -3914,15 +3914,18 @@ TEST(PersistentIndexMergeShardKvsTest, FixedLenUpsertDeleteAndReinsert) {
     l1_kvs[0].push_back(arena.add(k_collide_b, 500, kSharedHash));
 
     // l1_kvs[1]: intermediate layer
+    const KVRef expected_collide_a = arena.add(k_collide_a, 401, kSharedHash);
     l1_kvs[1].push_back(arena.add(k_multi_upsert, 101));
     l1_kvs[1].push_back(arena.add(k_deleted_only, NullIndexValue));
     l1_kvs[1].push_back(arena.add(k_deleted_then_reinsert, NullIndexValue));
+    l1_kvs[1].push_back(expected_collide_a);
 
     // l0_kvs: newest layer
     const KVRef expected_multi_upsert = arena.add(k_multi_upsert, 102);
     const KVRef expected_reinsert = arena.add(k_deleted_then_reinsert, 302);
     l0_kvs.push_back(expected_multi_upsert);
     l0_kvs.push_back(expected_reinsert);
+    l0_kvs.push_back(arena.add(k_collide_b, NullIndexValue, kSharedHash));
 
     std::vector<KVRef> ret;
     ASSERT_OK(merge_shard_kvs(kKeySize, l0_kvs, l1_kvs, 16, ret));
@@ -3932,9 +3935,10 @@ TEST(PersistentIndexMergeShardKvsTest, FixedLenUpsertDeleteAndReinsert) {
         ASSERT_TRUE(got.emplace(kv_key(kv, kKeySize), kv).second);
     }
 
-    ASSERT_EQ(got.size(), 4);
+    ASSERT_EQ(got.size(), 3);
     ASSERT_EQ(got.count(k_tombstone_l1_0), 0);
     ASSERT_EQ(got.count(k_deleted_only), 0);
+    ASSERT_EQ(got.count(k_collide_b), 0);
 
     ASSERT_EQ(got.at(k_multi_upsert).kv_pos, expected_multi_upsert.kv_pos);
     ASSERT_EQ(kv_val(got.at(k_multi_upsert), kKeySize), 102);
@@ -3942,8 +3946,8 @@ TEST(PersistentIndexMergeShardKvsTest, FixedLenUpsertDeleteAndReinsert) {
     ASSERT_EQ(got.at(k_deleted_then_reinsert).kv_pos, expected_reinsert.kv_pos);
     ASSERT_EQ(kv_val(got.at(k_deleted_then_reinsert), kKeySize), 302);
 
-    ASSERT_EQ(kv_val(got.at(k_collide_a), kKeySize), 400);
-    ASSERT_EQ(kv_val(got.at(k_collide_b), kKeySize), 500);
+    ASSERT_EQ(got.at(k_collide_a).kv_pos, expected_collide_a.kv_pos);
+    ASSERT_EQ(kv_val(got.at(k_collide_a), kKeySize), 401);
 }
 
 TEST(PersistentIndexMergeShardKvsTest, FixedLenDuplicateInL1ZeroReturnsError) {
@@ -4058,8 +4062,8 @@ TEST(PersistentIndexMergeShardKvsTest, WithDeleteRetainsTombstonesFixedAndVarLen
 TEST(PersistentIndexMergeShardKvsTest, ShortEmptyAndHighLoadBoundary) {
     constexpr size_t kKeySize = 16;
 
-    // Empty l0_kvs (L2 major compaction path) with 1, 15, and 16 entries in l1_kvs[0]
-    for (size_t count : {size_t{1}, size_t{15}, size_t{16}}) {
+    // Empty l0_kvs (L2 major compaction path) with 0, 1, 15, and 16 entries in l1_kvs[0]
+    for (size_t count : {size_t{0}, size_t{1}, size_t{15}, size_t{16}}) {
         MergeShardKVArena arena;
         std::vector<std::vector<KVRef>> l1_kvs(1);
         std::vector<KVRef> l0_kvs;
@@ -4076,9 +4080,39 @@ TEST(PersistentIndexMergeShardKvsTest, ShortEmptyAndHighLoadBoundary) {
         ASSERT_EQ(ret.size(), expected.size());
         for (const auto& kv : ret) {
             std::string k = kv_key(kv, kKeySize);
-            ASSERT_EQ(expected.count(k), 1);
-            ASSERT_EQ(kv_val(kv, kKeySize), expected.at(k));
+            auto it = expected.find(k);
+            ASSERT_NE(it, expected.end());
+            ASSERT_EQ(kv_val(kv, kKeySize), it->second);
+            ASSERT_EQ(expected.erase(k), 1);
         }
+        ASSERT_TRUE(expected.empty());
+    }
+
+    // estimated_size = 0 (forces dynamic growth) and sparse estimated_size = 500000 (50 entries)
+    for (size_t estimated_size : {size_t{0}, size_t{500000}}) {
+        constexpr size_t kSparseCount = 50;
+        MergeShardKVArena arena;
+        std::vector<std::vector<KVRef>> l1_kvs(1);
+        std::vector<KVRef> l0_kvs;
+        std::unordered_map<std::string, uint64_t> expected;
+        for (size_t i = 0; i < kSparseCount; ++i) {
+            std::string k = make_fixed_key16(i + 100);
+            uint64_t v = 2000 + i;
+            l1_kvs[0].push_back(arena.add(k, v));
+            expected.emplace(std::move(k), v);
+        }
+
+        std::vector<KVRef> ret;
+        ASSERT_OK(merge_shard_kvs(kKeySize, l0_kvs, l1_kvs, estimated_size, ret));
+        ASSERT_EQ(ret.size(), expected.size());
+        for (const auto& kv : ret) {
+            std::string k = kv_key(kv, kKeySize);
+            auto it = expected.find(k);
+            ASSERT_NE(it, expected.end());
+            ASSERT_EQ(kv_val(kv, kKeySize), it->second);
+            ASSERT_EQ(expected.erase(k), 1);
+        }
+        ASSERT_TRUE(expected.empty());
     }
 
     // High-load shard: 20,000 fixed-len keys (~85% load), 40% upserts, 5% deletes
@@ -4199,6 +4233,111 @@ TEST(PersistentIndexMergeShardKvsTest, RepeatedUpsertsAtHighLoadPreserveLatestPo
             ASSERT_TRUE(expected.empty());
         }
     }
+}
+
+TEST(PersistentIndexMergeShardKvsTest, UnsupportedKeySizeReturnsError) {
+    constexpr size_t kUnsupportedKeySize = 129;
+    std::vector<std::vector<KVRef>> l1_kvs(1);
+    std::vector<KVRef> l0_kvs;
+    std::vector<KVRef> ret;
+
+    Status st = merge_shard_kvs(kUnsupportedKeySize, l0_kvs, l1_kvs, 8, ret);
+    ASSERT_FALSE(st.ok());
+    ASSERT_TRUE(st.is_internal_error()) << st.to_string();
+
+    st = merge_shard_kvs_with_delete(kUnsupportedKeySize, l0_kvs, l1_kvs, 8, ret);
+    ASSERT_FALSE(st.ok());
+    ASSERT_TRUE(st.is_internal_error()) << st.to_string();
+}
+
+TEST(PersistentIndexMergeShardKvsTest, EmptyL1KvsReturnsError) {
+    for (size_t key_size : {size_t{16}, size_t{0}}) {
+        std::vector<std::vector<KVRef>> l1_kvs;
+        std::vector<KVRef> l0_kvs;
+        std::vector<KVRef> ret;
+
+        Status st = merge_shard_kvs(key_size, l0_kvs, l1_kvs, 8, ret);
+        ASSERT_FALSE(st.ok());
+        ASSERT_TRUE(st.is_internal_error()) << st.to_string();
+
+        st = merge_shard_kvs_with_delete(key_size, l0_kvs, l1_kvs, 8, ret);
+        ASSERT_FALSE(st.ok());
+        ASSERT_TRUE(st.is_internal_error()) << st.to_string();
+    }
+}
+
+TEST(PersistentIndexMergeShardKvsTest, VarLenTooSmallEntryReturnsError) {
+    constexpr size_t kKeySize = 0;
+    uint8_t buf[kIndexValueSize] = {};
+    const KVRef bad_kv(buf, 0x12345678ULL, 4);
+
+    // Invalid entry in l1_kvs[0]
+    {
+        std::vector<std::vector<KVRef>> l1_kvs(1);
+        l1_kvs[0].push_back(bad_kv);
+        std::vector<KVRef> l0_kvs;
+        std::vector<KVRef> ret;
+
+        Status st = merge_shard_kvs(kKeySize, l0_kvs, l1_kvs, 8, ret);
+        ASSERT_FALSE(st.ok());
+        ASSERT_TRUE(st.is_internal_error()) << st.to_string();
+
+        st = merge_shard_kvs_with_delete(kKeySize, l0_kvs, l1_kvs, 8, ret);
+        ASSERT_FALSE(st.ok());
+        ASSERT_TRUE(st.is_internal_error()) << st.to_string();
+    }
+
+    // Invalid entry in l1_kvs[1]
+    {
+        std::vector<std::vector<KVRef>> l1_kvs(2);
+        l1_kvs[1].push_back(bad_kv);
+        std::vector<KVRef> l0_kvs;
+        std::vector<KVRef> ret;
+
+        Status st = merge_shard_kvs(kKeySize, l0_kvs, l1_kvs, 8, ret);
+        ASSERT_FALSE(st.ok());
+        ASSERT_TRUE(st.is_internal_error()) << st.to_string();
+
+        st = merge_shard_kvs_with_delete(kKeySize, l0_kvs, l1_kvs, 8, ret);
+        ASSERT_FALSE(st.ok());
+        ASSERT_TRUE(st.is_internal_error()) << st.to_string();
+    }
+
+    // Invalid entry in l0_kvs
+    {
+        std::vector<std::vector<KVRef>> l1_kvs(1);
+        std::vector<KVRef> l0_kvs;
+        l0_kvs.push_back(bad_kv);
+        std::vector<KVRef> ret;
+
+        Status st = merge_shard_kvs(kKeySize, l0_kvs, l1_kvs, 8, ret);
+        ASSERT_FALSE(st.ok());
+        ASSERT_TRUE(st.is_internal_error()) << st.to_string();
+
+        st = merge_shard_kvs_with_delete(kKeySize, l0_kvs, l1_kvs, 8, ret);
+        ASSERT_FALSE(st.ok());
+        ASSERT_TRUE(st.is_internal_error()) << st.to_string();
+    }
+}
+
+TEST(PersistentIndexMergeShardKvsTest, VarLenDuplicateInL1ZeroReturnsError) {
+    constexpr size_t kKeySize = 0;
+    MergeShardKVArena arena;
+
+    const std::string dup_key = "dup_var_key_42";
+    std::vector<std::vector<KVRef>> l1_kvs(1);
+    l1_kvs[0].push_back(arena.add(dup_key, 10));
+    l1_kvs[0].push_back(arena.add(dup_key, 20));
+    std::vector<KVRef> l0_kvs;
+    std::vector<KVRef> ret;
+
+#ifdef NDEBUG
+    Status st = merge_shard_kvs(kKeySize, l0_kvs, l1_kvs, 8, ret);
+    ASSERT_FALSE(st.ok());
+    ASSERT_TRUE(st.is_internal_error()) << st.to_string();
+#else
+    ASSERT_DEATH({ (void)merge_shard_kvs(kKeySize, l0_kvs, l1_kvs, 8, ret); }, "duplicate key found");
+#endif
 }
 
 } // namespace starrocks
