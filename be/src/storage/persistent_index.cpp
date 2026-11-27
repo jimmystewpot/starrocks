@@ -490,8 +490,54 @@ static Status move_buckets(const std::vector<BucketToMove>& buckets_to_move, con
     return Status::OK();
 }
 
-static void copy_kv_to_page(size_t key_size, size_t num_kv, const KVPairPtr* kv_ptrs, const uint8_t* tags,
-                            uint8_t* dest_pack, const uint16_t* kv_size) {
+template <size_t KVLen>
+static inline void copy_fixlen_kvs_impl(size_t num_kv, const KVPairPtr* kv_ptrs, uint8_t* kvs_dest) {
+    for (size_t i = 0; i < num_kv; i++) {
+        memcpy(kvs_dest, kv_ptrs[i], KVLen);
+        kvs_dest += KVLen;
+    }
+}
+
+static void copy_fixlen_kv_to_page(size_t kv_len, size_t num_kv, const KVPairPtr* kv_ptrs, const uint8_t* tags,
+                                   uint8_t* dest_pack) {
+    if (num_kv == 0) {
+        return;
+    }
+    uint8_t* tags_dest = dest_pack;
+    size_t tags_len = pad(num_kv, kPackSize);
+    memcpy(tags_dest, tags, num_kv);
+    memset(tags_dest + num_kv, 0, tags_len - num_kv);
+    uint8_t* kvs_dest = dest_pack + tags_len;
+    switch (kv_len) {
+    case 4 + kIndexValueSize:
+        copy_fixlen_kvs_impl<4 + kIndexValueSize>(num_kv, kv_ptrs, kvs_dest);
+        break;
+    case 8 + kIndexValueSize:
+        copy_fixlen_kvs_impl<8 + kIndexValueSize>(num_kv, kv_ptrs, kvs_dest);
+        break;
+    case 16 + kIndexValueSize:
+        copy_fixlen_kvs_impl<16 + kIndexValueSize>(num_kv, kv_ptrs, kvs_dest);
+        break;
+    case 32 + kIndexValueSize:
+        copy_fixlen_kvs_impl<32 + kIndexValueSize>(num_kv, kv_ptrs, kvs_dest);
+        break;
+    case 64 + kIndexValueSize:
+        copy_fixlen_kvs_impl<64 + kIndexValueSize>(num_kv, kv_ptrs, kvs_dest);
+        break;
+    case 128 + kIndexValueSize:
+        copy_fixlen_kvs_impl<128 + kIndexValueSize>(num_kv, kv_ptrs, kvs_dest);
+        break;
+    default:
+        for (size_t i = 0; i < num_kv; i++) {
+            memcpy(kvs_dest, kv_ptrs[i], kv_len);
+            kvs_dest += kv_len;
+        }
+        break;
+    }
+}
+
+static void copy_varlen_kv_to_page(size_t num_kv, const KVPairPtr* kv_ptrs, const uint8_t* tags, uint8_t* dest_pack,
+                                   const uint16_t* kv_size) {
     uint8_t* tags_dest = dest_pack;
     size_t tags_len = pad(num_kv, kPackSize);
     if (num_kv > 0) {
@@ -499,25 +545,17 @@ static void copy_kv_to_page(size_t key_size, size_t num_kv, const KVPairPtr* kv_
     }
     memset(tags_dest + num_kv, 0, tags_len - num_kv);
     uint8_t* kvs_dest = dest_pack + tags_len;
-    if (key_size == 0) {
-        uint16_t offset = tags_len + (num_kv + 1) * sizeof(uint16_t);
-        for (size_t i = 0; i < num_kv; i++) {
-            encode_fixed16_le(kvs_dest, offset);
-            kvs_dest += sizeof(uint16_t);
-            offset += kv_size[i];
-        }
+    uint16_t offset = tags_len + (num_kv + 1) * sizeof(uint16_t);
+    for (size_t i = 0; i < num_kv; i++) {
         encode_fixed16_le(kvs_dest, offset);
         kvs_dest += sizeof(uint16_t);
-        for (size_t i = 0; i < num_kv; i++) {
-            memcpy(kvs_dest, kv_ptrs[i], kv_size[i]);
-            kvs_dest += kv_size[i];
-        }
-    } else {
-        const size_t kv_len = key_size + kIndexValueSize;
-        for (size_t i = 0; i < num_kv; i++) {
-            memcpy(kvs_dest, kv_ptrs[i], kv_len);
-            kvs_dest += kv_len;
-        }
+        offset += kv_size[i];
+    }
+    encode_fixed16_le(kvs_dest, offset);
+    kvs_dest += sizeof(uint16_t);
+    for (size_t i = 0; i < num_kv; i++) {
+        memcpy(kvs_dest, kv_ptrs[i], kv_size[i]);
+        kvs_dest += kv_size[i];
     }
 }
 
@@ -699,6 +737,18 @@ StatusOr<std::unique_ptr<ImmutableIndexShard>> try_create_with_scratch(size_t ke
     const KVPairPtr* flat_kv_ptrs_data = scratch.flat_kv_ptrs.data();
     const uint8_t* flat_tags_data = scratch.flat_tags.data();
     const uint16_t* flat_kv_sizes_data = key_size == 0 ? scratch.flat_kv_sizes.data() : nullptr;
+    const size_t fixlen_kv_len = key_size != 0 ? (key_size + kIndexValueSize) : 0;
+    auto copy_bucket_to_page = [&](uint32_t bid, uint32_t dest_pageid, size_t cur_packid) {
+        uint8_t num_kv = scratch.bucket_sizes[bid];
+        uint32_t off = scratch.bucket_offsets[bid];
+        uint8_t* dest_pack = ret->pack_in_page(dest_pageid, cur_packid);
+        if (fixlen_kv_len != 0) {
+            copy_fixlen_kv_to_page(fixlen_kv_len, num_kv, flat_kv_ptrs_data + off, flat_tags_data + off, dest_pack);
+        } else {
+            copy_varlen_kv_to_page(num_kv, flat_kv_ptrs_data + off, flat_tags_data + off, dest_pack,
+                                   flat_kv_sizes_data + off);
+        }
+    };
     size_t move_idx = 0;
 
     for (uint32_t pageid = 0; pageid < npage; pageid++) {
@@ -713,10 +763,7 @@ StatusOr<std::unique_ptr<ImmutableIndexShard>> try_create_with_scratch(size_t ke
             bucket_info.pageid = pageid;
             bucket_info.packid = cur_packid;
             bucket_info.size = scratch.bucket_sizes[bid];
-            uint32_t off = scratch.bucket_offsets[bid];
-            copy_kv_to_page(key_size, bucket_info.size, flat_kv_ptrs_data + off, flat_tags_data + off,
-                            ret->pack_in_page(pageid, cur_packid),
-                            flat_kv_sizes_data != nullptr ? flat_kv_sizes_data + off : nullptr);
+            copy_bucket_to_page(bid, pageid, cur_packid);
             cur_packid += scratch.bucket_packs[bid];
             DCHECK(cur_packid <= page_size / pack_size);
         }
@@ -727,10 +774,7 @@ StatusOr<std::unique_ptr<ImmutableIndexShard>> try_create_with_scratch(size_t ke
             bucket_info.pageid = pageid;
             bucket_info.packid = cur_packid;
             bucket_info.size = scratch.bucket_sizes[bid];
-            uint32_t off = scratch.bucket_offsets[bid];
-            copy_kv_to_page(key_size, bucket_info.size, flat_kv_ptrs_data + off, flat_tags_data + off,
-                            ret->pack_in_page(pageid, cur_packid),
-                            flat_kv_sizes_data != nullptr ? flat_kv_sizes_data + off : nullptr);
+            copy_bucket_to_page(bid, pageid, cur_packid);
             cur_packid += scratch.bucket_packs[bid];
             DCHECK(cur_packid <= page_size / pack_size);
         }
