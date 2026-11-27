@@ -152,6 +152,11 @@ struct KVRef {
     KVRef(const uint8_t* kv_pos, uint64_t hash, uint16_t size) : kv_pos(kv_pos), hash(hash), size(size) {}
 };
 
+Status merge_shard_kvs(size_t key_size, std::vector<KVRef>& l0_kvs, std::vector<std::vector<KVRef>>& l1_kvs,
+                       size_t estimated_size, std::vector<KVRef>& ret);
+Status merge_shard_kvs_with_delete(size_t key_size, std::vector<KVRef>& l0_kvs, std::vector<std::vector<KVRef>>& l1_kvs,
+                                   size_t estimated_size, std::vector<KVRef>& ret);
+
 struct EditVersionWithMerge {
     EditVersionWithMerge(const EditVersion& ver, bool m) : version(ver), merged(m) {}
     EditVersionWithMerge(int64_t major, int64_t minor, bool m) : version(major, minor), merged(m) {}

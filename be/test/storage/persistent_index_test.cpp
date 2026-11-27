@@ -17,6 +17,10 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <deque>
+#include <string>
+#include <string_view>
+#include <unordered_map>
 
 #include "base/coding.h"
 #include "base/failpoint/fail_point.h"
@@ -3845,5 +3849,613 @@ TEST_P(PersistentIndexTest, pindex_major_compact_meta) {
 INSTANTIATE_TEST_SUITE_P(PersistentIndexTest, PersistentIndexTest,
                          ::testing::Values(PersistentIndexTestParam{true, false},
                                            PersistentIndexTestParam{false, true}));
+
+namespace {
+
+class MergeShardKVArena {
+public:
+    KVRef add(std::string_view key, uint64_t val, uint64_t hash) {
+        std::vector<uint8_t> buf(key.size() + kIndexValueSize);
+        if (!key.empty()) {
+            memcpy(buf.data(), key.data(), key.size());
+        }
+        UNALIGNED_STORE64(buf.data() + key.size(), val);
+        _entries.emplace_back(std::move(buf));
+        const auto& stored = _entries.back();
+        return KVRef(stored.data(), hash, static_cast<uint16_t>(stored.size()));
+    }
+
+    KVRef add(std::string_view key, uint64_t val) { return add(key, val, key_index_hash(key.data(), key.size())); }
+
+private:
+    std::deque<std::vector<uint8_t>> _entries;
+};
+
+std::string make_fixed_key16(uint64_t id) {
+    std::string key(16, '\0');
+    UNALIGNED_STORE64(key.data(), id);
+    UNALIGNED_STORE64(key.data() + 8, id ^ 0x9e3779b97f4a7c15ULL);
+    return key;
+}
+
+std::string kv_key(const KVRef& kv, size_t key_size) {
+    size_t len = key_size > 0 ? key_size : (kv.size - kIndexValueSize);
+    return std::string(reinterpret_cast<const char*>(kv.kv_pos), len);
+}
+
+uint64_t kv_val(const KVRef& kv, size_t key_size) {
+    size_t len = key_size > 0 ? key_size : (kv.size - kIndexValueSize);
+    return UNALIGNED_LOAD64(kv.kv_pos + len);
+}
+
+} // namespace
+
+TEST(PersistentIndexMergeShardKvsTest, FixedLenUpsertDeleteAndReinsert) {
+    constexpr size_t kKeySize = 16;
+    MergeShardKVArena arena;
+
+    const std::string k_tombstone_l1_0 = make_fixed_key16(1);
+    const std::string k_multi_upsert = make_fixed_key16(2);
+    const std::string k_deleted_only = make_fixed_key16(3);
+    const std::string k_deleted_then_reinsert = make_fixed_key16(4);
+    const std::string k_collide_a = make_fixed_key16(5);
+    const std::string k_collide_b = make_fixed_key16(6);
+    constexpr uint64_t kSharedHash = 0xdeadbeefcafebabeULL;
+
+    std::vector<std::vector<KVRef>> l1_kvs(2);
+    std::vector<KVRef> l0_kvs;
+
+    // l1_kvs[0]: base layer
+    l1_kvs[0].push_back(arena.add(k_tombstone_l1_0, NullIndexValue));
+    l1_kvs[0].push_back(arena.add(k_multi_upsert, 100));
+    l1_kvs[0].push_back(arena.add(k_deleted_only, 200));
+    l1_kvs[0].push_back(arena.add(k_deleted_then_reinsert, 300));
+    l1_kvs[0].push_back(arena.add(k_collide_a, 400, kSharedHash));
+    l1_kvs[0].push_back(arena.add(k_collide_b, 500, kSharedHash));
+
+    // l1_kvs[1]: intermediate layer
+    const KVRef expected_collide_a = arena.add(k_collide_a, 401, kSharedHash);
+    l1_kvs[1].push_back(arena.add(k_multi_upsert, 101));
+    l1_kvs[1].push_back(arena.add(k_deleted_only, NullIndexValue));
+    l1_kvs[1].push_back(arena.add(k_deleted_then_reinsert, NullIndexValue));
+    l1_kvs[1].push_back(expected_collide_a);
+
+    // l0_kvs: newest layer
+    const KVRef expected_multi_upsert = arena.add(k_multi_upsert, 102);
+    const KVRef expected_reinsert = arena.add(k_deleted_then_reinsert, 302);
+    l0_kvs.push_back(expected_multi_upsert);
+    l0_kvs.push_back(expected_reinsert);
+    l0_kvs.push_back(arena.add(k_collide_b, NullIndexValue, kSharedHash));
+
+    std::vector<KVRef> ret;
+    ASSERT_OK(merge_shard_kvs(kKeySize, l0_kvs, l1_kvs, 16, ret));
+
+    std::unordered_map<std::string, KVRef> got;
+    for (const auto& kv : ret) {
+        ASSERT_TRUE(got.emplace(kv_key(kv, kKeySize), kv).second);
+    }
+
+    ASSERT_EQ(got.size(), 3);
+    ASSERT_EQ(got.count(k_tombstone_l1_0), 0);
+    ASSERT_EQ(got.count(k_deleted_only), 0);
+    ASSERT_EQ(got.count(k_collide_b), 0);
+
+    ASSERT_EQ(got.at(k_multi_upsert).kv_pos, expected_multi_upsert.kv_pos);
+    ASSERT_EQ(kv_val(got.at(k_multi_upsert), kKeySize), 102);
+
+    ASSERT_EQ(got.at(k_deleted_then_reinsert).kv_pos, expected_reinsert.kv_pos);
+    ASSERT_EQ(kv_val(got.at(k_deleted_then_reinsert), kKeySize), 302);
+
+    ASSERT_EQ(got.at(k_collide_a).kv_pos, expected_collide_a.kv_pos);
+    ASSERT_EQ(kv_val(got.at(k_collide_a), kKeySize), 401);
+}
+
+TEST(PersistentIndexMergeShardKvsTest, FixedLenDuplicateInL1ZeroReturnsError) {
+    constexpr size_t kKeySize = 16;
+    MergeShardKVArena arena;
+
+    const std::string dup_key = make_fixed_key16(42);
+    std::vector<std::vector<KVRef>> l1_kvs(1);
+    l1_kvs[0].push_back(arena.add(dup_key, 10));
+    l1_kvs[0].push_back(arena.add(dup_key, 20));
+    std::vector<KVRef> l0_kvs;
+    std::vector<KVRef> ret;
+
+#ifdef NDEBUG
+    Status st = merge_shard_kvs(kKeySize, l0_kvs, l1_kvs, 8, ret);
+    ASSERT_FALSE(st.ok());
+    ASSERT_TRUE(st.is_internal_error()) << st.to_string();
+#else
+    ASSERT_DEATH({ (void)merge_shard_kvs(kKeySize, l0_kvs, l1_kvs, 8, ret); }, "duplicate key found");
+#endif
+}
+
+TEST(PersistentIndexMergeShardKvsTest, VarLenUpsertDeleteAndHashCollision) {
+    constexpr size_t kKeySize = 0;
+    MergeShardKVArena arena;
+
+    const std::string k5 = "alpha";                                // 5B
+    const std::string k16 = "alpha_0123456789";                    // 16B, shared prefix
+    const std::string k37 = "alpha_0123456789_0123456789_0123456"; // 35 -> pad to 37B below
+    const std::string k37_exact = k37 + "78";
+    ASSERT_EQ(k5.size(), 5);
+    ASSERT_EQ(k16.size(), 16);
+    ASSERT_EQ(k37_exact.size(), 37);
+
+    const std::string k_col_short = "col_a";
+    const std::string k_col_same_len = "col_b";
+    const std::string k_col_long = "col_a_longer_key";
+    constexpr uint64_t kSharedHash = 0x123456789abcdef0ULL;
+
+    std::vector<std::vector<KVRef>> l1_kvs(2);
+    std::vector<KVRef> l0_kvs;
+
+    l1_kvs[0].push_back(arena.add(k5, 10));
+    l1_kvs[0].push_back(arena.add(k16, 20));
+    l1_kvs[0].push_back(arena.add(k37_exact, 30));
+    l1_kvs[0].push_back(arena.add(k_col_short, 40, kSharedHash));
+    l1_kvs[0].push_back(arena.add(k_col_same_len, 50, kSharedHash));
+    l1_kvs[0].push_back(arena.add(k_col_long, 60, kSharedHash));
+
+    l1_kvs[1].push_back(arena.add(k5, 11));
+    l1_kvs[1].push_back(arena.add(k16, NullIndexValue));
+
+    const KVRef expected_k5 = arena.add(k5, 12);
+    const KVRef expected_col_short = arena.add(k_col_short, 41, kSharedHash);
+    l0_kvs.push_back(expected_k5);
+    l0_kvs.push_back(expected_col_short);
+
+    std::vector<KVRef> ret;
+    ASSERT_OK(merge_shard_kvs(kKeySize, l0_kvs, l1_kvs, 16, ret));
+
+    std::unordered_map<std::string, KVRef> got;
+    for (const auto& kv : ret) {
+        ASSERT_TRUE(got.emplace(kv_key(kv, kKeySize), kv).second);
+    }
+
+    ASSERT_EQ(got.size(), 5);
+    ASSERT_EQ(got.count(k16), 0);
+    ASSERT_EQ(got.at(k5).kv_pos, expected_k5.kv_pos);
+    ASSERT_EQ(kv_val(got.at(k5), kKeySize), 12);
+    ASSERT_EQ(kv_val(got.at(k37_exact), kKeySize), 30);
+    ASSERT_EQ(got.at(k_col_short).kv_pos, expected_col_short.kv_pos);
+    ASSERT_EQ(kv_val(got.at(k_col_short), kKeySize), 41);
+    ASSERT_EQ(kv_val(got.at(k_col_same_len), kKeySize), 50);
+    ASSERT_EQ(kv_val(got.at(k_col_long), kKeySize), 60);
+}
+
+TEST(PersistentIndexMergeShardKvsTest, WithDeleteRetainsTombstonesFixedAndVarLen) {
+    for (size_t key_size : {size_t{16}, size_t{0}}) {
+        MergeShardKVArena arena;
+        const std::string k_live_to_tombstone = key_size == 16 ? make_fixed_key16(1) : "live_to_del";
+        const std::string k_tombstone_to_live = key_size == 16 ? make_fixed_key16(2) : "del_to_live_key_16";
+        const std::string k_keep_tombstone = key_size == 16 ? make_fixed_key16(3) : "stay_deleted";
+
+        std::vector<std::vector<KVRef>> l1_kvs(1);
+        l1_kvs[0].push_back(arena.add(k_live_to_tombstone, 111));
+        l1_kvs[0].push_back(arena.add(k_tombstone_to_live, NullIndexValue));
+        l1_kvs[0].push_back(arena.add(k_keep_tombstone, NullIndexValue));
+
+        std::vector<KVRef> l0_kvs;
+        const KVRef tombstone_ref = arena.add(k_live_to_tombstone, NullIndexValue);
+        const KVRef live_ref = arena.add(k_tombstone_to_live, 222);
+        l0_kvs.push_back(tombstone_ref);
+        l0_kvs.push_back(live_ref);
+
+        std::vector<KVRef> ret;
+        ASSERT_OK(merge_shard_kvs_with_delete(key_size, l0_kvs, l1_kvs, 8, ret));
+
+        std::unordered_map<std::string, KVRef> got;
+        for (const auto& kv : ret) {
+            ASSERT_TRUE(got.emplace(kv_key(kv, key_size), kv).second);
+        }
+
+        ASSERT_EQ(got.size(), 3);
+        ASSERT_EQ(got.at(k_live_to_tombstone).kv_pos, tombstone_ref.kv_pos);
+        ASSERT_EQ(kv_val(got.at(k_live_to_tombstone), key_size), NullIndexValue);
+        ASSERT_EQ(got.at(k_tombstone_to_live).kv_pos, live_ref.kv_pos);
+        ASSERT_EQ(kv_val(got.at(k_tombstone_to_live), key_size), 222);
+        ASSERT_EQ(kv_val(got.at(k_keep_tombstone), key_size), NullIndexValue);
+    }
+}
+
+TEST(PersistentIndexMergeShardKvsTest, ShortEmptyAndHighLoadBoundary) {
+    constexpr size_t kKeySize = 16;
+
+    // Empty l0_kvs (L2 major compaction path) with 0, 1, 15, and 16 entries in l1_kvs[0]
+    for (size_t count : {size_t{0}, size_t{1}, size_t{15}, size_t{16}}) {
+        MergeShardKVArena arena;
+        std::vector<std::vector<KVRef>> l1_kvs(1);
+        std::vector<KVRef> l0_kvs;
+        std::unordered_map<std::string, uint64_t> expected;
+        for (size_t i = 0; i < count; ++i) {
+            std::string k = make_fixed_key16(i + 1);
+            uint64_t v = 1000 + i;
+            l1_kvs[0].push_back(arena.add(k, v));
+            expected.emplace(std::move(k), v);
+        }
+
+        std::vector<KVRef> ret;
+        ASSERT_OK(merge_shard_kvs(kKeySize, l0_kvs, l1_kvs, count, ret));
+        ASSERT_EQ(ret.size(), expected.size());
+        for (const auto& kv : ret) {
+            std::string k = kv_key(kv, kKeySize);
+            auto it = expected.find(k);
+            ASSERT_NE(it, expected.end());
+            ASSERT_EQ(kv_val(kv, kKeySize), it->second);
+            ASSERT_EQ(expected.erase(k), 1);
+        }
+        ASSERT_TRUE(expected.empty());
+    }
+
+    // estimated_size = 0 (forces dynamic growth) and sparse estimated_size = 500000 (50 entries)
+    for (size_t estimated_size : {size_t{0}, size_t{500000}}) {
+        constexpr size_t kSparseCount = 50;
+        MergeShardKVArena arena;
+        std::vector<std::vector<KVRef>> l1_kvs(1);
+        std::vector<KVRef> l0_kvs;
+        std::unordered_map<std::string, uint64_t> expected;
+        for (size_t i = 0; i < kSparseCount; ++i) {
+            std::string k = make_fixed_key16(i + 100);
+            uint64_t v = 2000 + i;
+            l1_kvs[0].push_back(arena.add(k, v));
+            expected.emplace(std::move(k), v);
+        }
+
+        std::vector<KVRef> ret;
+        ASSERT_OK(merge_shard_kvs(kKeySize, l0_kvs, l1_kvs, estimated_size, ret));
+        ASSERT_EQ(ret.size(), expected.size());
+        for (const auto& kv : ret) {
+            std::string k = kv_key(kv, kKeySize);
+            auto it = expected.find(k);
+            ASSERT_NE(it, expected.end());
+            ASSERT_EQ(kv_val(kv, kKeySize), it->second);
+            ASSERT_EQ(expected.erase(k), 1);
+        }
+        ASSERT_TRUE(expected.empty());
+    }
+
+    // High-load shard: 20,000 fixed-len keys (~85% load), 40% upserts, 5% deletes
+    {
+        constexpr size_t kNumKeys = 20000;
+        constexpr size_t kNumUpserts = 8000; // 40%
+        constexpr size_t kNumDeletes = 1000; // 5%
+        MergeShardKVArena arena;
+        std::vector<std::vector<KVRef>> l1_kvs(1);
+        std::vector<KVRef> l0_kvs;
+        l1_kvs[0].reserve(kNumKeys);
+        l0_kvs.reserve(kNumUpserts + kNumDeletes);
+
+        std::unordered_map<std::string, uint64_t> expected;
+        expected.reserve(kNumKeys);
+        for (size_t i = 0; i < kNumKeys; ++i) {
+            std::string k = make_fixed_key16(i);
+            uint64_t v = i + 1;
+            l1_kvs[0].push_back(arena.add(k, v));
+            expected.emplace(std::move(k), v);
+        }
+
+        for (size_t i = 0; i < kNumUpserts; ++i) {
+            std::string k = make_fixed_key16(i);
+            uint64_t v = 100000 + i;
+            l0_kvs.push_back(arena.add(k, v));
+            expected[k] = v;
+        }
+
+        for (size_t i = kNumUpserts; i < kNumUpserts + kNumDeletes; ++i) {
+            std::string k = make_fixed_key16(i);
+            l0_kvs.push_back(arena.add(k, NullIndexValue));
+            expected.erase(k);
+        }
+
+        std::vector<KVRef> ret;
+        ASSERT_OK(merge_shard_kvs(kKeySize, l0_kvs, l1_kvs, kNumKeys, ret));
+        ASSERT_EQ(ret.size(), kNumKeys - kNumDeletes);
+        ASSERT_EQ(ret.size(), expected.size());
+
+        std::unordered_map<std::string, uint64_t> actual;
+        actual.reserve(ret.size());
+        for (const auto& kv : ret) {
+            ASSERT_TRUE(actual.emplace(kv_key(kv, kKeySize), kv_val(kv, kKeySize)).second);
+        }
+        ASSERT_EQ(actual, expected);
+    }
+}
+
+TEST(PersistentIndexMergeShardKvsTest, RepeatedUpsertsAtHighLoadPreserveLatestPos) {
+    constexpr size_t kNumKeys = 14000;
+    constexpr size_t kNumUpdated = 10000;
+    constexpr size_t kNumExtraL1Layers = 4;
+
+    auto make_key = [](size_t key_size, size_t idx) -> std::string {
+        if (key_size > 0) {
+            return make_fixed_key16(idx);
+        }
+        return "var_key_" + std::to_string(idx) + "_" + std::string(idx % 17, 'x');
+    };
+
+    for (size_t key_size : {size_t{16}, size_t{0}}) {
+        for (bool with_delete : {false, true}) {
+            MergeShardKVArena arena;
+            std::vector<std::vector<KVRef>> l1_kvs(1 + kNumExtraL1Layers);
+            std::vector<KVRef> l0_kvs;
+            l1_kvs[0].reserve(kNumKeys);
+            for (size_t layer = 1; layer <= kNumExtraL1Layers; ++layer) {
+                l1_kvs[layer].reserve(kNumUpdated);
+            }
+            l0_kvs.reserve(kNumUpdated);
+
+            std::unordered_map<std::string, std::pair<const uint8_t*, uint64_t>> expected;
+            expected.reserve(kNumKeys);
+
+            for (size_t i = 0; i < kNumKeys; ++i) {
+                std::string k = make_key(key_size, i);
+                uint64_t v = i + 1;
+                KVRef ref = arena.add(k, v);
+                l1_kvs[0].push_back(ref);
+                expected.emplace(std::move(k), std::make_pair(ref.kv_pos, v));
+            }
+
+            for (size_t layer = 1; layer <= kNumExtraL1Layers; ++layer) {
+                for (size_t i = 0; i < kNumUpdated; ++i) {
+                    std::string k = make_key(key_size, i);
+                    uint64_t v = layer * 100000ULL + i + 1;
+                    KVRef ref = arena.add(k, v);
+                    l1_kvs[layer].push_back(ref);
+                    expected[k] = std::make_pair(ref.kv_pos, v);
+                }
+            }
+
+            for (size_t i = 0; i < kNumUpdated; ++i) {
+                std::string k = make_key(key_size, i);
+                uint64_t v = (kNumExtraL1Layers + 1) * 100000ULL + i + 1;
+                KVRef ref = arena.add(k, v);
+                l0_kvs.push_back(ref);
+                expected[k] = std::make_pair(ref.kv_pos, v);
+            }
+
+            std::vector<KVRef> ret;
+            if (with_delete) {
+                ASSERT_OK(merge_shard_kvs_with_delete(key_size, l0_kvs, l1_kvs, kNumKeys, ret));
+            } else {
+                ASSERT_OK(merge_shard_kvs(key_size, l0_kvs, l1_kvs, kNumKeys, ret));
+            }
+
+            ASSERT_EQ(ret.size(), kNumKeys);
+            for (const auto& kv : ret) {
+                std::string k = kv_key(kv, key_size);
+                auto it = expected.find(k);
+                ASSERT_NE(it, expected.end());
+                ASSERT_EQ(kv.kv_pos, it->second.first);
+                ASSERT_EQ(kv_val(kv, key_size), it->second.second);
+                expected.erase(it);
+            }
+            ASSERT_TRUE(expected.empty());
+        }
+    }
+}
+
+TEST(PersistentIndexMergeShardKvsTest, UnsupportedKeySizeReturnsError) {
+    constexpr size_t kUnsupportedKeySize = 129;
+    std::vector<std::vector<KVRef>> l1_kvs(1);
+    std::vector<KVRef> l0_kvs;
+    std::vector<KVRef> ret;
+
+    Status st = merge_shard_kvs(kUnsupportedKeySize, l0_kvs, l1_kvs, 8, ret);
+    ASSERT_FALSE(st.ok());
+    ASSERT_TRUE(st.is_internal_error()) << st.to_string();
+
+    st = merge_shard_kvs_with_delete(kUnsupportedKeySize, l0_kvs, l1_kvs, 8, ret);
+    ASSERT_FALSE(st.ok());
+    ASSERT_TRUE(st.is_internal_error()) << st.to_string();
+}
+
+TEST(PersistentIndexMergeShardKvsTest, EmptyL1KvsReturnsError) {
+    for (size_t key_size : {size_t{16}, size_t{0}}) {
+        std::vector<std::vector<KVRef>> l1_kvs;
+        std::vector<KVRef> l0_kvs;
+        std::vector<KVRef> ret;
+
+        Status st = merge_shard_kvs(key_size, l0_kvs, l1_kvs, 8, ret);
+        ASSERT_FALSE(st.ok());
+        ASSERT_TRUE(st.is_internal_error()) << st.to_string();
+
+        st = merge_shard_kvs_with_delete(key_size, l0_kvs, l1_kvs, 8, ret);
+        ASSERT_FALSE(st.ok());
+        ASSERT_TRUE(st.is_internal_error()) << st.to_string();
+    }
+}
+
+TEST(PersistentIndexMergeShardKvsTest, VarLenTooSmallEntryReturnsError) {
+    constexpr size_t kKeySize = 0;
+    uint8_t buf[kIndexValueSize] = {};
+    const KVRef bad_kv(buf, 0x12345678ULL, 4);
+
+    // Invalid entry in l1_kvs[0]
+    {
+        std::vector<std::vector<KVRef>> l1_kvs(1);
+        l1_kvs[0].push_back(bad_kv);
+        std::vector<KVRef> l0_kvs;
+        std::vector<KVRef> ret;
+
+        Status st = merge_shard_kvs(kKeySize, l0_kvs, l1_kvs, 8, ret);
+        ASSERT_FALSE(st.ok());
+        ASSERT_TRUE(st.is_internal_error()) << st.to_string();
+
+        st = merge_shard_kvs_with_delete(kKeySize, l0_kvs, l1_kvs, 8, ret);
+        ASSERT_FALSE(st.ok());
+        ASSERT_TRUE(st.is_internal_error()) << st.to_string();
+    }
+
+    // Invalid entry in l1_kvs[1]
+    {
+        std::vector<std::vector<KVRef>> l1_kvs(2);
+        l1_kvs[1].push_back(bad_kv);
+        std::vector<KVRef> l0_kvs;
+        std::vector<KVRef> ret;
+
+        Status st = merge_shard_kvs(kKeySize, l0_kvs, l1_kvs, 8, ret);
+        ASSERT_FALSE(st.ok());
+        ASSERT_TRUE(st.is_internal_error()) << st.to_string();
+
+        st = merge_shard_kvs_with_delete(kKeySize, l0_kvs, l1_kvs, 8, ret);
+        ASSERT_FALSE(st.ok());
+        ASSERT_TRUE(st.is_internal_error()) << st.to_string();
+    }
+
+    // Invalid entry in l0_kvs
+    {
+        std::vector<std::vector<KVRef>> l1_kvs(1);
+        std::vector<KVRef> l0_kvs;
+        l0_kvs.push_back(bad_kv);
+        std::vector<KVRef> ret;
+
+        Status st = merge_shard_kvs(kKeySize, l0_kvs, l1_kvs, 8, ret);
+        ASSERT_FALSE(st.ok());
+        ASSERT_TRUE(st.is_internal_error()) << st.to_string();
+
+        st = merge_shard_kvs_with_delete(kKeySize, l0_kvs, l1_kvs, 8, ret);
+        ASSERT_FALSE(st.ok());
+        ASSERT_TRUE(st.is_internal_error()) << st.to_string();
+    }
+}
+
+TEST(PersistentIndexMergeShardKvsTest, VarLenDuplicateInL1ZeroReturnsError) {
+    constexpr size_t kKeySize = 0;
+    MergeShardKVArena arena;
+
+    const std::string dup_key = "dup_var_key_42";
+    std::vector<std::vector<KVRef>> l1_kvs(1);
+    l1_kvs[0].push_back(arena.add(dup_key, 10));
+    l1_kvs[0].push_back(arena.add(dup_key, 20));
+    std::vector<KVRef> l0_kvs;
+    std::vector<KVRef> ret;
+
+#ifdef NDEBUG
+    Status st = merge_shard_kvs(kKeySize, l0_kvs, l1_kvs, 8, ret);
+    ASSERT_FALSE(st.ok());
+    ASSERT_TRUE(st.is_internal_error()) << st.to_string();
+#else
+    ASSERT_DEATH({ (void)merge_shard_kvs(kKeySize, l0_kvs, l1_kvs, 8, ret); }, "duplicate key found");
+#endif
+}
+
+TEST(PersistentIndexMergeShardKvsTest, FixedLenLargeKey64BAndSkewedReserve) {
+    auto make_large_fixed_key = [](size_t key_size, uint64_t id) {
+        std::string key(key_size, static_cast<char>((id & 0x7f) ^ 0x5a));
+        UNALIGNED_STORE64(key.data(), id);
+        UNALIGNED_STORE64(key.data() + 8, id ^ 0x9e3779b97f4a7c15ULL);
+        UNALIGNED_STORE64(key.data() + key_size - 8, id ^ 0xbf58476d1ce4e5b9ULL);
+        return key;
+    };
+
+    struct ReserveCase {
+        size_t num_keys;
+        size_t estimated_size;
+    };
+    const std::vector<ReserveCase> cases = {
+            {2000, 10},   // underestimated
+            {50, 500000}, // overestimated
+    };
+
+    for (size_t key_size : {size_t{64}, size_t{96}}) {
+        for (bool with_delete : {false, true}) {
+            for (const auto& tc : cases) {
+                MergeShardKVArena arena;
+                std::vector<std::vector<KVRef>> l1_kvs(2);
+                std::vector<KVRef> l0_kvs;
+                std::unordered_map<std::string, std::pair<const uint8_t*, uint64_t>> expected;
+                expected.reserve(tc.num_keys + 16);
+
+                auto record = [&](const std::string& k, const KVRef& ref, uint64_t v) {
+                    if (!with_delete && v == NullIndexValue) {
+                        expected.erase(k);
+                    } else {
+                        expected[k] = std::make_pair(ref.kv_pos, v);
+                    }
+                };
+
+                // l1_kvs[0]: base layer with mostly live entries and some tombstones
+                for (size_t i = 0; i < tc.num_keys; ++i) {
+                    std::string k = make_large_fixed_key(key_size, i);
+                    uint64_t v = (i % 10 == 9) ? NullIndexValue : (1000ULL + i);
+                    KVRef ref = arena.add(k, v);
+                    l1_kvs[0].push_back(ref);
+                    record(k, ref, v);
+                }
+
+                // l1_kvs[1]: upserts and deletes
+                const size_t l1_upsert_end = tc.num_keys / 3;
+                const size_t l1_delete_end = l1_upsert_end + tc.num_keys / 5;
+                for (size_t i = 0; i < l1_upsert_end; ++i) {
+                    std::string k = make_large_fixed_key(key_size, i);
+                    uint64_t v = 100000ULL + i;
+                    KVRef ref = arena.add(k, v);
+                    l1_kvs[1].push_back(ref);
+                    record(k, ref, v);
+                }
+                for (size_t i = l1_upsert_end; i < l1_delete_end; ++i) {
+                    std::string k = make_large_fixed_key(key_size, i);
+                    KVRef ref = arena.add(k, NullIndexValue);
+                    l1_kvs[1].push_back(ref);
+                    record(k, ref, NullIndexValue);
+                }
+
+                // l0_kvs: further upserts, deletes, reinserts, and new keys
+                const size_t l0_upsert_end = tc.num_keys / 5;
+                for (size_t i = 0; i < l0_upsert_end; ++i) {
+                    std::string k = make_large_fixed_key(key_size, i);
+                    uint64_t v = 200000ULL + i;
+                    KVRef ref = arena.add(k, v);
+                    l0_kvs.push_back(ref);
+                    record(k, ref, v);
+                }
+                // Reinsert half of l1_kvs[1]-deleted keys
+                for (size_t i = l1_upsert_end; i < l1_upsert_end + (l1_delete_end - l1_upsert_end) / 2; ++i) {
+                    std::string k = make_large_fixed_key(key_size, i);
+                    uint64_t v = 300000ULL + i;
+                    KVRef ref = arena.add(k, v);
+                    l0_kvs.push_back(ref);
+                    record(k, ref, v);
+                }
+                // Delete another slice
+                const size_t l0_delete_end = std::min(tc.num_keys, l1_delete_end + tc.num_keys / 10);
+                for (size_t i = l1_delete_end; i < l0_delete_end; ++i) {
+                    std::string k = make_large_fixed_key(key_size, i);
+                    KVRef ref = arena.add(k, NullIndexValue);
+                    l0_kvs.push_back(ref);
+                    record(k, ref, NullIndexValue);
+                }
+                // Brand-new keys in l0_kvs
+                for (size_t i = 0; i < 8; ++i) {
+                    std::string k = make_large_fixed_key(key_size, tc.num_keys + i);
+                    uint64_t v = 400000ULL + i;
+                    KVRef ref = arena.add(k, v);
+                    l0_kvs.push_back(ref);
+                    record(k, ref, v);
+                }
+
+                std::vector<KVRef> ret;
+                if (with_delete) {
+                    ASSERT_OK(merge_shard_kvs_with_delete(key_size, l0_kvs, l1_kvs, tc.estimated_size, ret));
+                } else {
+                    ASSERT_OK(merge_shard_kvs(key_size, l0_kvs, l1_kvs, tc.estimated_size, ret));
+                }
+
+                ASSERT_EQ(ret.size(), expected.size());
+                for (const auto& kv : ret) {
+                    ASSERT_EQ(kv.size, key_size + kIndexValueSize);
+                    std::string k = kv_key(kv, key_size);
+                    auto it = expected.find(k);
+                    ASSERT_NE(it, expected.end());
+                    ASSERT_EQ(kv.kv_pos, it->second.first);
+                    ASSERT_EQ(kv_val(kv, key_size), it->second.second);
+                    expected.erase(it);
+                }
+                ASSERT_TRUE(expected.empty());
+            }
+        }
+    }
+}
 
 } // namespace starrocks

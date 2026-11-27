@@ -4345,32 +4345,95 @@ Status PersistentIndex::_delete_tmp_index_file() {
     return FileSystem::Default()->iterate_dir(_path, cb);
 }
 
+namespace {
+
+struct FixedMergeKVRef {
+    mutable const uint8_t* kv_pos;
+    uint64_t hash;
+
+    FixedMergeKVRef() = default;
+    FixedMergeKVRef(const KVRef& kv) : kv_pos(kv.kv_pos), hash(kv.hash) {}
+};
+static_assert(sizeof(FixedMergeKVRef) == 16);
+
 template <size_t KeySize>
-struct KVRefEq {
-    bool operator()(const KVRef& lhs, const KVRef& rhs) const {
+struct FixedMergeKVRefEq {
+    bool operator()(const FixedMergeKVRef& lhs, const FixedMergeKVRef& rhs) const {
+        return lhs.hash == rhs.hash && memcmp(lhs.kv_pos, rhs.kv_pos, KeySize) == 0;
+    }
+};
+
+struct FixedMergeKVRefHash {
+    uint64_t operator()(const FixedMergeKVRef& kv) const { return kv.hash; }
+};
+
+struct MergeKVRef {
+    mutable const uint8_t* kv_pos;
+    uint64_t hash;
+    uint16_t size;
+
+    MergeKVRef() = default;
+    MergeKVRef(const KVRef& kv) : kv_pos(kv.kv_pos), hash(kv.hash), size(kv.size) {}
+};
+static_assert(sizeof(MergeKVRef) == sizeof(KVRef));
+
+template <size_t KeySize>
+struct MergeKVRefEq {
+    bool operator()(const MergeKVRef& lhs, const MergeKVRef& rhs) const {
         return lhs.hash == rhs.hash && memcmp(lhs.kv_pos, rhs.kv_pos, KeySize) == 0;
     }
 };
 
 template <>
-struct KVRefEq<0> {
-    bool operator()(const KVRef& lhs, const KVRef& rhs) const {
+struct MergeKVRefEq<0> {
+    bool operator()(const MergeKVRef& lhs, const MergeKVRef& rhs) const {
         return lhs.hash == rhs.hash && lhs.size == rhs.size &&
                memcmp(lhs.kv_pos, rhs.kv_pos, lhs.size - kIndexValueSize) == 0;
     }
 };
 
-struct KVRefHash {
-    uint64_t operator()(const KVRef& kv) const { return kv.hash; }
+struct MergeKVRefHash {
+    uint64_t operator()(const MergeKVRef& kv) const { return kv.hash; }
 };
+
+constexpr size_t kMergePrefetchDistance = 16;
+
+size_t compute_merge_reserve_size(const std::vector<KVRef>& l0_kvs, const std::vector<std::vector<KVRef>>& l1_kvs,
+                                  size_t estimated_size) {
+    DCHECK(!l1_kvs.empty());
+    size_t total_input_kvs = l0_kvs.size();
+    for (const auto& l1 : l1_kvs) {
+        total_input_kvs += l1.size();
+    }
+    return std::min(std::max(estimated_size, l1_kvs[0].size()), total_input_kvs);
+}
+
+template <size_t KeySize = 0, class Set>
+inline void prefetch_merge_kv(const Set& kvs_set, const std::vector<KVRef>& vec, size_t idx) {
+    if (idx + kMergePrefetchDistance < vec.size()) {
+        const auto& next_kv = vec[idx + kMergePrefetchDistance];
+        kvs_set.prefetch_hash(kvs_set.hash(typename Set::value_type(next_kv)));
+        __builtin_prefetch(next_kv.kv_pos);
+        if constexpr (KeySize >= 64) {
+            __builtin_prefetch(next_kv.kv_pos + KeySize);
+        }
+    }
+}
+
+} // namespace
 
 template <size_t KeySize>
 Status merge_shard_kvs_fixed_len(std::vector<KVRef>& l0_kvs, std::vector<std::vector<KVRef>>& l1_kvs,
                                  size_t estimated_size, std::vector<KVRef>& ret) {
-    phmap::flat_hash_set<KVRef, KVRefHash, KVRefEq<KeySize>> kvs_set;
-    kvs_set.reserve(estimated_size);
-    DCHECK(!l1_kvs.empty());
-    for (const auto& kv : l1_kvs[0]) {
+    if (UNLIKELY(l1_kvs.empty())) {
+        return Status::InternalError("l1_kvs is empty");
+    }
+    phmap::flat_hash_set<FixedMergeKVRef, FixedMergeKVRefHash, FixedMergeKVRefEq<KeySize>> kvs_set;
+    kvs_set.reserve(compute_merge_reserve_size(l0_kvs, l1_kvs, estimated_size));
+    for (size_t j = 0; j < l1_kvs[0].size(); j++) {
+        prefetch_merge_kv<KeySize>(kvs_set, l1_kvs[0], j);
+        const auto& kv = l1_kvs[0][j];
+        DCHECK_EQ(kv.size, KeySize + kIndexValueSize);
         const auto v = UNALIGNED_LOAD64(kv.kv_pos + KeySize);
         if (v == NullIndexValue) {
             continue;
@@ -4382,7 +4445,10 @@ Status merge_shard_kvs_fixed_len(std::vector<KVRef>& l0_kvs, std::vector<std::ve
         }
     }
     for (size_t i = 1; i < l1_kvs.size(); i++) {
-        for (const auto& kv : l1_kvs[i]) {
+        for (size_t j = 0; j < l1_kvs[i].size(); j++) {
+            prefetch_merge_kv<KeySize>(kvs_set, l1_kvs[i], j);
+            const auto& kv = l1_kvs[i][j];
+            DCHECK_EQ(kv.size, KeySize + kIndexValueSize);
             const auto v = UNALIGNED_LOAD64(kv.kv_pos + KeySize);
             if (v == NullIndexValue) {
                 kvs_set.erase(kv);
@@ -4390,13 +4456,15 @@ Status merge_shard_kvs_fixed_len(std::vector<KVRef>& l0_kvs, std::vector<std::ve
                 auto [it, inserted] = kvs_set.emplace(kv);
                 if (!inserted) {
                     DCHECK(it->hash == kv.hash) << "upsert kv in set, hash should be the same";
-                    kvs_set.erase(it);
-                    kvs_set.emplace(kv);
+                    it->kv_pos = kv.kv_pos;
                 }
             }
         }
     }
-    for (const auto& kv : l0_kvs) {
+    for (size_t j = 0; j < l0_kvs.size(); j++) {
+        prefetch_merge_kv<KeySize>(kvs_set, l0_kvs, j);
+        const auto& kv = l0_kvs[j];
+        DCHECK_EQ(kv.size, KeySize + kIndexValueSize);
         const auto v = UNALIGNED_LOAD64(kv.kv_pos + KeySize);
         if (v == NullIndexValue) {
             // delete
@@ -4405,26 +4473,30 @@ Status merge_shard_kvs_fixed_len(std::vector<KVRef>& l0_kvs, std::vector<std::ve
             auto [it, inserted] = kvs_set.emplace(kv);
             if (!inserted) {
                 DCHECK(it->hash == kv.hash) << "upsert kv in set, hash should be the same";
-                // TODO: find a way to modify iterator directly, currently just erase then re-insert
-                // it->kv_pos = kv.kv_pos;
-                kvs_set.erase(it);
-                kvs_set.emplace(kv);
+                it->kv_pos = kv.kv_pos;
             }
         }
     }
     ret.reserve(ret.size() + kvs_set.size());
     for (const auto& kv : kvs_set) {
-        ret.emplace_back(kv);
+        ret.emplace_back(kv.kv_pos, kv.hash, static_cast<uint16_t>(KeySize + kIndexValueSize));
     }
     return Status::OK();
 }
 
 Status merge_shard_kvs_var_len(std::vector<KVRef>& l0_kvs, std::vector<std::vector<KVRef>>& l1_kvs,
                                size_t estimate_size, std::vector<KVRef>& ret) {
-    phmap::flat_hash_set<KVRef, KVRefHash, KVRefEq<0>> kvs_set;
-    kvs_set.reserve(estimate_size);
-    DCHECK(!l1_kvs.empty());
-    for (const auto& kv : l1_kvs[0]) {
+    if (UNLIKELY(l1_kvs.empty())) {
+        return Status::InternalError("l1_kvs is empty");
+    }
+    phmap::flat_hash_set<MergeKVRef, MergeKVRefHash, MergeKVRefEq<0>> kvs_set;
+    kvs_set.reserve(compute_merge_reserve_size(l0_kvs, l1_kvs, estimate_size));
+    for (size_t j = 0; j < l1_kvs[0].size(); j++) {
+        prefetch_merge_kv(kvs_set, l1_kvs[0], j);
+        const auto& kv = l1_kvs[0][j];
+        if (UNLIKELY(kv.size < kIndexValueSize)) {
+            return Status::InternalError(fmt::format("invalid var-len kv size {}", kv.size));
+        }
         const auto v = UNALIGNED_LOAD64(kv.kv_pos + kv.size - kIndexValueSize);
         if (v == NullIndexValue) {
             continue;
@@ -4436,7 +4508,12 @@ Status merge_shard_kvs_var_len(std::vector<KVRef>& l0_kvs, std::vector<std::vect
         }
     }
     for (size_t i = 1; i < l1_kvs.size(); i++) {
-        for (const auto& kv : l1_kvs[i]) {
+        for (size_t j = 0; j < l1_kvs[i].size(); j++) {
+            prefetch_merge_kv(kvs_set, l1_kvs[i], j);
+            const auto& kv = l1_kvs[i][j];
+            if (UNLIKELY(kv.size < kIndexValueSize)) {
+                return Status::InternalError(fmt::format("invalid var-len kv size {}", kv.size));
+            }
             const auto v = UNALIGNED_LOAD64(kv.kv_pos + kv.size - kIndexValueSize);
             if (v == NullIndexValue) {
                 kvs_set.erase(kv);
@@ -4444,13 +4521,18 @@ Status merge_shard_kvs_var_len(std::vector<KVRef>& l0_kvs, std::vector<std::vect
                 auto [it, inserted] = kvs_set.emplace(kv);
                 if (!inserted) {
                     DCHECK(it->hash == kv.hash) << "upsert kv in set, hash should be the same";
-                    kvs_set.erase(it);
-                    kvs_set.emplace(kv);
+                    DCHECK(it->size == kv.size) << "upsert kv in set, size should be the same";
+                    it->kv_pos = kv.kv_pos;
                 }
             }
         }
     }
-    for (auto& kv : l0_kvs) {
+    for (size_t j = 0; j < l0_kvs.size(); j++) {
+        prefetch_merge_kv(kvs_set, l0_kvs, j);
+        const auto& kv = l0_kvs[j];
+        if (UNLIKELY(kv.size < kIndexValueSize)) {
+            return Status::InternalError(fmt::format("invalid var-len kv size {}", kv.size));
+        }
         const uint64_t v = UNALIGNED_LOAD64(kv.kv_pos + kv.size - kIndexValueSize);
         if (v == NullIndexValue) {
             // delete
@@ -4458,22 +4540,20 @@ Status merge_shard_kvs_var_len(std::vector<KVRef>& l0_kvs, std::vector<std::vect
         } else {
             if (auto [it, inserted] = kvs_set.emplace(kv); !inserted) {
                 DCHECK(it->hash == kv.hash) << "upsert kv in set, hash should be the same";
-                // TODO: find a way to modify iterator directly, currently just erase then re-insert
-                // it->kv_pos = kv.kv_pos;
-                kvs_set.erase(it);
-                kvs_set.emplace(kv);
+                DCHECK(it->size == kv.size) << "upsert kv in set, size should be the same";
+                it->kv_pos = kv.kv_pos;
             }
         }
     }
     ret.reserve(ret.size() + kvs_set.size());
     for (const auto& kv : kvs_set) {
-        ret.emplace_back(kv);
+        ret.emplace_back(kv.kv_pos, kv.hash, kv.size);
     }
     return Status::OK();
 }
 
-static Status merge_shard_kvs(size_t key_size, std::vector<KVRef>& l0_kvs, std::vector<std::vector<KVRef>>& l1_kvs,
-                              size_t estimated_size, std::vector<KVRef>& ret) {
+Status merge_shard_kvs(size_t key_size, std::vector<KVRef>& l0_kvs, std::vector<std::vector<KVRef>>& l1_kvs,
+                       size_t estimated_size, std::vector<KVRef>& ret) {
     if (key_size > 0) {
 #define CASE_SIZE(s) \
     case s:          \
@@ -4510,76 +4590,89 @@ static Status merge_shard_kvs(size_t key_size, std::vector<KVRef>& l0_kvs, std::
     } else if (key_size == 0) {
         return merge_shard_kvs_var_len(l0_kvs, l1_kvs, estimated_size, ret);
     }
-    return Status::OK();
+    return Status::InternalError(fmt::format("unsupported key_size {} in merge_shard_kvs", key_size));
 }
 
 template <size_t KeySize>
 Status merge_shard_kvs_fixed_len_with_delete(std::vector<KVRef>& l0_kvs, std::vector<std::vector<KVRef>>& l1_kvs,
                                              size_t estimated_size, std::vector<KVRef>& ret) {
-    phmap::flat_hash_set<KVRef, KVRefHash, KVRefEq<KeySize>> kvs_set;
-    kvs_set.reserve(estimated_size);
-    DCHECK(!l1_kvs.empty());
+    if (UNLIKELY(l1_kvs.empty())) {
+        return Status::InternalError("l1_kvs is empty");
+    }
+    phmap::flat_hash_set<FixedMergeKVRef, FixedMergeKVRefHash, FixedMergeKVRefEq<KeySize>> kvs_set;
+    kvs_set.reserve(compute_merge_reserve_size(l0_kvs, l1_kvs, estimated_size));
     for (auto& l1_kv : l1_kvs) {
-        for (const auto& kv : l1_kv) {
+        for (size_t j = 0; j < l1_kv.size(); j++) {
+            prefetch_merge_kv<KeySize>(kvs_set, l1_kv, j);
+            const auto& kv = l1_kv[j];
+            DCHECK_EQ(kv.size, KeySize + kIndexValueSize);
             auto [it, inserted] = kvs_set.emplace(kv);
             if (!inserted) {
                 DCHECK(it->hash == kv.hash) << "upsert kv in set, hash should be the same";
-                kvs_set.erase(it);
-                kvs_set.emplace(kv);
+                it->kv_pos = kv.kv_pos;
             }
         }
     }
-    for (const auto& kv : l0_kvs) {
+    for (size_t j = 0; j < l0_kvs.size(); j++) {
+        prefetch_merge_kv<KeySize>(kvs_set, l0_kvs, j);
+        const auto& kv = l0_kvs[j];
+        DCHECK_EQ(kv.size, KeySize + kIndexValueSize);
         auto [it, inserted] = kvs_set.emplace(kv);
         if (!inserted) {
             DCHECK(it->hash == kv.hash) << "upsert kv in set, hash should be the same";
-            // TODO: find a way to modify iterator directly, currently just erase then re-insert
-            // it->kv_pos = kv.kv_pos;
-            kvs_set.erase(it);
-            kvs_set.emplace(kv);
+            it->kv_pos = kv.kv_pos;
         }
     }
     ret.reserve(ret.size() + kvs_set.size());
     for (const auto& kv : kvs_set) {
-        ret.emplace_back(kv);
+        ret.emplace_back(kv.kv_pos, kv.hash, static_cast<uint16_t>(KeySize + kIndexValueSize));
     }
     return Status::OK();
 }
 
 Status merge_shard_kvs_var_len_with_delete(std::vector<KVRef>& l0_kvs, std::vector<std::vector<KVRef>>& l1_kvs,
                                            size_t estimate_size, std::vector<KVRef>& ret) {
-    phmap::flat_hash_set<KVRef, KVRefHash, KVRefEq<0>> kvs_set;
-    kvs_set.reserve(estimate_size);
-    DCHECK(!l1_kvs.empty());
+    if (UNLIKELY(l1_kvs.empty())) {
+        return Status::InternalError("l1_kvs is empty");
+    }
+    phmap::flat_hash_set<MergeKVRef, MergeKVRefHash, MergeKVRefEq<0>> kvs_set;
+    kvs_set.reserve(compute_merge_reserve_size(l0_kvs, l1_kvs, estimate_size));
     for (auto& l1_kv : l1_kvs) {
-        for (const auto& kv : l1_kv) {
+        for (size_t j = 0; j < l1_kv.size(); j++) {
+            prefetch_merge_kv(kvs_set, l1_kv, j);
+            const auto& kv = l1_kv[j];
+            if (UNLIKELY(kv.size < kIndexValueSize)) {
+                return Status::InternalError(fmt::format("invalid var-len kv size {}", kv.size));
+            }
             auto [it, inserted] = kvs_set.emplace(kv);
             if (!inserted) {
                 DCHECK(it->hash == kv.hash) << "upsert kv in set, hash should be the same";
-                kvs_set.erase(it);
-                kvs_set.emplace(kv);
+                DCHECK(it->size == kv.size) << "upsert kv in set, size should be the same";
+                it->kv_pos = kv.kv_pos;
             }
         }
     }
-    for (auto& kv : l0_kvs) {
+    for (size_t j = 0; j < l0_kvs.size(); j++) {
+        prefetch_merge_kv(kvs_set, l0_kvs, j);
+        const auto& kv = l0_kvs[j];
+        if (UNLIKELY(kv.size < kIndexValueSize)) {
+            return Status::InternalError(fmt::format("invalid var-len kv size {}", kv.size));
+        }
         if (auto [it, inserted] = kvs_set.emplace(kv); !inserted) {
             DCHECK(it->hash == kv.hash) << "upsert kv in set, hash should be the same";
-            // TODO: find a way to modify iterator directly, currently just erase then re-insert
-            // it->kv_pos = kv.kv_pos;
-            kvs_set.erase(it);
-            kvs_set.emplace(kv);
+            DCHECK(it->size == kv.size) << "upsert kv in set, size should be the same";
+            it->kv_pos = kv.kv_pos;
         }
     }
     ret.reserve(ret.size() + kvs_set.size());
     for (const auto& kv : kvs_set) {
-        ret.emplace_back(kv);
+        ret.emplace_back(kv.kv_pos, kv.hash, kv.size);
     }
     return Status::OK();
 }
 
-static Status merge_shard_kvs_with_delete(size_t key_size, std::vector<KVRef>& l0_kvs,
-                                          std::vector<std::vector<KVRef>>& l1_kvs, size_t estimated_size,
-                                          std::vector<KVRef>& ret) {
+Status merge_shard_kvs_with_delete(size_t key_size, std::vector<KVRef>& l0_kvs, std::vector<std::vector<KVRef>>& l1_kvs,
+                                   size_t estimated_size, std::vector<KVRef>& ret) {
     if (key_size > 0) {
 #define CASE_SIZE(s) \
     case s:          \
@@ -4616,7 +4709,7 @@ static Status merge_shard_kvs_with_delete(size_t key_size, std::vector<KVRef>& l
     } else if (key_size == 0) {
         return merge_shard_kvs_var_len_with_delete(l0_kvs, l1_kvs, estimated_size, ret);
     }
-    return Status::OK();
+    return Status::InternalError(fmt::format("unsupported key_size {} in merge_shard_kvs_with_delete", key_size));
 }
 
 Status PersistentIndex::_merge_compaction_internal(ImmutableIndexWriter* writer, int l1_start_idx, int l1_end_idx,
