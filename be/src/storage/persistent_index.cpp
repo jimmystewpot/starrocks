@@ -15,6 +15,7 @@
 #include "storage/persistent_index.h"
 
 #include <cstring>
+#include <limits>
 #include <numeric>
 #include <utility>
 
@@ -451,11 +452,13 @@ static void copy_kv_to_page(size_t key_size, size_t num_kv, const KVPairPtr* kv_
                             uint8_t* dest_pack, const uint16_t* kv_size) {
     uint8_t* tags_dest = dest_pack;
     size_t tags_len = pad(num_kv, kPackSize);
-    memcpy(tags_dest, tags, num_kv);
+    if (num_kv > 0) {
+        memcpy(tags_dest, tags, num_kv);
+    }
     memset(tags_dest + num_kv, 0, tags_len - num_kv);
     uint8_t* kvs_dest = dest_pack + tags_len;
-    uint16_t offset = tags_len + (num_kv + 1) * sizeof(uint16_t);
     if (key_size == 0) {
+        uint16_t offset = tags_len + (num_kv + 1) * sizeof(uint16_t);
         for (size_t i = 0; i < num_kv; i++) {
             encode_fixed16_le(kvs_dest, offset);
             kvs_dest += sizeof(uint16_t);
@@ -463,12 +466,235 @@ static void copy_kv_to_page(size_t key_size, size_t num_kv, const KVPairPtr* kv_
         }
         encode_fixed16_le(kvs_dest, offset);
         kvs_dest += sizeof(uint16_t);
-    }
-    for (size_t i = 0; i < num_kv; i++) {
-        memcpy(kvs_dest, kv_ptrs[i], kv_size[i]);
-        kvs_dest += kv_size[i];
+        for (size_t i = 0; i < num_kv; i++) {
+            memcpy(kvs_dest, kv_ptrs[i], kv_size[i]);
+            kvs_dest += kv_size[i];
+        }
+    } else {
+        const size_t kv_len = key_size + kIndexValueSize;
+        for (size_t i = 0; i < num_kv; i++) {
+            memcpy(kvs_dest, kv_ptrs[i], kv_len);
+            kvs_dest += kv_len;
+        }
     }
 }
+
+namespace {
+
+struct ShardCreateScratch {
+    std::vector<uint8_t> bucket_sizes;
+    std::vector<uint32_t> bucket_data_size;
+    std::vector<uint8_t> bucket_packs;
+    std::vector<uint32_t> bucket_offsets;
+    std::vector<uint32_t> write_pos;
+    std::vector<uint32_t> kv_bids;
+    std::vector<KVPairPtr> flat_kv_ptrs;
+    std::vector<uint8_t> flat_tags;
+    std::vector<uint16_t> flat_kv_sizes;
+    std::vector<BucketToMove> buckets_to_move;
+    std::vector<MoveDest> dests;
+};
+
+StatusOr<std::unique_ptr<ImmutableIndexShard>> try_create_with_scratch(size_t key_size, size_t npage, size_t page_size,
+                                                                       size_t nbucket,
+                                                                       const std::vector<KVRef>& kv_refs,
+                                                                       ShardCreateScratch& scratch) {
+    if (!kv_refs.empty()) {
+        // This scenario should not happen in theory, since the usage and size stats by key size is not exactly
+        // accurate, so we add this code as a defense
+        if (npage == 0) {
+            LOG(ERROR) << "find a empty shard with kvs, key size: " << key_size << ", kv_num: " << kv_refs.size();
+            npage = 1;
+        }
+    }
+    // the max packid right now is 256
+    const size_t pack_size = page_size / 256;
+    const size_t total_bucket = npage * nbucket;
+    const size_t num_kvs = kv_refs.size();
+    const uint32_t npage32 = static_cast<uint32_t>(npage);
+    const uint32_t nbucket32 = static_cast<uint32_t>(nbucket);
+    const bool full_buckets = (nbucket32 == kBucketPerPage);
+
+    // Pass 1: count entries (and payload bytes for varlen) per bucket and cache bid per KV.
+    scratch.bucket_sizes.assign(total_bucket, 0);
+    if (key_size == 0) {
+        scratch.bucket_data_size.assign(total_bucket, 0);
+    }
+    scratch.kv_bids.resize(num_kvs);
+
+    if (key_size != 0) {
+        const size_t kv_len = key_size + kIndexValueSize;
+        for (size_t i = 0; i < num_kvs; i++) {
+            const auto& kv_ref = kv_refs[i];
+            DCHECK_EQ(kv_ref.size, kv_len);
+            auto h = IndexHash(kv_ref.hash);
+            uint32_t page = static_cast<uint32_t>(h.page()) % npage32;
+            uint32_t bucket =
+                    full_buckets ? static_cast<uint32_t>(h.bucket()) : (static_cast<uint32_t>(h.bucket()) % nbucket32);
+            uint32_t bid = page * nbucket32 + bucket;
+            auto& sz = scratch.bucket_sizes[bid];
+            if (UNLIKELY(sz == std::numeric_limits<uint8_t>::max())) {
+                return Status::InternalError("bucket size limit exceeded");
+            }
+            sz++;
+            if (UNLIKELY(pad(static_cast<size_t>(sz), kPackSize) + static_cast<size_t>(sz) * kv_len > page_size)) {
+                return Status::InternalError("bucket size limit exceeded");
+            }
+            scratch.kv_bids[i] = bid;
+        }
+    } else {
+        for (size_t i = 0; i < num_kvs; i++) {
+            const auto& kv_ref = kv_refs[i];
+            auto h = IndexHash(kv_ref.hash);
+            uint32_t page = static_cast<uint32_t>(h.page()) % npage32;
+            uint32_t bucket =
+                    full_buckets ? static_cast<uint32_t>(h.bucket()) : (static_cast<uint32_t>(h.bucket()) % nbucket32);
+            uint32_t bid = page * nbucket32 + bucket;
+            auto& sz = scratch.bucket_sizes[bid];
+            if (UNLIKELY(sz == std::numeric_limits<uint8_t>::max())) {
+                return Status::InternalError("bucket size limit exceeded");
+            }
+            sz++;
+            auto& data_size = scratch.bucket_data_size[bid];
+            data_size += kv_ref.size;
+            if (UNLIKELY(pad(static_cast<size_t>(sz), kPackSize) + data_size > page_size)) {
+                return Status::InternalError("bucket size limit exceeded");
+            }
+            scratch.kv_bids[i] = bid;
+        }
+    }
+
+    scratch.bucket_packs.resize(total_bucket);
+    const size_t page_pack_size_limit = (page_size - kPageHeaderSize) / pack_size;
+    if (key_size != 0) {
+        const size_t kv_len = key_size + kIndexValueSize;
+        for (size_t i = 0; i < total_bucket; i++) {
+            size_t sz = scratch.bucket_sizes[i];
+            size_t npack = npad(pad(sz, kPackSize) + pad(sz * kv_len, kPackSize), pack_size);
+            if (UNLIKELY(npack >= page_pack_size_limit)) {
+                return Status::InternalError("page page limit exceeded");
+            }
+            scratch.bucket_packs[i] = static_cast<uint8_t>(npack);
+        }
+    } else {
+        for (size_t i = 0; i < total_bucket; i++) {
+            size_t sz = scratch.bucket_sizes[i];
+            size_t npack =
+                    npad(pad(sz, kPackSize) + pad(scratch.bucket_data_size[i] + sizeof(uint16_t) * (sz + 1), kPackSize),
+                         pack_size);
+            if (UNLIKELY(npack >= page_pack_size_limit)) {
+                return Status::InternalError("page page limit exceeded");
+            }
+            scratch.bucket_packs[i] = static_cast<uint8_t>(npack);
+        }
+    }
+
+    // Check over-limit pages and reassign some buckets in those pages to under-limit pages
+    // before running Pass 2 scatter so failed npage retries exit early.
+    scratch.buckets_to_move.clear();
+    scratch.dests.clear();
+    std::vector<bool> page_has_move(npage, false);
+    for (uint32_t pageid = 0; pageid < npage; pageid++) {
+        const uint8_t* bucket_packs_in_page = &scratch.bucket_packs[pageid * nbucket];
+        int npack = std::accumulate(bucket_packs_in_page, bucket_packs_in_page + nbucket, 0);
+        if (npack < page_pack_size_limit) {
+            scratch.dests.emplace_back(page_pack_size_limit - npack, pageid);
+        } else if (npack > page_pack_size_limit) {
+            page_has_move[pageid] = true;
+            RETURN_IF_ERROR(find_buckets_to_move(pageid, nbucket, npack - page_pack_size_limit, bucket_packs_in_page,
+                                                 &scratch.buckets_to_move));
+        }
+    }
+    auto move_rs = move_buckets(scratch.buckets_to_move, scratch.dests);
+    if (!move_rs.ok()) {
+        return std::move(move_rs).status();
+    }
+    auto& moves = move_rs.value();
+
+    // Pass 2: prefix sum bucket offsets and scatter KVs into contiguous flat CSR arrays.
+    scratch.bucket_offsets.resize(total_bucket + 1);
+    uint32_t running_off = 0;
+    for (size_t i = 0; i < total_bucket; i++) {
+        scratch.bucket_offsets[i] = running_off;
+        running_off += scratch.bucket_sizes[i];
+    }
+    scratch.bucket_offsets[total_bucket] = running_off;
+    scratch.write_pos.assign(scratch.bucket_offsets.begin(), scratch.bucket_offsets.begin() + total_bucket);
+
+    scratch.flat_kv_ptrs.resize(num_kvs);
+    scratch.flat_tags.resize(num_kvs);
+    if (key_size != 0) {
+        for (size_t i = 0; i < num_kvs; i++) {
+            uint32_t pos = scratch.write_pos[scratch.kv_bids[i]]++;
+            scratch.flat_kv_ptrs[pos] = kv_refs[i].kv_pos;
+            scratch.flat_tags[pos] = static_cast<uint8_t>(IndexHash(kv_refs[i].hash).tag());
+        }
+    } else {
+        scratch.flat_kv_sizes.resize(num_kvs);
+        for (size_t i = 0; i < num_kvs; i++) {
+            uint32_t pos = scratch.write_pos[scratch.kv_bids[i]]++;
+            scratch.flat_kv_ptrs[pos] = kv_refs[i].kv_pos;
+            scratch.flat_tags[pos] = static_cast<uint8_t>(IndexHash(kv_refs[i].hash).tag());
+            scratch.flat_kv_sizes[pos] = kv_refs[i].size;
+        }
+    }
+
+    auto bucket_moved = [&](uint32_t pageid, uint32_t bucketid) -> bool {
+        for (auto& move : moves) {
+            if (move.src_pageid == pageid && move.src_bucketid == bucketid) {
+                return true;
+            }
+        }
+        return false;
+    };
+    // calculate bucket positions
+    std::unique_ptr<ImmutableIndexShard> ret = std::make_unique<ImmutableIndexShard>(npage, page_size);
+    for (auto& move : moves) {
+        ret->num_entry_moved += scratch.bucket_sizes[move.src_pageid * nbucket + move.src_bucketid];
+    }
+    const KVPairPtr* flat_kv_ptrs_data = scratch.flat_kv_ptrs.data();
+    const uint8_t* flat_tags_data = scratch.flat_tags.data();
+    const uint16_t* flat_kv_sizes_data = key_size == 0 ? scratch.flat_kv_sizes.data() : nullptr;
+
+    for (uint32_t pageid = 0; pageid < npage; pageid++) {
+        PageHeader& header = ret->header(pageid);
+        size_t cur_packid = npad(nbucket * kBucketHeaderSize, pack_size);
+        for (uint32_t bucketid = 0; bucketid < nbucket; bucketid++) {
+            if (page_has_move[pageid] && bucket_moved(pageid, bucketid)) {
+                continue;
+            }
+            auto bid = pageid * nbucket + bucketid;
+            auto& bucket_info = header.buckets[bucketid];
+            bucket_info.pageid = pageid;
+            bucket_info.packid = cur_packid;
+            bucket_info.size = scratch.bucket_sizes[bid];
+            uint32_t off = scratch.bucket_offsets[bid];
+            copy_kv_to_page(key_size, bucket_info.size, flat_kv_ptrs_data + off, flat_tags_data + off,
+                            ret->pack_in_page(pageid, cur_packid),
+                            flat_kv_sizes_data != nullptr ? flat_kv_sizes_data + off : nullptr);
+            cur_packid += scratch.bucket_packs[bid];
+            DCHECK(cur_packid <= page_size / pack_size);
+        }
+        for (auto& move : moves) {
+            if (move.dest_pageid == pageid) {
+                auto bid = move.src_pageid * nbucket + move.src_bucketid;
+                auto& bucket_info = ret->bucket(move.src_pageid, move.src_bucketid);
+                bucket_info.pageid = pageid;
+                bucket_info.packid = cur_packid;
+                bucket_info.size = scratch.bucket_sizes[bid];
+                uint32_t off = scratch.bucket_offsets[bid];
+                copy_kv_to_page(key_size, bucket_info.size, flat_kv_ptrs_data + off, flat_tags_data + off,
+                                ret->pack_in_page(pageid, cur_packid),
+                                flat_kv_sizes_data != nullptr ? flat_kv_sizes_data + off : nullptr);
+                cur_packid += scratch.bucket_packs[bid];
+                DCHECK(cur_packid <= page_size / pack_size);
+            }
+        }
+    }
+    return std::move(ret);
+}
+
+} // namespace
 
 static bool load_bf_or_not() {
     return config::enable_pindex_filter && StorageEngine::instance()->update_manager()->keep_pindex_bf();
@@ -482,9 +708,10 @@ StatusOr<std::unique_ptr<ImmutableIndexShard>> ImmutableIndexShard::create(size_
     }
     MonotonicStopWatch watch;
     watch.start();
+    ShardCreateScratch scratch;
     uint64_t retry_cnt = 0;
     for (size_t npage = npage_hint; npage < kPageMaxNum;) {
-        auto rs_create = ImmutableIndexShard::try_create(key_size, npage, page_size, nbucket, kv_refs);
+        auto rs_create = try_create_with_scratch(key_size, npage, page_size, nbucket, kv_refs, scratch);
         // increase npage and retry
         if (!rs_create.ok()) {
             // grows at 50%
@@ -503,126 +730,8 @@ StatusOr<std::unique_ptr<ImmutableIndexShard>> ImmutableIndexShard::create(size_
 StatusOr<std::unique_ptr<ImmutableIndexShard>> ImmutableIndexShard::try_create(size_t key_size, size_t npage,
                                                                                size_t page_size, size_t nbucket,
                                                                                const std::vector<KVRef>& kv_refs) {
-    if (!kv_refs.empty()) {
-        // This scenario should not happen in theory, since the usage and size stats by key size is not exactly
-        // accurate, so we add this code as a defense
-        if (npage == 0) {
-            LOG(ERROR) << "find a empty shard with kvs, key size: " << key_size << ", kv_num: " << kv_refs.size();
-            npage = 1;
-        }
-    }
-    // the max packid right now is 256
-    size_t pack_size = page_size / 256;
-    const size_t total_bucket = npage * nbucket;
-    std::vector<uint8_t> bucket_sizes(total_bucket);
-    std::vector<std::pair<uint32_t, std::vector<uint16_t>>> bucket_data_size(total_bucket);
-    std::vector<std::pair<std::vector<KVPairPtr>, std::vector<uint8_t>>> bucket_kv_ptrs_tags(total_bucket);
-    size_t estimated_entry_per_bucket = npad(kv_refs.size() * 100 / 85, total_bucket);
-    for (auto& [kv_ptrs, tags] : bucket_kv_ptrs_tags) {
-        kv_ptrs.reserve(estimated_entry_per_bucket);
-        tags.reserve(estimated_entry_per_bucket);
-    }
-    for (const auto& kv_ref : kv_refs) {
-        auto h = IndexHash(kv_ref.hash);
-        auto page = h.page() % npage;
-        auto bucket = h.bucket() % nbucket;
-        auto bid = page * nbucket + bucket;
-        auto& sz = bucket_sizes[bid];
-        sz++;
-        auto& data_size = bucket_data_size[bid].first;
-        data_size += kv_ref.size;
-        if (pad(sz, kPackSize) + data_size > page_size) {
-            return Status::InternalError("bucket size limit exceeded");
-        }
-        bucket_data_size[bid].second.emplace_back(kv_ref.size);
-        bucket_kv_ptrs_tags[bid].first.emplace_back(kv_ref.kv_pos);
-        bucket_kv_ptrs_tags[bid].second.emplace_back(h.tag());
-    }
-    std::vector<uint8_t> bucket_packs(total_bucket);
-    size_t page_pack_size_limit = (page_size - kPageHeaderSize) / pack_size;
-    for (size_t i = 0; i < total_bucket; i++) {
-        auto npack = 0;
-        if (key_size != 0) {
-            npack = npad(pad((size_t)bucket_sizes[i], kPackSize) + pad(bucket_data_size[i].first, kPackSize),
-                         pack_size);
-        } else {
-            npack = npad(pad((size_t)bucket_sizes[i], kPackSize) +
-                                 pad(bucket_data_size[i].first + sizeof(uint16_t) * ((size_t)bucket_sizes[i] + 1),
-                                     kPackSize),
-                         pack_size);
-        }
-        if (npack >= page_pack_size_limit) {
-            return Status::InternalError("page page limit exceeded");
-        }
-        bucket_packs[i] = npack;
-    }
-    // check over-limit pages and reassign some buckets in those pages to under-limit pages
-    std::vector<BucketToMove> buckets_to_move;
-    std::vector<MoveDest> dests;
-    std::vector<bool> page_has_move(npage, false);
-    for (uint32_t pageid = 0; pageid < npage; pageid++) {
-        const uint8_t* bucket_packs_in_page = &bucket_packs[pageid * nbucket];
-        int npack = std::accumulate(bucket_packs_in_page, bucket_packs_in_page + nbucket, 0);
-        if (npack < page_pack_size_limit) {
-            dests.emplace_back(page_pack_size_limit - npack, pageid);
-        } else if (npack > page_pack_size_limit) {
-            page_has_move[pageid] = true;
-            RETURN_IF_ERROR(find_buckets_to_move(pageid, nbucket, npack - page_pack_size_limit, bucket_packs_in_page,
-                                                 &buckets_to_move));
-        }
-    }
-    auto move_rs = move_buckets(buckets_to_move, dests);
-    if (!move_rs.ok()) {
-        return std::move(move_rs).status();
-    }
-    auto& moves = move_rs.value();
-    auto bucket_moved = [&](uint32_t pageid, uint32_t bucketid) -> bool {
-        for (auto& move : moves) {
-            if (move.src_pageid == pageid && move.src_bucketid == bucketid) {
-                return true;
-            }
-        }
-        return false;
-    };
-    // calculate bucket positions
-    std::unique_ptr<ImmutableIndexShard> ret = std::make_unique<ImmutableIndexShard>(npage, page_size);
-    for (auto& move : moves) {
-        ret->num_entry_moved += bucket_sizes[move.src_pageid * nbucket + move.src_bucketid];
-    }
-    for (uint32_t pageid = 0; pageid < npage; pageid++) {
-        PageHeader& header = ret->header(pageid);
-        size_t cur_packid = npad(nbucket * kBucketHeaderSize, pack_size);
-        for (uint32_t bucketid = 0; bucketid < nbucket; bucketid++) {
-            if (page_has_move[pageid] && bucket_moved(pageid, bucketid)) {
-                continue;
-            }
-            auto bid = pageid * nbucket + bucketid;
-            auto& bucket_info = header.buckets[bucketid];
-            bucket_info.pageid = pageid;
-            bucket_info.packid = cur_packid;
-            bucket_info.size = bucket_sizes[bid];
-            copy_kv_to_page(key_size, bucket_info.size, bucket_kv_ptrs_tags[bid].first.data(),
-                            bucket_kv_ptrs_tags[bid].second.data(), ret->pack_in_page(pageid, cur_packid),
-                            bucket_data_size[bid].second.data());
-            cur_packid += bucket_packs[bid];
-            DCHECK(cur_packid <= page_size / pack_size);
-        }
-        for (auto& move : moves) {
-            if (move.dest_pageid == pageid) {
-                auto bid = move.src_pageid * nbucket + move.src_bucketid;
-                auto& bucket_info = ret->bucket(move.src_pageid, move.src_bucketid);
-                bucket_info.pageid = pageid;
-                bucket_info.packid = cur_packid;
-                bucket_info.size = bucket_sizes[bid];
-                copy_kv_to_page(key_size, bucket_info.size, bucket_kv_ptrs_tags[bid].first.data(),
-                                bucket_kv_ptrs_tags[bid].second.data(), ret->pack_in_page(pageid, cur_packid),
-                                bucket_data_size[bid].second.data());
-                cur_packid += bucket_packs[bid];
-                DCHECK(cur_packid <= page_size / pack_size);
-            }
-        }
-    }
-    return std::move(ret);
+    ShardCreateScratch scratch;
+    return try_create_with_scratch(key_size, npage, page_size, nbucket, kv_refs, scratch);
 }
 
 ImmutableIndexWriter::~ImmutableIndexWriter() {
