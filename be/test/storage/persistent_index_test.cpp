@@ -3842,6 +3842,264 @@ TEST_P(PersistentIndexTest, pindex_major_compact_meta) {
     ASSERT_FALSE(PersistentIndex::modify_l2_versions(input_l2_versions, input_l2_versions.back(), index_meta).ok());
 }
 
+TEST_P(PersistentIndexTest, test_immutable_shard_fixlen_and_varlen_roundtrip) {
+    ASSIGN_OR_ABORT(auto fs, FileSystemFactory::CreateSharedFromString("posix://"));
+    const std::string base_dir = "./test_immutable_shard_roundtrip";
+    (void)fs::remove_all(base_dir);
+    ASSERT_OK(fs::create_directories(base_dir));
+    DeferOp cleanup([&]() { (void)fs::remove_all(base_dir); });
+
+    // Helper: write a single shard via ImmutableIndexWriter and verify every key via ImmutableIndex::get.
+    auto verify_shard = [&](const std::string& tag, size_t key_size, size_t npage_hint, size_t page_size,
+                            size_t nbucket, const std::vector<std::string>& keys,
+                            const std::vector<IndexValue>& values) {
+        const std::string path = base_dir + "/idx_" + tag;
+        // Build contiguous KV buffers (key bytes + 8-byte IndexValue).
+        std::vector<std::string> kv_bufs(keys.size());
+        std::vector<KVRef> kv_refs;
+        kv_refs.reserve(keys.size());
+        std::vector<Slice> key_slices;
+        key_slices.reserve(keys.size());
+        KeysInfo keys_info;
+        keys_info.key_infos.reserve(keys.size());
+
+        for (size_t i = 0; i < keys.size(); i++) {
+            kv_bufs[i].resize(keys[i].size() + kIndexValueSize);
+            memcpy(kv_bufs[i].data(), keys[i].data(), keys[i].size());
+            UNALIGNED_STORE64(kv_bufs[i].data() + keys[i].size(), values[i].get_value());
+            uint64_t h = key_index_hash(keys[i].data(), keys[i].size());
+            kv_refs.emplace_back(reinterpret_cast<const uint8_t*>(kv_bufs[i].data()), h,
+                                 static_cast<uint16_t>(kv_bufs[i].size()));
+            key_slices.emplace_back(keys[i].data(), keys[i].size());
+            keys_info.key_infos.emplace_back(static_cast<uint32_t>(i), h);
+        }
+
+        auto writer = std::make_unique<ImmutableIndexWriter>();
+        ASSERT_OK(writer->init(path, EditVersion(1, 0), false));
+        ASSERT_OK(writer->write_shard(key_size, npage_hint, page_size, nbucket, kv_refs));
+        ASSERT_OK(writer->finish());
+
+        ASSIGN_OR_ABORT(auto rf, fs->new_random_access_file(path));
+        ASSIGN_OR_ABORT(auto idx, ImmutableIndex::load(std::move(rf), true));
+
+        if (!keys.empty()) {
+            std::vector<IndexValue> got(keys.size());
+            KeysInfo found;
+            ASSERT_OK(idx->get(keys.size(), key_slices.data(), keys_info, got.data(), &found, key_size));
+            ASSERT_EQ(keys.size(), found.size()) << "tag=" << tag;
+            for (size_t i = 0; i < keys.size(); i++) {
+                ASSERT_EQ(values[i], got[i]) << "tag=" << tag << " i=" << i;
+            }
+        }
+    };
+
+    // 1. Empty shard (fixed-len and varlen)
+    verify_shard("empty_fix8", 8, 1, 4096, 16, {}, {});
+    verify_shard("empty_varlen", 0, 1, 4096, 16, {}, {});
+
+    // 2. Single-key shard (fixed-len and varlen)
+    {
+        std::vector<std::string> keys = {std::string(8, 'a')};
+        std::vector<IndexValue> vals = {IndexValue(42)};
+        verify_shard("single_fix8", 8, 1, 4096, 16, keys, vals);
+    }
+    {
+        std::vector<std::string> keys = {"only_one_varlen_key"};
+        std::vector<IndexValue> vals = {IndexValue(99)};
+        verify_shard("single_varlen", 0, 1, 4096, 16, keys, vals);
+    }
+
+    // 3. Fixed-length keys across all specialized sizes (4, 8, 16, 32, 64, 128) + generic fallback (12)
+    for (size_t ks : {size_t(4), size_t(8), size_t(12), size_t(16), size_t(32), size_t(64), size_t(128)}) {
+        const size_t N = 500;
+        std::vector<std::string> keys(N);
+        std::vector<IndexValue> vals(N);
+        for (size_t i = 0; i < N; i++) {
+            keys[i].assign(ks, static_cast<char>('A' + (i % 26)));
+            uint32_t v = static_cast<uint32_t>(i);
+            memcpy(keys[i].data(), &v, sizeof(v));
+            vals[i] = IndexValue((i << 16) ^ 0x5a5a5a5aULL);
+        }
+        auto [nshard, npage_hint, page_size] = MutableIndex::estimate_nshard_and_npage((ks + kIndexValueSize) * N, N);
+        auto nbucket = MutableIndex::estimate_nbucket(ks, N, 1, npage_hint);
+        verify_shard("fix_" + std::to_string(ks), ks, npage_hint, page_size, nbucket, keys, vals);
+    }
+
+    // 4. Variable-length keys with mixed sizes (including 1B up to 128B)
+    {
+        const size_t N = 600;
+        std::vector<std::string> keys(N);
+        std::vector<IndexValue> vals(N);
+        const size_t lens[] = {1, 3, 7, 15, 31, 64, 128};
+        for (size_t i = 0; i < N; i++) {
+            size_t len = lens[i % 7];
+            keys[i].resize(len);
+            for (size_t j = 0; j < len; j++) {
+                keys[i][j] = static_cast<char>((i * 31 + j * 17) & 0x7f);
+            }
+            // Guarantee uniqueness for short keys by encoding i in the available bytes.
+            if (len >= 4) {
+                uint32_t v = static_cast<uint32_t>(i);
+                memcpy(keys[i].data(), &v, sizeof(v));
+            } else {
+                keys[i] = std::to_string(i) + "_v";
+            }
+            vals[i] = IndexValue(i * 13 + 7);
+        }
+        verify_shard("varlen_mixed", 0, 2, 4096, 16, keys, vals);
+    }
+}
+
+TEST_P(PersistentIndexTest, test_immutable_shard_skewed_moves_and_retries) {
+    ASSIGN_OR_ABORT(auto fs, FileSystemFactory::CreateSharedFromString("posix://"));
+    const std::string base_dir = "./test_immutable_shard_skewed";
+    (void)fs::remove_all(base_dir);
+    ASSERT_OK(fs::create_directories(base_dir));
+    DeferOp cleanup([&]() { (void)fs::remove_all(base_dir); });
+
+    // Generate keys where a large fraction hash to page 0 (for npage = 16) while others spread out,
+    // exercising both move_buckets (over-limit pages moving buckets to under-limit pages) and npage retries
+    // when starting from npage_hint = 1.
+    auto run_skewed_case = [&](const std::string& tag, size_t key_size, size_t n_keys, size_t npage_hint) {
+        const std::string path = base_dir + "/idx_" + tag;
+        std::vector<std::string> keys;
+        std::vector<std::string> kv_bufs;
+        std::vector<IndexValue> values;
+        std::vector<KVRef> kv_refs;
+        std::vector<Slice> key_slices;
+        KeysInfo keys_info;
+
+        keys.reserve(n_keys);
+        kv_bufs.reserve(n_keys);
+        values.reserve(n_keys);
+        kv_refs.reserve(n_keys);
+        key_slices.reserve(n_keys);
+        keys_info.key_infos.reserve(n_keys);
+
+        // Pick half the keys with ((h >> 16) & 0xffffffff) % 8 == 0 to create heavy page skew,
+        // and half uniformly distributed.
+        uint64_t candidate = 0;
+        while (keys.size() < n_keys) {
+            std::string k;
+            if (key_size != 0) {
+                k.assign(key_size, '\0');
+                memcpy(k.data(), &candidate, std::min(key_size, sizeof(candidate)));
+            } else {
+                k = "skew_key_" + std::to_string(candidate) + "_" + std::string(candidate % 24, 'x');
+            }
+            uint64_t h = key_index_hash(k.data(), k.size());
+            uint64_t page_hash = (h >> 16) & 0xffffffffULL;
+            bool want_hot = keys.size() < n_keys / 2;
+            if (!want_hot || (page_hash % 8 == 0)) {
+                size_t idx = keys.size();
+                keys.push_back(std::move(k));
+                IndexValue val(candidate * 3 + 1);
+                values.push_back(val);
+                std::string buf(keys.back().size() + kIndexValueSize, '\0');
+                memcpy(buf.data(), keys.back().data(), keys.back().size());
+                UNALIGNED_STORE64(buf.data() + keys.back().size(), val.get_value());
+                kv_bufs.push_back(std::move(buf));
+                kv_refs.emplace_back(reinterpret_cast<const uint8_t*>(kv_bufs.back().data()), h,
+                                     static_cast<uint16_t>(kv_bufs.back().size()));
+                key_slices.emplace_back(keys.back().data(), keys.back().size());
+                keys_info.key_infos.emplace_back(static_cast<uint32_t>(idx), h);
+            }
+            candidate++;
+        }
+
+        auto writer = std::make_unique<ImmutableIndexWriter>();
+        ASSERT_OK(writer->init(path, EditVersion(1, 0), false));
+        ASSERT_OK(writer->write_shard(key_size, npage_hint, 4096, 16, kv_refs));
+        ASSERT_OK(writer->finish());
+
+        ASSIGN_OR_ABORT(auto rf, fs->new_random_access_file(path));
+        ASSIGN_OR_ABORT(auto idx, ImmutableIndex::load(std::move(rf), true));
+
+        std::vector<IndexValue> got(n_keys);
+        KeysInfo found;
+        ASSERT_OK(idx->get(n_keys, key_slices.data(), keys_info, got.data(), &found, key_size));
+        ASSERT_EQ(n_keys, found.size()) << "tag=" << tag;
+        for (size_t i = 0; i < n_keys; i++) {
+            ASSERT_EQ(values[i], got[i]) << "tag=" << tag << " i=" << i;
+        }
+    };
+
+    // Start from npage_hint = 1 to force multiple npage retries + bucket movements on both fixlen and varlen.
+    run_skewed_case("fix8_retry", 8, 3000, 1);
+    run_skewed_case("fix16_retry", 16, 2500, 1);
+    run_skewed_case("varlen_retry", 0, 2000, 1);
+    // Start near tight npage_hint to heavily trigger move_buckets without needing huge retry jump.
+    run_skewed_case("fix8_moves", 8, 2500, 16);
+}
+
+TEST_P(PersistentIndexTest, test_immutable_shard_bucket_uint8_overflow) {
+    ASSIGN_OR_ABORT(auto fs, FileSystemFactory::CreateSharedFromString("posix://"));
+    const std::string base_dir = "./test_immutable_shard_uint8_overflow";
+    (void)fs::remove_all(base_dir);
+    ASSERT_OK(fs::create_directories(base_dir));
+    DeferOp cleanup([&]() { (void)fs::remove_all(base_dir); });
+
+    // Regression test for uint8_t bucket_sizes wraparound when page_size > 4096:
+    // Select 260 distinct 4-byte keys whose real XXH3 hashes all have bucket == 0.
+    // On npage = 1 with page_size = 8192, all 260 keys (12 bytes each = 3120B + 256B tags <= 8192B)
+    // collide into bucket 0. Without a uint8_t overflow check before incrementing bucket_sizes[bid],
+    // bucket_sizes[0] wraps 255 -> 0 -> 4 and silently loses 256 entries.
+    const size_t kTargetKeys = 260;
+    const size_t kKeySize = 4;
+    const size_t kPageSize = 8192;
+
+    std::vector<uint32_t> raw_keys;
+    std::vector<std::string> kv_bufs;
+    std::vector<IndexValue> values;
+    std::vector<KVRef> kv_refs;
+    std::vector<Slice> key_slices;
+    KeysInfo keys_info;
+
+    raw_keys.reserve(kTargetKeys);
+    kv_bufs.reserve(kTargetKeys);
+    values.reserve(kTargetKeys);
+    kv_refs.reserve(kTargetKeys);
+    key_slices.reserve(kTargetKeys);
+    keys_info.key_infos.reserve(kTargetKeys);
+
+    for (uint32_t k = 0; raw_keys.size() < kTargetKeys; k++) {
+        uint64_t h = key_index_hash(&k, kKeySize);
+        uint64_t bucket = (h >> 8) & 15ULL;
+        if (bucket != 0) {
+            continue;
+        }
+        size_t idx = raw_keys.size();
+        raw_keys.push_back(k);
+        IndexValue val(static_cast<uint64_t>(k) * 7 + 3);
+        values.push_back(val);
+        std::string buf(kKeySize + kIndexValueSize, '\0');
+        memcpy(buf.data(), &k, kKeySize);
+        UNALIGNED_STORE64(buf.data() + kKeySize, val.get_value());
+        kv_bufs.push_back(std::move(buf));
+        kv_refs.emplace_back(reinterpret_cast<const uint8_t*>(kv_bufs.back().data()), h,
+                             static_cast<uint16_t>(kv_bufs.back().size()));
+        key_slices.emplace_back(reinterpret_cast<const uint8_t*>(&raw_keys.back()), kKeySize);
+        keys_info.key_infos.emplace_back(static_cast<uint32_t>(idx), h);
+    }
+
+    const std::string path = base_dir + "/idx_uint8_overflow";
+    auto writer = std::make_unique<ImmutableIndexWriter>();
+    ASSERT_OK(writer->init(path, EditVersion(1, 0), false));
+    ASSERT_OK(writer->write_shard(kKeySize, /*npage_hint=*/1, kPageSize, /*nbucket=*/16, kv_refs));
+    ASSERT_OK(writer->finish());
+
+    ASSIGN_OR_ABORT(auto rf, fs->new_random_access_file(path));
+    ASSIGN_OR_ABORT(auto idx, ImmutableIndex::load(std::move(rf), true));
+
+    std::vector<IndexValue> got(kTargetKeys);
+    KeysInfo found;
+    ASSERT_OK(idx->get(kTargetKeys, key_slices.data(), keys_info, got.data(), &found, kKeySize));
+    ASSERT_EQ(kTargetKeys, found.size());
+    for (size_t i = 0; i < kTargetKeys; i++) {
+        ASSERT_EQ(values[i], got[i]) << "i=" << i;
+    }
+}
+
 INSTANTIATE_TEST_SUITE_P(PersistentIndexTest, PersistentIndexTest,
                          ::testing::Values(PersistentIndexTestParam{true, false},
                                            PersistentIndexTestParam{false, true}));
